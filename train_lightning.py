@@ -124,27 +124,19 @@ def cycle(loader):
             yield data
 
 # Custom progress tracking callback
+# Simpler progress bar that follows the pattern from test_lightning.py
 class CustomProgressBar(TQDMProgressBar):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        print("CustomProgressBar initialized")
+        print("Progress bar initialized")
         
     def get_metrics(self, trainer, pl_module):
         items = super().get_metrics(trainer, pl_module)
-        # Add more visible metrics
+        # Add tokens/sec if available
         if hasattr(trainer, 'logged_metrics'):
-            items["PROGRESS"] = f"STEP {trainer.global_step}"
             if 'tokens_per_second' in trainer.logged_metrics:
-                items["TOKENS/S"] = f"{trainer.logged_metrics['tokens_per_second']:.2f}"
-            if 'batch_loss' in trainer.logged_metrics:
-                items["LOSS"] = f"{trainer.logged_metrics['batch_loss']:.5f}"
+                items["tokens/s"] = f"{trainer.logged_metrics['tokens_per_second']:.2f}"
         return items
-    
-    def on_train_batch_end(self, *args, **kwargs):
-        # Force progress bar to print on every batch
-        print("\n")  # Add extra newline for visibility
-        print("PROGRESS BAR UPDATE")
-        super().on_train_batch_end(*args, **kwargs)
 
 class TrainingMetricsCallback(pl.Callback):
     def __init__(self):
@@ -153,51 +145,36 @@ class TrainingMetricsCallback(pl.Callback):
         self.tokens_processed = 0
         self.logger = logging.getLogger("min_lm_training.metrics")
         print("TrainingMetricsCallback initialized")
-        self.logger.info("TrainingMetricsCallback initialized")
     
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
-        print(f"\n========== STARTING BATCH {batch_idx} ==========")
-        self.logger.debug(f"Starting batch {batch_idx}, global_step={trainer.global_step}")
+        if batch_idx % 10 == 0:  # Reduce logging frequency
+            self.logger.debug(f"Rank {trainer.global_rank} starting batch {batch_idx}")
         
         if self.start_time is None:
             self.start_time = time.time()
             self.tokens_processed = 0
-            print("Timer started")
     
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, unused=0):
-        # Always log on all processes to help debug
-        # Remove the global_rank check to log from all processes
-        
         # Count tokens processed
         batch_size = batch.size(0)
         seq_len = batch.size(1) - 1  # -1 because we're using the last token as the target
         self.tokens_processed += batch_size * seq_len
-        
+
         # Calculate tokens per second
         elapsed = time.time() - self.start_time
         if elapsed > 0:
             tokens_per_sec = self.tokens_processed / elapsed
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs
-            
+    
             # Log through Lightning
-            trainer.logger.log_metrics({
-                "tokens_per_second": tokens_per_sec,
-                "batch_loss": loss.item()
-            }, step=trainer.global_step)
-            
-            # Extreme logging - print EVERY batch with clear markers
-            print(f"======== STEP {trainer.global_step} ========")
-            print(f"BATCH {batch_idx} METRICS:")
-            print(f"LOSS: {loss.item():.5f}")
-            print(f"TOKENS/SEC: {tokens_per_sec:.2f}")
-            print(f"ELAPSED TIME: {elapsed:.2f}s")
-            print(f"BATCH SHAPE: {batch.shape}")
-            print(f"GPU MEM ALLOCATED: {torch.cuda.memory_allocated() / 1024**2:.2f}MB")
-            print(f"GPU MEM RESERVED: {torch.cuda.memory_reserved() / 1024**2:.2f}MB")
-            print(f"================================")
-            
-            # Also log to file with extreme detail
-            self.logger.info(f"STEP {trainer.global_step} | BATCH {batch_idx} | LOSS: {loss.item():.5f} | {tokens_per_sec:.2f} tokens/s | TIME: {elapsed:.2f}s")
+            self.log('train_loss', loss, prog_bar=True, sync_dist=True)
+            self.log('tokens_per_second', tokens_per_sec, prog_bar=True, sync_dist=True)
+    
+            # Simplified logging with rank information like in test_lightning.py
+            print(f"Rank {trainer.global_rank} | Batch {batch_idx} | Loss: {loss.item():.4f} | Tokens/s: {tokens_per_sec:.2f}")
+    
+            # Log to file with sufficient detail but not overwhelming
+            self.logger.info(f"Rank {trainer.global_rank} | Step {trainer.global_step} | Batch {batch_idx} | Loss: {loss.item():.4f} | {tokens_per_sec:.2f} tokens/s")
 
 # Text generation callback - simplified to match train.py pattern
 class TextGenerationCallback(pl.Callback):
@@ -209,7 +186,6 @@ class TextGenerationCallback(pl.Callback):
         self.generate_every = generate_every
         self.logger = logging.getLogger("min_lm_training.text_gen")
         print("TextGenerationCallback initialized")
-        self.logger.info("TextGenerationCallback initialized")
     
     def on_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         # Only generate text on rank 0 and only during training
@@ -269,81 +245,46 @@ if __name__ == "__main__":
     pl.seed_everything(42)
     torch.set_float32_matmul_precision('medium')
     
-    # Initial diagnostic output
-    print("========== PROGRAM STARTED ==========")
+    # Basic diagnostic output following test_lightning.py style
     print(f"CUDA AVAILABLE: {torch.cuda.is_available()}")
     print(f"GPU COUNT: {torch.cuda.device_count()}")
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
             print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-    print(f"PYTORCH VERSION: {torch.__version__}")
-    print(f"PYTORCH LIGHTNING VERSION: {pl.__version__}")
-    print(f"Using gloo backend for distributed training")
-    print("====================================")
     
-    # Load and prepare data - exactly as in train.py
+    # Load and prepare data - with simplified logging
     print("Loading data from enwik8.gz...")
-    try:
-        with gzip.open("./data/enwik8.gz") as file:
-            print("File opened successfully, reading data...")
-            data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
-            np_train, np_valid = np.split(data, [int(90e6)])
-            data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
-            print("========== DATA LOADED ==========")
-            print(f"TRAIN DATA SHAPE: {data_train.shape}")
-            print(f"VAL DATA SHAPE: {data_val.shape}")
-            print("================================")
-    except Exception as e:
-        print(f"ERROR LOADING DATA: {str(e)}")
-        raise
+    with gzip.open("./data/enwik8.gz") as file:
+        data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
+        np_train, np_valid = np.split(data, [int(90e6)])
+        data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
+    print(f"Data loaded - Train: {data_train.shape}, Val: {data_val.shape}")
 
-    # Create datasets and dataloaders - exactly as in train.py
+    # Create datasets and dataloaders - simplified
     print("Creating datasets and dataloaders...")
     train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
     val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
-    print(f"Train dataset size: {len(train_dataset)}")
-    print(f"Val dataset size: {len(val_dataset)}")
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=0)
     
-    # Cycle the loaders - exactly as in train.py
-    print("Setting up cycled data loaders...")
+    # Cycle the loaders
     train_loader_iter = cycle(train_loader)
     val_loader_iter = cycle(val_loader)
     
-    # Test data loaders
-    print("========== TESTING DATA LOADERS ==========")
-    try:
-        print("Testing train loader...")
-        test_batch = next(train_loader_iter)
-        print(f"SUCCESS - Train batch shape: {test_batch.shape}")
-        
-        print("Testing val loader...")
-        test_batch = next(val_loader_iter)
-        print(f"SUCCESS - Val batch shape: {test_batch.shape}")
-    except Exception as e:
-        print(f"ERROR IN DATA LOADERS: {str(e)}")
-        print("This could be why you're not seeing output!")
-        raise
-    print("=======================================")
+    # Test basic loader functionality (quick sanity check)
+    test_batch = next(train_loader_iter)
+    print(f"Data loader check - batch shape: {test_batch.shape}")
     
-    # Set up model
-    print("========== CREATING MODEL ==========")
-    try:
-        model = LightningMinLM(
-            num_tokens=256,
-            dim=512,
-            depth=6,
-            ff_mult=4,
-            learning_rate=LEARNING_RATE,
-            use_lstm=False  # set to True for minLSTM
-        )
-        print("MODEL CREATED:")
-        print(model)
-        print("==================================")
-    except Exception as e:
-        print(f"ERROR CREATING MODEL: {str(e)}")
-        raise
+    # Set up model - simplified like in test_lightning.py
+    print("Creating model...")
+    model = LightningMinLM(
+        num_tokens=256,
+        dim=512,
+        depth=6,
+        ff_mult=4,
+        learning_rate=LEARNING_RATE,
+        use_lstm=False  # set to True for minLSTM
+    )
     
     # Set up callbacks
     checkpoint_callback = ModelCheckpoint(
@@ -380,45 +321,28 @@ if __name__ == "__main__":
     
     # Set up trainer with gloo backend for distributed training
     print("Setting up PyTorch Lightning Trainer with gloo backend...")
-    try:
-        # Create a DDPStrategy with the gloo backend
-        ddp_strategy = DDPStrategy(process_group_backend="gloo") if torch.cuda.device_count() > 1 else "auto"
-        
-        trainer = Trainer(
-            max_steps=NUM_BATCHES,
-            accumulate_grad_batches=GRAD_ACCUM_EVERY,  # Match grad accumulation from train.py
-            accelerator="gpu",
-            devices="auto",  # use all available GPUs
-            strategy=ddp_strategy,
-            gradient_clip_val=0.5,
-            callbacks=[checkpoint_callback, text_gen_callback, metrics_callback, progress_bar],
-            val_check_interval=VALIDATE_EVERY,
-            logger=primary_logger,
-            log_every_n_steps=1,  # Add explicit logging frequency
-            enable_progress_bar=True,
-            enable_model_summary=True,
-            enable_checkpointing=True
-        )
-        print("Trainer created successfully")
-    except Exception as e:
-        print(f"ERROR CREATING TRAINER: {str(e)}")
-        raise
     
-    # Log the training configuration
-    logger.info(f"Starting training with {torch.cuda.device_count()} GPUs")
-    logger.info(f"Batch size: {BATCH_SIZE}, Grad accumulation: {GRAD_ACCUM_EVERY}")
-    logger.info(f"Learning rate: {LEARNING_RATE}, Sequence length: {SEQ_LEN}")
+    # Create a DDPStrategy with the gloo backend, as in test_lightning.py
+    ddp_strategy = DDPStrategy(process_group_backend="gloo") if torch.cuda.device_count() > 1 else "auto"
     
-    print("======== TRAINING CONFIGURATION ========")
-    print(f"BATCH SIZE: {BATCH_SIZE}")
-    print(f"GRAD ACCUMULATION: {GRAD_ACCUM_EVERY}")
-    print(f"EFFECTIVE BATCH SIZE: {BATCH_SIZE * GRAD_ACCUM_EVERY}")
-    print(f"LEARNING RATE: {LEARNING_RATE}")
-    print(f"SEQUENCE LENGTH: {SEQ_LEN}")
-    print(f"NUM BATCHES: {NUM_BATCHES}")
-    print(f"VALIDATE EVERY: {VALIDATE_EVERY}")
-    print(f"GENERATE EVERY: {GENERATE_EVERY}")
-    print("=======================================")
+    trainer = Trainer(
+        max_steps=NUM_BATCHES,
+        accumulate_grad_batches=GRAD_ACCUM_EVERY,
+        accelerator="gpu",
+        devices="auto",
+        strategy=ddp_strategy,
+        gradient_clip_val=0.5,
+        callbacks=[checkpoint_callback, text_gen_callback, metrics_callback, progress_bar],
+        val_check_interval=VALIDATE_EVERY,
+        logger=primary_logger,
+        log_every_n_steps=10,  # Less frequent logging
+        num_sanity_val_steps=0,  # Skip validation sanity checks like in test_lightning.py
+    )
+    print("Trainer created successfully")
+    
+    # Simplified configuration logging
+    print(f"Starting training with {torch.cuda.device_count()} GPUs")
+    print(f"Config: bs={BATCH_SIZE}, grad_accum={GRAD_ACCUM_EVERY}, lr={LEARNING_RATE}, seq_len={SEQ_LEN}")
     
     # Create a custom dataloader that returns the cycled data
     # This makes the Lightning version use exactly the same data pattern as train.py
@@ -432,22 +356,11 @@ if __name__ == "__main__":
         def __next__(self):
             return next(self.cycled_iterator)
     
-    # Pre-training sanity check
-    print("========== PRE-TRAINING SANITY CHECK ==========")
-    print("About to call trainer.fit()")
-    print("If you don't see ANY output after this, the training loop may not be starting")
-    print("=============================================")
-    
-    # Train model with the cycled data loaders
-    try:
-        print("STARTING TRAINING NOW!")
-        trainer.fit(
-            model, 
-            train_dataloaders=CycledDataLoader(train_loader_iter),
-            val_dataloaders=CycledDataLoader(val_loader_iter)
-        )
-        print("TRAINING COMPLETED SUCCESSFULLY!")
-    except Exception as e:
-        print(f"ERROR DURING TRAINING: {str(e)}")
-        import traceback
-        traceback.print_exc()
+    # Training start - similar to test_lightning.py
+    print("Starting training...")
+    trainer.fit(
+        model, 
+        train_dataloaders=CycledDataLoader(train_loader_iter),
+        val_dataloaders=CycledDataLoader(val_loader_iter)
+    )
+    print("Training completed.")
