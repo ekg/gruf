@@ -128,7 +128,6 @@ if __name__ == "__main__":
         Enwik8DataModule,
         seed_everything_default=42,
         run=True,  # Run fit by default
-        save_config_overwrite=True,
         trainer_defaults={
             "callbacks": [
                 # Model checkpoint callback
