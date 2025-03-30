@@ -79,12 +79,12 @@ class TextGenerationCallback(pl.Callback):
         self.generate_length = generate_length
         self.generate_every = generate_every
     
-    def setup(self, trainer, pl_module, stage=None):
+    def on_fit_start(self, trainer, pl_module):
         # Access val_dataset from the datamodule when it's available
         if hasattr(trainer.datamodule, 'val_dataset'):
             self.val_dataset = trainer.datamodule.val_dataset
     
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, unused=0):
         # Only generate text on rank 0
         if trainer.global_rank == 0 and (batch_idx + 1) % self.generate_every == 0:
             pl_module.eval()
@@ -138,13 +138,12 @@ if __name__ == "__main__":
                      "save_top_k": 3,
                      "mode": "min"
                  }},
-                # Text generation callback
-                {"class_path": __name__ + ".TextGenerationCallback",
-                 "init_args": {
-                     "prime_length": 128,
-                     "generate_length": 512,
-                     "generate_every": 500
-                 }}
+                # Text generation callback - using simple instantiation instead of class_path
+                TextGenerationCallback(
+                    prime_length=128,
+                    generate_length=512,
+                    generate_every=500
+                )
             ]
         }
     )
