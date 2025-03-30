@@ -152,9 +152,17 @@ class LightningMinLM(pl.LightningModule):
         if self.global_rank == 0:
             elapsed = time.time() - self.start_time
             global_tokens_per_sec = global_tokens_processed / elapsed if elapsed > 0 else 0
-            # Log to progress bar
-            self.log('tokens_per_sec', global_tokens_per_sec, prog_bar=True)
-            print(f"Batch {self.trainer.global_step}/{NUM_BATCHES} | Loss: {loss.item():.4f} | Global: {global_tokens_per_sec:.2f} tokens/s", end="\r")
+            
+            # Format tokens/s in a human-readable way
+            if global_tokens_per_sec >= 1e6:
+                formatted_toks = f"{global_tokens_per_sec/1e6:.2f}M/s"
+            elif global_tokens_per_sec >= 1e3:
+                formatted_toks = f"{global_tokens_per_sec/1e3:.2f}k/s"
+            else:
+                formatted_toks = f"{global_tokens_per_sec:.2f}/s"
+                
+            # Log to progress bar with better name and value
+            self.log('toks/s', formatted_toks, prog_bar=True)
         
         return {"loss": loss}
     
@@ -169,6 +177,16 @@ class LightningMinLM(pl.LightningModule):
     
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+
+# Custom progress bar that formats token/s more cleanly
+class TokensPerSecFormatter(TQDMProgressBar):
+    def get_metrics(self, trainer, model):
+        items = super().get_metrics(trainer, model)
+        # Format tokens/s if present
+        if 'toks/s' in items:
+            # Will be in thousands already from our conversion above
+            items['toks/s'] = f"{items['toks/s']:.2f}k/s"
+        return items
 
 # Text generation callback
 class TextGenerationCallback(pl.Callback):
@@ -265,6 +283,8 @@ def main():
         mode="min"
     )
     
+    progress_bar = TokensPerSecFormatter()
+    
     text_gen_callback = TextGenerationCallback(
         val_dataset=val_dataset,
         prime_length=PRIME_LENGTH,
@@ -294,7 +314,7 @@ def main():
         devices="auto",
         strategy=ddp_strategy,
         gradient_clip_val=0.5,
-        callbacks=[checkpoint_callback, text_gen_callback],
+        callbacks=[checkpoint_callback, text_gen_callback, progress_bar],
         val_check_interval=VALIDATE_EVERY,
         logger=csv_logger,
         log_every_n_steps=10,
