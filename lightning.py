@@ -28,7 +28,7 @@ VALIDATE_EVERY = 100
 PRIME_LENGTH = 128
 GENERATE_EVERY = 500
 GENERATE_LENGTH = 512
-SEQ_LEN = 512
+SEQ_LEN = 1024 * 2
 
 # Functions for text generation
 def decode_token(token):
