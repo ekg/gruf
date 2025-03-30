@@ -139,13 +139,12 @@ if __name__ == "__main__":
         generate_every=GENERATE_EVERY
     )
     
-    # Set up trainer with TBPTT for recurrent training
+    # Set up trainer
     trainer = Trainer(
         max_steps=NUM_BATCHES,  # to match the original script
         accelerator="gpu",
         devices="auto",  # use all available GPUs
         strategy="ddp" if torch.cuda.device_count() > 1 else None,
-        truncated_bptt_steps=TRUNCATED_BPTT_STEPS,  # for recurrent training
         gradient_clip_val=0.5,
         callbacks=[checkpoint_callback, text_gen_callback],
         val_check_interval=VALIDATE_EVERY
