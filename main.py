@@ -70,58 +70,64 @@ def base_decoding(
 
     return out[..., prompt_seq_len:]
 
-# Text generation callback
-class TextGenerationCallback(pl.Callback):
-    def __init__(self, prime_length=128, generate_length=512, generate_every=500):
-        super().__init__()
-        self.val_dataset = None
-        self.prime_length = prime_length
-        self.generate_length = generate_length
-        self.generate_every = generate_every
-    
-    def on_fit_start(self, trainer, pl_module):
-        # Access val_dataset from the datamodule when it's available
-        if hasattr(trainer.datamodule, 'val_dataset'):
-            self.val_dataset = trainer.datamodule.val_dataset
-    
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, unused=0):
-        # Only generate text on rank 0
-        if trainer.global_rank == 0 and (batch_idx + 1) % self.generate_every == 0:
-            pl_module.eval()
+# define text generation function to be used as a callback
+def generate_text_during_training(trainer, pl_module, batch_idx, prime_length=128, generate_length=512, generate_every=500):
+    """Text generation function that can be used as a callback during training."""
+    if trainer.global_rank == 0 and (batch_idx + 1) % generate_every == 0:
+        pl_module.eval()
+        
+        # Get validation dataset from datamodule
+        val_dataset = trainer.datamodule.val_dataset if hasattr(trainer.datamodule, 'val_dataset') else None
+        
+        if val_dataset is None:
+            print("No validation dataset available for text generation", flush=True)
+            return
+        
+        try:
+            # Get a sample from validation set
+            inp = random.choice(val_dataset)[:prime_length]
+            inp = inp.to(pl_module.device)
             
-            if self.val_dataset is None:
-                print("No validation dataset available for text generation", flush=True)
-                return
+            prime = decode_tokens(inp)
+            print(f"\n\n===== GENERATION AT STEP {batch_idx+1} =====")
+            print(f"INPUT: {prime}")
             
-            try:
-                # Get a sample from validation set
-                inp = random.choice(self.val_dataset)[:self.prime_length]
-                inp = inp.to(pl_module.device)
-                
-                prime = decode_tokens(inp)
-                print(f"\n\n===== GENERATION AT STEP {batch_idx+1} =====")
-                print(f"INPUT: {prime}")
-                
-                prompt = inp[None, ...]
-                
-                # Generate text
-                sampled = base_decoding(
-                    pl_module, 
-                    prompt, 
-                    self.generate_length,
-                    temperature=1.0,
-                    filter_thres=0.9
-                )
-                
-                base_decode_output = decode_tokens(sampled[0])
-                print(f"\nOUTPUT: {base_decode_output}")
-                print("=" * 50)
-            except Exception as e:
-                print(f"Error during text generation: {str(e)}")
+            prompt = inp[None, ...]
             
-            pl_module.train()
+            # Generate text
+            sampled = base_decoding(
+                pl_module, 
+                prompt, 
+                generate_length,
+                temperature=1.0,
+                filter_thres=0.9
+            )
+            
+            base_decode_output = decode_tokens(sampled[0])
+            print(f"\nOUTPUT: {base_decode_output}")
+            print("=" * 50)
+        except Exception as e:
+            print(f"Error during text generation: {str(e)}")
+        
+        pl_module.train()
 
 if __name__ == "__main__":
+    from pytorch_lightning.callbacks import LambdaCallback
+    
+    # Create a simple lambda callback for text generation
+    text_gen_callback = LambdaCallback(
+        on_train_batch_end=lambda trainer, pl_module, outputs, batch, batch_idx, unused=0: 
+            generate_text_during_training(
+                trainer, 
+                pl_module, 
+                batch_idx,
+                prime_length=128,
+                generate_length=512,
+                generate_every=500
+            )
+    )
+    
+    # Make sure to register the checkpoint callback as class_path for CLI compatibility
     # LightningCLI handles argument parsing and instantiation
     cli = LightningCLI(
         LightningMinLM,
@@ -138,12 +144,8 @@ if __name__ == "__main__":
                      "save_top_k": 3,
                      "mode": "min"
                  }},
-                # Text generation callback - using simple instantiation instead of class_path
-                TextGenerationCallback(
-                    prime_length=128,
-                    generate_length=512,
-                    generate_every=500
-                )
+                # Use the lambda callback directly
+                text_gen_callback
             ]
         }
     )
