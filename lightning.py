@@ -22,13 +22,13 @@ from minGRU_pytorch.minLM import minLM
 # Constants (matching the original training script)
 NUM_BATCHES = int(1e5)
 BATCH_SIZE = 4
-GRAD_ACCUM_EVERY = 4
+GRAD_ACCUM_EVERY = 16
 LEARNING_RATE = 1e-4
-VALIDATE_EVERY = 100
+VALIDATE_EVERY = 1024
 PRIME_LENGTH = 128
-GENERATE_EVERY = 500
+GENERATE_EVERY = 1024
 GENERATE_LENGTH = 512
-SEQ_LEN = 1024 * 2
+SEQ_LEN = 1024 * 4
 
 # Functions for text generation
 def decode_token(token):
