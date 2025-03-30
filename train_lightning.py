@@ -115,7 +115,7 @@ class TextSamplerDataset(Dataset):
     def __getitem__(self, index):
         rand_start = torch.randint(0, self.data.size(0) - self.seq_len, (1,))
         full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
-        return full_seq.cuda()
+        return full_seq  # Let Lightning handle device placement
 
 # cycle function - identical to train.py
 def cycle(loader):
@@ -264,12 +264,11 @@ if __name__ == "__main__":
     print("Creating datasets and dataloaders...")
     train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
     val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=0)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, num_workers=0, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=0, pin_memory=True)
     
-    # Cycle the loaders
+    # Only cycle the training loader
     train_loader_iter = cycle(train_loader)
-    val_loader_iter = cycle(val_loader)
     
     # Test basic loader functionality (quick sanity check)
     test_batch = next(train_loader_iter)
@@ -323,7 +322,11 @@ if __name__ == "__main__":
     print("Setting up PyTorch Lightning Trainer with gloo backend...")
     
     # Create a DDPStrategy with the gloo backend, as in test_lightning.py
-    ddp_strategy = DDPStrategy(process_group_backend="gloo") if torch.cuda.device_count() > 1 else "auto"
+    ddp_strategy = DDPStrategy(
+        process_group_backend="gloo", 
+        find_unused_parameters=False,
+        static_graph=True
+    ) if torch.cuda.device_count() > 1 else "auto"
     
     trainer = Trainer(
         max_steps=NUM_BATCHES,
@@ -333,10 +336,11 @@ if __name__ == "__main__":
         strategy=ddp_strategy,
         gradient_clip_val=0.5,
         callbacks=[checkpoint_callback, text_gen_callback, metrics_callback, progress_bar],
-        val_check_interval=VALIDATE_EVERY,
+        val_check_interval=VALIDATE_EVERY * 10,  # Reduce validation frequency
         logger=primary_logger,
-        log_every_n_steps=10,  # Less frequent logging
+        log_every_n_steps=10,
         num_sanity_val_steps=0,  # Skip validation sanity checks like in test_lightning.py
+        limit_val_batches=2,  # Limit validation to just 2 batches
     )
     print("Trainer created successfully")
     
@@ -358,9 +362,15 @@ if __name__ == "__main__":
     
     # Training start - similar to test_lightning.py
     print("Starting training...")
-    trainer.fit(
-        model, 
-        train_dataloaders=CycledDataLoader(train_loader_iter),
-        val_dataloaders=CycledDataLoader(val_loader_iter)
-    )
-    print("Training completed.")
+    try:
+        # Use the standard DataLoader for validation instead of a cycled one
+        trainer.fit(
+            model, 
+            train_dataloaders=CycledDataLoader(train_loader_iter),
+            val_dataloaders=val_loader  # Regular DataLoader for validation
+        )
+        print("Training completed.")
+    except Exception as e:
+        print(f"Training error: {e}")
+        import traceback
+        traceback.print_exc()
