@@ -280,15 +280,51 @@ def main():
         use_lstm=False  # set to True for minLSTM
     )
     
+    # Create checkpoint directory
+    checkpoint_dir = "checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
     # Set up callbacks
+    # Best models based on validation loss
     checkpoint_callback = ModelCheckpoint(
+        dirpath=checkpoint_dir,
         monitor="val_loss",
         filename="minlm-{epoch:02d}-{val_loss:.2f}",
         save_top_k=3,
         mode="min"
     )
+
+    # Periodic backups every 1000 steps
+    backup_checkpoint_callback = ModelCheckpoint(
+        dirpath=checkpoint_dir,
+        filename="minlm-backup-step-{step}",
+        every_n_train_steps=1000,
+        save_top_k=2,
+        save_last=True  # Also save the latest model as 'last.ckpt'
+    )
     
     progress_bar = TokensPerSecFormatter()
+    
+    # Save model configuration for easy reloading
+    def save_model_config():
+        import json
+        config = {
+            "num_tokens": 256,
+            "dim": 512,
+            "depth": 6,
+            "ff_mult": 4,
+            "expansion": 1.5,
+            "conv_kernel_size": 3,
+            "learning_rate": LEARNING_RATE,
+            "use_lstm": False,
+            "seq_len": SEQ_LEN,
+            "batch_size": BATCH_SIZE
+        }
+        with open(os.path.join(checkpoint_dir, "model_config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+    
+    # Save the config file
+    save_model_config()
     
     text_gen_callback = TextGenerationCallback(
         val_dataset=val_dataset,
@@ -319,7 +355,7 @@ def main():
         devices="auto",
         strategy=ddp_strategy,
         gradient_clip_val=0.5,
-        callbacks=[checkpoint_callback, text_gen_callback, progress_bar],
+        callbacks=[checkpoint_callback, backup_checkpoint_callback, text_gen_callback, progress_bar],
         val_check_interval=VALIDATE_EVERY,
         logger=csv_logger,
         log_every_n_steps=10,
@@ -339,7 +375,7 @@ def main():
     print("Starting training...")
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
     
-    # Print final stats
+    # Print final stats and save final model
     if trainer.is_global_zero:
         print("\nTraining completed.")
         print(f"Total steps: {trainer.global_step}")
@@ -347,6 +383,86 @@ def main():
         elapsed = time.time() - model.start_time
         tokens_per_sec = model.global_tokens.item() / elapsed if elapsed > 0 else 0
         print(f"Average tokens/sec: {tokens_per_sec:.2f}")
+        
+        # Save final model explicitly
+        final_model_path = os.path.join(checkpoint_dir, f"minlm-final-step-{trainer.global_step}.pt")
+        torch.save({
+            'step': trainer.global_step,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': trainer.optimizers[0].state_dict() if trainer.optimizers else None,
+            'global_tokens': model.global_tokens.item(),
+            'training_time': elapsed
+        }, final_model_path)
+        print(f"Final model saved to: {final_model_path}")
+        
+        # Save a helper script for loading the model
+        load_script_path = os.path.join(checkpoint_dir, "load_model.py")
+        with open(load_script_path, "w") as f:
+            f.write('''
+import torch
+import json
+import os
+from minGRU_pytorch.minLM import minLM
+
+def load_model(checkpoint_path, config_path=None):
+    """
+    Load a trained minLM model from checkpoint
+    
+    Args:
+        checkpoint_path: Path to the model checkpoint
+        config_path: Path to the model config file (optional)
+    
+    Returns:
+        Loaded model
+    """
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    
+    # Load config if provided, otherwise use defaults
+    if config_path and os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+    else:
+        # Default config
+        config = {
+            "num_tokens": 256,
+            "dim": 512,
+            "depth": 6,
+            "ff_mult": 4,
+            "expansion": 1.5,
+            "conv_kernel_size": 3,
+            "use_lstm": False
+        }
+    
+    # Create model with the same configuration
+    model = minLM(
+        num_tokens=config["num_tokens"],
+        dim=config["dim"],
+        depth=config["depth"],
+        ff_mult=config["ff_mult"],
+        expansion=config.get("expansion", 1.5),
+        conv_kernel_size=config.get("conv_kernel_size", 3),
+        use_lstm=config.get("use_lstm", False)
+    )
+    
+    # Load model weights
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+    
+    return model
+
+if __name__ == "__main__":
+    # Example usage
+    model = load_model(
+        checkpoint_path="minlm-final-step-100000.pt",
+        config_path="model_config.json"
+    )
+    print("Model loaded successfully!")
+    print(f"Model has {sum(p.numel() for p in model.parameters())} parameters")
+''')
+        print(f"Helper script for loading the model saved to: {load_script_path}")
 
 if __name__ == "__main__":
     main()
