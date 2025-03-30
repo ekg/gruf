@@ -282,14 +282,25 @@ def main():
     
     # Set up model
     print("Creating model...")
+    # Using a larger dimension size (2048) to create a bigger model
+    model_dim = 2048
     model = LightningMinLM(
         num_tokens=256,
-        dim=512,
+        dim=model_dim,
         depth=6,
         ff_mult=4,
         learning_rate=LEARNING_RATE,
         use_lstm=False  # set to True for minLSTM
     )
+    
+    # Print model parameter count to verify size
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"\nModel Information:")
+    print(f"Dimension: {model_dim}")
+    print(f"Total parameters: {total_params:,}")
+    # Print the shape of the first layer weight to confirm dimension
+    first_layer_shape = model.model.layers[0][2].to_hidden_and_gate.weight.shape
+    print(f"First layer dimension: {first_layer_shape}")
     
     # Create checkpoint directory
     checkpoint_dir = "checkpoints"
@@ -322,7 +333,7 @@ def main():
         import json
         config = {
             "num_tokens": 256,
-            "dim": 512,
+            "dim": model_dim,  # Use the same model_dim variable
             "depth": 6,
             "ff_mult": 4,
             "expansion": 1.5,
@@ -416,9 +427,42 @@ def main():
     print("Starting training...")
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
     
+    # Helper function to print detailed model information
+    def print_model_details(model):
+        """Print detailed information about model parameters"""
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"\nDetailed Model Information:")
+        print(f"Total parameters: {total_params:,}")
+        
+        # Group parameters by layer type
+        param_groups = {}
+        for name, param in model.named_parameters():
+            # Extract the layer type (embedding, RNN, FF, etc.)
+            if "token_emb" in name:
+                group = "embedding"
+            elif "mingru" in name or "to_hidden" in name:
+                group = "rnn"
+            elif "ff" in name:
+                group = "feedforward"
+            elif "norm" in name:
+                group = "normalization"
+            elif "to_logits" in name:
+                group = "output"
+            else:
+                group = "other"
+                
+            if group not in param_groups:
+                param_groups[group] = 0
+            param_groups[group] += param.numel()
+        
+        # Print parameter counts by group
+        for group, count in param_groups.items():
+            print(f"- {group}: {count:,} parameters ({count/total_params*100:.1f}%)")
+    
     # Print final stats and save final model
     if trainer.is_global_zero:
         print("\nTraining completed.")
+        print_model_details(model)
         print(f"Total steps: {trainer.global_step}")
         print(f"Total tokens: {model.global_tokens.item()}")
         elapsed = time.time() - model.start_time
