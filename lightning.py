@@ -82,18 +82,39 @@ def base_decoding(
 
 # TextSamplerDataset - identical to train.py
 class TextSamplerDataset(Dataset):
-    def __init__(self, data, seq_len):
+    def __init__(self, data, seq_len, shuffle_indices=False):
         super().__init__()
         self.data = data
         self.seq_len = seq_len
+        # Total number of valid starting positions
+        self.num_valid_starts = self.data.size(0) - self.seq_len - 1
+        
+        # Create indices for all valid starting positions
+        self.indices = torch.arange(self.num_valid_starts)
+        if shuffle_indices:
+            # Create a shuffled version of indices but keep original ordering available
+            self.shuffled_indices = torch.randperm(self.num_valid_starts)
+        else:
+            self.shuffled_indices = None
 
     def __len__(self):
-        return self.data.size(0) // self.seq_len
+        return self.num_valid_starts
 
     def __getitem__(self, index):
-        rand_start = torch.randint(0, self.data.size(0) - self.seq_len, (1,))
-        full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
+        # Use shuffled indices if enabled, otherwise use sequential access
+        if self.shuffled_indices is not None:
+            start_idx = self.shuffled_indices[index]
+        else:
+            start_idx = index
+            
+        # Get sequence starting at the determined position
+        full_seq = self.data[start_idx : start_idx + self.seq_len + 1].long()
         return full_seq  # Let Lightning handle device placement
+    
+    def reshuffle(self):
+        """Reshuffle indices at the beginning of each epoch"""
+        if self.shuffled_indices is not None:
+            self.shuffled_indices = torch.randperm(self.num_valid_starts)
 
 # LightningMinLM model
 class LightningMinLM(pl.LightningModule):
@@ -182,6 +203,18 @@ class TokensPerSecFormatter(TQDMProgressBar):
             items['toks/s'] = f"{items['toks/s']:.2f}k/s"
         return items
 
+# Callback to reshuffle dataset indices at the beginning of each epoch
+class ReshuffleDatasetCallback(pl.Callback):
+    def __init__(self, dataset):
+        super().__init__()
+        self.dataset = dataset
+    
+    def on_train_epoch_start(self, trainer, pl_module):
+        if hasattr(self.dataset, 'reshuffle'):
+            self.dataset.reshuffle()
+            if trainer.global_rank == 0:
+                print(f"Reshuffled dataset indices at epoch {trainer.current_epoch}")
+
 # Text generation callback
 class TextGenerationCallback(pl.Callback):
     def __init__(self, val_dataset, prime_length=128, generate_length=512, generate_every=500):
@@ -252,8 +285,8 @@ def main():
 
     # Create datasets and dataloaders
     print("Creating datasets and dataloaders...")
-    train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
-    val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
+    train_dataset = TextSamplerDataset(data_train, SEQ_LEN, shuffle_indices=True)
+    val_dataset = TextSamplerDataset(data_val, SEQ_LEN, shuffle_indices=False)
     
     # Calculate optimal number of workers (typically CPU count)
     num_workers = min(31, os.cpu_count() or 4)
@@ -333,6 +366,9 @@ def main():
     # Save the config file
     save_model_config()
     
+    # Create a callback to reshuffle the dataset at the beginning of each epoch
+    reshuffle_callback = ReshuffleDatasetCallback(train_dataset)
+    
     text_gen_callback = TextGenerationCallback(
         val_dataset=val_dataset,
         prime_length=PRIME_LENGTH,
@@ -354,24 +390,32 @@ def main():
         static_graph=False  # Setting to False to avoid DDP autograd hooks issue
     ) if torch.cuda.device_count() > 1 else "auto"
 
+    # Calculate number of epochs needed to reach NUM_BATCHES
+    steps_per_epoch = len(train_dataset) // BATCH_SIZE
+    if steps_per_epoch == 0:
+        steps_per_epoch = 1  # Avoid division by zero
+    max_epochs = math.ceil(NUM_BATCHES / steps_per_epoch)
+    
+    print(f"Dataset has {len(train_dataset)} samples")
+    print(f"With batch size {BATCH_SIZE}, each epoch has {steps_per_epoch} steps")
+    print(f"Training for {max_epochs} epochs to reach approximately {NUM_BATCHES} steps")
+
     # Create trainer
     trainer = pl.Trainer(
-        max_steps=NUM_BATCHES,
+        max_steps=NUM_BATCHES,  # Still use max_steps as a hard limit
         accumulate_grad_batches=GRAD_ACCUM_EVERY,
         accelerator="gpu",
         devices="auto",
         strategy=ddp_strategy,
         gradient_clip_val=0.5,
-        callbacks=[checkpoint_callback, backup_checkpoint_callback, text_gen_callback, progress_bar],
+        callbacks=[checkpoint_callback, backup_checkpoint_callback, text_gen_callback, progress_bar, reshuffle_callback],
         val_check_interval=VALIDATE_EVERY,
         logger=csv_logger,
         log_every_n_steps=10,
         num_sanity_val_steps=0,
         limit_val_batches=4,
-        # This ensures we use max_steps as the stopping criterion
-        max_epochs=None,
-        # This makes training continue indefinitely until max_steps is reached
-        check_val_every_n_epoch=None,
+        max_epochs=max_epochs,  # Set max_epochs to ensure we can track progress
+        check_val_every_n_epoch=None,  # Still validate based on steps, not epochs
     )
 
     print(f"Starting training with {torch.cuda.device_count()} GPUs")
