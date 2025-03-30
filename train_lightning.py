@@ -2,32 +2,31 @@ import math
 import torch
 import time
 import os
+import gzip
+import numpy as np
+import random
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
-from pytorch_lightning.utilities import rank_zero_only
 import sys
 from pytorch_lightning.loggers import CSVLogger
+from torch.utils.data import DataLoader, Dataset
 
 # Set float32 matmul precision to address the warning
 torch.set_float32_matmul_precision('high')
 
-# Force more aggressive logging
-os.environ["PYTORCH_LIGHTNING_RANK_ZERO_ONLY"] = "0"  # To ensure logging from all ranks
-
 from lightning_min_lm import LightningMinLM
-from data_module import Enwik8DataModule
 
 # Constants (matching the original training script)
 NUM_BATCHES = int(1e5)
 BATCH_SIZE = 4
+GRAD_ACCUM_EVERY = 4
 LEARNING_RATE = 1e-4
 VALIDATE_EVERY = 100
 PRIME_LENGTH = 128
 GENERATE_EVERY = 500
 GENERATE_LENGTH = 512
 SEQ_LEN = 512
-TRUNCATED_BPTT_STEPS = 128  # For recurrent training
 
 # Functions for text generation
 def decode_token(token):
@@ -79,54 +78,55 @@ def base_decoding(
 
     return out[..., prompt_seq_len:]
 
-# Debug initialization - print when each process starts
-def print_debug_info():
-    global_rank = int(os.environ.get("GLOBAL_RANK", 0))
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    
-    # This will print from every process
-    print(f"STARTING: Process rank {global_rank}/{world_size} (local: {local_rank}) - PID: {os.getpid()}", 
-          flush=True, file=sys.stderr)
+# TextSamplerDataset - identical to train.py
+class TextSamplerDataset(Dataset):
+    def __init__(self, data, seq_len):
+        super().__init__()
+        self.data = data
+        self.seq_len = seq_len
 
-print_debug_info()
+    def __len__(self):
+        return self.data.size(0) // self.seq_len
+
+    def __getitem__(self, index):
+        rand_start = torch.randint(0, self.data.size(0) - self.seq_len, (1,))
+        full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
+        return full_seq.cuda()
+
+# cycle function - identical to train.py
+def cycle(loader):
+    while True:
+        for data in loader:
+            yield data
 
 # Custom progress tracking callback
 class TrainingMetricsCallback(pl.Callback):
     def __init__(self):
         super().__init__()
         self.start_time = None
-        self.last_batch_idx = 0
         self.tokens_processed = 0
-        print("TrainingMetricsCallback initialized", flush=True, file=sys.stderr)
     
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
-        # Not using rank_zero_only to get logging from all processes
-        global_rank = trainer.global_rank
-        if self.start_time is None or batch_idx < self.last_batch_idx:
+        if self.start_time is None:
             self.start_time = time.time()
             self.tokens_processed = 0
-            print(f"[Rank {global_rank}] Starting batch timing", flush=True, file=sys.stderr)
-        self.last_batch_idx = batch_idx
     
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        global_rank = trainer.global_rank
-        # Count tokens processed
-        batch_size = batch.size(0)
-        seq_len = batch.size(1) - 1  # -1 because we're using the last token as the target
-        self.tokens_processed += batch_size * seq_len
-        
-        # Calculate tokens per second
-        elapsed = time.time() - self.start_time
-        if elapsed > 0:
-            tokens_per_sec = self.tokens_processed / elapsed
-            loss = outputs["loss"] if isinstance(outputs, dict) else outputs
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, unused=0):
+        if trainer.global_rank == 0:  # Only print from rank 0
+            # Count tokens processed
+            batch_size = batch.size(0)
+            seq_len = batch.size(1) - 1  # -1 because we're using the last token as the target
+            self.tokens_processed += batch_size * seq_len
             
-            # Print for all ranks to debug
-            msg = f"[Rank {global_rank}] Step {batch_idx}: loss: {loss.item():.3f} | {tokens_per_sec:.2f} tokens/s"
-            print(msg, flush=True, file=sys.stderr)
+            # Calculate tokens per second
+            elapsed = time.time() - self.start_time
+            if elapsed > 0:
+                tokens_per_sec = self.tokens_processed / elapsed
+                loss = outputs["loss"] if isinstance(outputs, dict) else outputs
+                
+                print(f"training loss: {loss.item():.3f} | {tokens_per_sec:.2f} tokens/s", end="\r")
 
-# Text generation callback
+# Text generation callback - simplified to match train.py pattern
 class TextGenerationCallback(pl.Callback):
     def __init__(self, val_dataset, prime_length=128, generate_length=512, generate_every=500):
         super().__init__()
@@ -134,12 +134,10 @@ class TextGenerationCallback(pl.Callback):
         self.prime_length = prime_length
         self.generate_length = generate_length
         self.generate_every = generate_every
-        print("TextGenerationCallback initialized", flush=True, file=sys.stderr)
     
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, unused=0):
         # Only generate text on rank 0
         if trainer.global_rank == 0 and (batch_idx + 1) % self.generate_every == 0:
-            print(f"\n\nStarting text generation at step {batch_idx+1}", flush=True, file=sys.stderr)
             pl_module.eval()
             
             try:
@@ -148,8 +146,7 @@ class TextGenerationCallback(pl.Callback):
                 inp = inp.cuda()
                 
                 prime = decode_tokens(inp)
-                print(f"\n\n===== GENERATION AT STEP {batch_idx+1} =====", flush=True)
-                print(f"INPUT: {prime}", flush=True)
+                print(f"INPUT: {prime}")
                 
                 prompt = inp[None, ...]
                 
@@ -163,22 +160,28 @@ class TextGenerationCallback(pl.Callback):
                 )
                 
                 base_decode_output = decode_tokens(sampled[0])
-                print(f"\nOUTPUT: {base_decode_output}", flush=True)
-                print("=" * 50, flush=True)
+                print(f"\nOUTPUT: {base_decode_output}")
             except Exception as e:
-                print(f"Error during text generation: {str(e)}", flush=True, file=sys.stderr)
+                print(f"Error during text generation: {str(e)}")
             
             pl_module.train()
 
 if __name__ == "__main__":
-    import random
+    # Load and prepare data - exactly as in train.py
+    with gzip.open("./data/enwik8.gz") as file:
+        data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
+        np_train, np_valid = np.split(data, [int(90e6)])
+        data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
+
+    # Create datasets and dataloaders - exactly as in train.py
+    train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
+    val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
     
-    # Set up data module
-    data_module = Enwik8DataModule(
-        batch_size=BATCH_SIZE,
-        seq_len=SEQ_LEN
-    )
-    data_module.setup()
+    # Cycle the loaders - exactly as in train.py
+    train_loader_iter = cycle(train_loader)
+    val_loader_iter = cycle(val_loader)
     
     # Set up model
     model = LightningMinLM(
@@ -199,7 +202,7 @@ if __name__ == "__main__":
     )
     
     text_gen_callback = TextGenerationCallback(
-        val_dataset=data_module.val_dataset,
+        val_dataset=val_dataset,
         prime_length=PRIME_LENGTH,
         generate_length=GENERATE_LENGTH,
         generate_every=GENERATE_EVERY
@@ -212,27 +215,34 @@ if __name__ == "__main__":
     # Create a CSV logger
     logger = CSVLogger("logs", name="min_lm_training")
     
-    # Print trainer setup info
-    gpu_count = torch.cuda.device_count()
-    print(f"Setting up trainer with {gpu_count} GPUs...", flush=True, file=sys.stderr)
-    
     # Set up trainer
     trainer = Trainer(
-        max_steps=NUM_BATCHES,  # to match the original script
+        max_steps=NUM_BATCHES,
+        accumulate_grad_batches=GRAD_ACCUM_EVERY,  # Match grad accumulation from train.py
         accelerator="gpu",
         devices="auto",  # use all available GPUs
         strategy="ddp" if torch.cuda.device_count() > 1 else None,
         gradient_clip_val=0.5,
         callbacks=[checkpoint_callback, text_gen_callback, metrics_callback, progress_bar],
         val_check_interval=VALIDATE_EVERY,
-        enable_progress_bar=True,
-        log_every_n_steps=1,  # Log every step for more visibility
         logger=logger
     )
     
-    print("Trainer setup complete, starting training...", flush=True, file=sys.stderr)
+    # Create a custom dataloader that returns the cycled data
+    # This makes the Lightning version use exactly the same data pattern as train.py
+    class CycledDataLoader:
+        def __init__(self, cycled_iterator):
+            self.cycled_iterator = cycled_iterator
+        
+        def __iter__(self):
+            return self
+        
+        def __next__(self):
+            return next(self.cycled_iterator)
     
-    # Train model
-    print("Starting trainer.fit()...", flush=True, file=sys.stderr)
-    trainer.fit(model, data_module)
-    print("Training complete!", flush=True, file=sys.stderr)
+    # Train model with the cycled data loaders
+    trainer.fit(
+        model, 
+        train_dataloaders=CycledDataLoader(train_loader_iter),
+        val_dataloaders=CycledDataLoader(val_loader_iter)
+    )

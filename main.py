@@ -112,7 +112,31 @@ def generate_text_during_training(trainer, pl_module, batch_idx, prime_length=12
         pl_module.train()
 
 if __name__ == "__main__":
+    import gzip
+    import numpy as np
+    from torch.utils.data import DataLoader, Dataset
     from pytorch_lightning.callbacks import LambdaCallback
+    
+    # TextSamplerDataset - identical to train.py
+    class TextSamplerDataset(Dataset):
+        def __init__(self, data, seq_len):
+            super().__init__()
+            self.data = data
+            self.seq_len = seq_len
+
+        def __len__(self):
+            return self.data.size(0) // self.seq_len
+
+        def __getitem__(self, index):
+            rand_start = torch.randint(0, self.data.size(0) - self.seq_len, (1,))
+            full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
+            return full_seq.cuda()
+    
+    # cycle function - identical to train.py
+    def cycle(loader):
+        while True:
+            for data in loader:
+                yield data
     
     # Create a simple lambda callback for text generation
     text_gen_callback = LambdaCallback(
@@ -127,25 +151,75 @@ if __name__ == "__main__":
             )
     )
     
-    # Make sure to register the checkpoint callback as class_path for CLI compatibility
-    # LightningCLI handles argument parsing and instantiation
-    cli = LightningCLI(
-        LightningMinLM,
-        Enwik8DataModule,
-        seed_everything_default=42,
-        run=True,  # Run fit by default
-        trainer_defaults={
-            "callbacks": [
-                # Model checkpoint callback
-                {"class_path": "pytorch_lightning.callbacks.ModelCheckpoint",
-                 "init_args": {
-                     "monitor": "val_loss",
-                     "filename": "minlm-{epoch:02d}-{val_loss:.2f}",
-                     "save_top_k": 3,
-                     "mode": "min"
-                 }},
-                # Use the lambda callback directly
-                text_gen_callback
-            ]
-        }
-    )
+    # If using CLI, load data first to pass validation dataset to callback
+    if len(sys.argv) > 1 and sys.argv[1] == "fit":
+        # Load data the same way as train.py
+        with gzip.open("./data/enwik8.gz") as file:
+            data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
+            np_train, np_valid = np.split(data, [int(90e6)])
+            data_val = torch.from_numpy(np_valid)
+        
+        val_dataset = TextSamplerDataset(data_val, 512)
+        
+        # Use a custom data module that loads data identically to train.py
+        class EnwikTextSamplerDataModule(pl.LightningDataModule):
+            def __init__(self, batch_size=4, seq_len=512, data_path="./data/enwik8.gz"):
+                super().__init__()
+                self.batch_size = batch_size
+                self.seq_len = seq_len
+                self.data_path = data_path
+                
+                # Load the data immediately so it's available for callbacks
+                with gzip.open(self.data_path) as file:
+                    data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
+                    np_train, np_valid = np.split(data, [int(90e6)])
+                    self.data_train = torch.from_numpy(np_train)
+                    self.data_val = torch.from_numpy(np_valid)
+                
+                self.train_dataset = TextSamplerDataset(self.data_train, self.seq_len)
+                self.val_dataset = TextSamplerDataset(self.data_val, self.seq_len)
+            
+            def train_dataloader(self):
+                train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size)
+                return CycledDataLoader(cycle(train_loader))
+            
+            def val_dataloader(self):
+                val_loader = DataLoader(self.val_dataset, batch_size=self.batch_size)
+                return CycledDataLoader(cycle(val_loader))
+        
+        # Custom dataloader that returns cycled data
+        class CycledDataLoader:
+            def __init__(self, cycled_iterator):
+                self.cycled_iterator = cycled_iterator
+            
+            def __iter__(self):
+                return self
+            
+            def __next__(self):
+                return next(self.cycled_iterator)
+    
+        # Make sure to register the checkpoint callback as class_path for CLI compatibility
+        # LightningCLI handles argument parsing and instantiation
+        cli = LightningCLI(
+            LightningMinLM,
+            EnwikTextSamplerDataModule,
+            seed_everything_default=42,
+            run=True,  # Run fit by default
+            trainer_defaults={
+                "callbacks": [
+                    # Model checkpoint callback
+                    {"class_path": "pytorch_lightning.callbacks.ModelCheckpoint",
+                     "init_args": {
+                         "monitor": "val_loss",
+                         "filename": "minlm-{epoch:02d}-{val_loss:.2f}",
+                         "save_top_k": 3,
+                         "mode": "min"
+                     }},
+                    # Use the lambda callback directly
+                    text_gen_callback
+                ],
+                "accumulate_grad_batches": 4  # Match GRAD_ACCUM_EVERY from train.py
+            }
+        )
+    else:
+        print("Please use the 'fit' command to run training.")
