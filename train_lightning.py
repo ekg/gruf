@@ -1,8 +1,14 @@
 import math
 import torch
+import time
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
+from pytorch_lightning.utilities import rank_zero_only
+import sys
+
+# Set float32 matmul precision to address the warning
+torch.set_float32_matmul_precision('high')
 
 from lightning_min_lm import LightningMinLM
 from data_module import Enwik8DataModule
@@ -68,6 +74,38 @@ def base_decoding(
 
     return out[..., prompt_seq_len:]
 
+# Custom progress tracking callback
+class TrainingMetricsCallback(pl.Callback):
+    def __init__(self):
+        super().__init__()
+        self.start_time = None
+        self.last_batch_idx = 0
+        self.tokens_processed = 0
+    
+    @rank_zero_only
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        if self.start_time is None or batch_idx < self.last_batch_idx:  # Reset on epoch change
+            self.start_time = time.time()
+            self.tokens_processed = 0
+        self.last_batch_idx = batch_idx
+    
+    @rank_zero_only
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        # Count tokens processed
+        batch_size = batch.size(0)
+        seq_len = batch.size(1) - 1  # -1 because we're using the last token as the target
+        self.tokens_processed += batch_size * seq_len
+        
+        # Calculate tokens per second
+        elapsed = time.time() - self.start_time
+        if elapsed > 0:
+            tokens_per_sec = self.tokens_processed / elapsed
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs
+            
+            # Print to stderr to avoid Lightning's progress bar clearing it
+            print(f"\rStep {batch_idx}: loss: {loss.item():.3f} | {tokens_per_sec:.2f} tokens/s", 
+                  end="", file=sys.stderr)
+
 # Text generation callback
 class TextGenerationCallback(pl.Callback):
     def __init__(self, val_dataset, prime_length=128, generate_length=512, generate_every=500):
@@ -76,7 +114,8 @@ class TextGenerationCallback(pl.Callback):
         self.prime_length = prime_length
         self.generate_length = generate_length
         self.generate_every = generate_every
-        
+    
+    @rank_zero_only
     def on_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if (batch_idx + 1) % self.generate_every == 0:
             pl_module.eval()
@@ -86,6 +125,7 @@ class TextGenerationCallback(pl.Callback):
             inp = inp.cuda()
             
             prime = decode_tokens(inp)
+            print(f"\n\n===== GENERATION AT STEP {batch_idx+1} =====")
             print(f"INPUT: {prime}")
             
             prompt = inp[None, ...]
@@ -101,6 +141,7 @@ class TextGenerationCallback(pl.Callback):
             
             base_decode_output = decode_tokens(sampled[0])
             print(f"\nOUTPUT: {base_decode_output}")
+            print("=" * 50)
             
             pl_module.train()
 
@@ -139,6 +180,10 @@ if __name__ == "__main__":
         generate_every=GENERATE_EVERY
     )
     
+    metrics_callback = TrainingMetricsCallback()
+    
+    progress_bar = TQDMProgressBar(refresh_rate=20)  # Update every 20 steps
+    
     # Set up trainer
     trainer = Trainer(
         max_steps=NUM_BATCHES,  # to match the original script
@@ -146,8 +191,10 @@ if __name__ == "__main__":
         devices="auto",  # use all available GPUs
         strategy="ddp" if torch.cuda.device_count() > 1 else None,
         gradient_clip_val=0.5,
-        callbacks=[checkpoint_callback, text_gen_callback],
-        val_check_interval=VALIDATE_EVERY
+        callbacks=[checkpoint_callback, text_gen_callback, metrics_callback, progress_bar],
+        val_check_interval=VALIDATE_EVERY,
+        enable_progress_bar=True,
+        log_every_n_steps=10
     )
     
     # Train model
