@@ -360,14 +360,35 @@ def main():
     ) if torch.cuda.device_count() > 1 else "auto"
 
     # Calculate number of epochs needed to reach NUM_BATCHES
-    steps_per_epoch = len(train_dataset) // BATCH_SIZE
-    if steps_per_epoch == 0:
-        steps_per_epoch = 1  # Avoid division by zero
-    max_epochs = math.ceil(NUM_BATCHES / steps_per_epoch)
+    total_samples = len(train_dataset)
+    steps_per_epoch_global = total_samples // BATCH_SIZE
+    world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    steps_per_epoch_per_gpu = steps_per_epoch_global // world_size
+    if steps_per_epoch_per_gpu == 0:
+        steps_per_epoch_per_gpu = 1  # Avoid division by zero
+    max_epochs = math.ceil(NUM_BATCHES / steps_per_epoch_per_gpu)
     
-    print(f"Dataset has {len(train_dataset)} samples")
-    print(f"With batch size {BATCH_SIZE}, each epoch has {steps_per_epoch} steps")
+    # Calculate tokens per epoch
+    tokens_per_sample = SEQ_LEN
+    tokens_per_epoch_per_gpu = steps_per_epoch_per_gpu * BATCH_SIZE * tokens_per_sample
+    tokens_per_epoch_total = tokens_per_epoch_per_gpu * world_size
+    effective_batch_size = BATCH_SIZE * world_size * GRAD_ACCUM_EVERY
+    
+    print(f"\n--- Training Configuration ---")
+    print(f"Total dataset size: {data_train.shape[0]:,} characters")
+    print(f"Sequence length: {SEQ_LEN} tokens")
+    print(f"Total samples: {total_samples:,} (dataset size / sequence length)")
+    print(f"Running on {world_size} GPUs")
+    print(f"Batch size per GPU: {BATCH_SIZE}")
+    print(f"Global batch size: {BATCH_SIZE * world_size}")
+    print(f"Gradient accumulation: {GRAD_ACCUM_EVERY}")
+    print(f"Effective batch size: {effective_batch_size}")
+    print(f"Steps per epoch per GPU: {steps_per_epoch_per_gpu}")
+    print(f"Steps per epoch total: {steps_per_epoch_global}")
+    print(f"Tokens per epoch per GPU: {tokens_per_epoch_per_gpu:,}")
+    print(f"Tokens per epoch total: {tokens_per_epoch_total:,}")
     print(f"Training for {max_epochs} epochs to reach approximately {NUM_BATCHES} steps")
+    print(f"-----------------------------\n")
 
     # Create trainer
     trainer = pl.Trainer(
