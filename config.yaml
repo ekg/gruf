@@ -1,0 +1,33 @@
+# Default configuration for MinLM training
+model:
+  num_tokens: 256
+  dim: 512
+  depth: 6
+  ff_mult: 4
+  learning_rate: 1.0e-4
+  use_lstm: false
+
+data:
+  batch_size: 4
+  seq_len: 512
+  data_path: ./data/enwik8.gz
+
+trainer:
+  max_steps: 100000
+  accelerator: gpu
+  devices: auto
+  strategy: ddp
+  gradient_clip_val: 0.5
+  val_check_interval: 100
+  callbacks:
+    - class_path: pytorch_lightning.callbacks.ModelCheckpoint
+      init_args:
+        monitor: val_loss
+        filename: minlm-{epoch:02d}-{val_loss:.2f}
+        save_top_k: 3
+        mode: min
+    - class_path: main.TextGenerationCallback
+      init_args:
+        prime_length: 128
+        generate_length: 512
+        generate_every: 500
