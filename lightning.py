@@ -300,7 +300,8 @@ def main():
         filename="minlm-backup-step-{step}",
         every_n_train_steps=1000,
         save_top_k=2,
-        save_last=True  # Also save the latest model as 'last.ckpt'
+        save_last=True,  # Also save the latest model as 'last.ckpt'
+        monitor="step"    # Monitor the step count for save_top_k
     )
     
     progress_bar = TokensPerSecFormatter()
