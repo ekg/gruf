@@ -3,6 +3,7 @@ import gzip
 import random
 import numpy as np
 import math
+import time
 import pytorch_lightning as pl
 import torch
 from torch import nn
@@ -118,6 +119,9 @@ class LightningMinLM(pl.LightningModule):
             conv_kernel_size=conv_kernel_size,
             use_lstm=use_lstm
         )
+        # For tracking tokens per second
+        self.total_tokens_processed = 0
+        self.start_time = time.time()
     
     def forward(self, x, prev_hiddens=None):
         return self.model(x, return_loss=False, return_prev_hiddens=True, prev_hiddens=prev_hiddens)
@@ -125,12 +129,26 @@ class LightningMinLM(pl.LightningModule):
     def training_step(self, batch, batch_idx, hiddens=None):
         loss = self.model(batch, return_loss=True)
         self.log('train_loss', loss, prog_bar=True, sync_dist=True)
-        print(f"Rank {self.global_rank} | Batch {batch_idx} | Loss: {loss.item():.4f}")
+        
+        # Update tokens processed count
+        tokens_in_batch = batch.numel()
+        self.total_tokens_processed += tokens_in_batch
+        
+        # Only display on rank 0 to avoid duplicate output
+        if self.global_rank == 0:
+            elapsed = time.time() - self.start_time
+            tokens_per_sec = self.total_tokens_processed / elapsed if elapsed > 0 else 0
+            print(f"Batch {batch_idx} | Loss: {loss.item():.4f} | {tokens_per_sec:.2f} tokens/s", end="\r")
+        
         return {"loss": loss}
     
     def validation_step(self, batch, batch_idx):
         loss = self.model(batch, return_loss=True)
         self.log('val_loss', loss, prog_bar=True, sync_dist=True)
+        
+        if self.global_rank == 0 and batch_idx == 0:
+            print(f"\nvalidation loss: {loss.item():.4f}")
+            
         return {"val_loss": loss}
     
     def configure_optimizers(self):
@@ -176,7 +194,7 @@ class TextGenerationCallback(pl.Callback):
                 )
                 
                 base_decode_output = decode_tokens(sampled[0])
-                print(f"OUTPUT: {base_decode_output}")
+                print(f"\nOUTPUT: {base_decode_output}")
                 print(f"--- END SAMPLE GENERATION ---\n")
                 
             except Exception as e:

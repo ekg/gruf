@@ -127,24 +127,32 @@ optim = Adam(model.parameters(), lr = LEARNING_RATE)
 train_loader = cycle(train_loader)
 val_loader = cycle(val_loader)
 
-# training
+# Track total tokens processed and time for global token/s calculation
+total_tokens_processed = 0
+global_start_time = time.time()
 
+# training
 for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
     model.train()
-    start_time = time.time()
+    batch_start_time = time.time()
 
     for _ in range(GRAD_ACCUM_EVERY):
         data = next(train_loader)
-
         loss = model(data, return_loss = True)
-
         (loss / GRAD_ACCUM_EVERY).backward()
     
-    # Calculate tokens per second
-    elapsed = time.time() - start_time
-    tokens_per_sec = (BATCH_SIZE * GRAD_ACCUM_EVERY * SEQ_LEN) / elapsed
+    # Update total tokens processed
+    tokens_in_batch = BATCH_SIZE * GRAD_ACCUM_EVERY * SEQ_LEN
+    total_tokens_processed += tokens_in_batch
     
-    print(f"training loss: {loss.item():.3f} | {tokens_per_sec:.2f} tokens/s", end="\r")
+    # Calculate tokens per second (both for this batch and overall)
+    batch_elapsed = time.time() - batch_start_time
+    global_elapsed = time.time() - global_start_time
+    
+    batch_tokens_per_sec = tokens_in_batch / batch_elapsed if batch_elapsed > 0 else 0
+    global_tokens_per_sec = total_tokens_processed / global_elapsed if global_elapsed > 0 else 0
+    
+    print(f"Batch {i} | Loss: {loss.item():.4f} | {global_tokens_per_sec:.2f} tokens/s", end="\r")
 
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
 
@@ -155,9 +163,8 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
         model.eval()
         with torch.no_grad():
             valid_data = next(val_loader)
-
             loss = model(valid_data, return_loss = True)
-            print(f"\nvalidation loss: {loss.item():.3f}")
+            print(f"\nvalidation loss: {loss.item():.4f}")
 
     if i % GENERATE_EVERY == 0:
         model.eval()
