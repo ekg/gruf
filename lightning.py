@@ -161,10 +161,6 @@ class LightningMinLM(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         loss = self.model(batch, return_loss=True)
         self.log('val_loss', loss, prog_bar=True, sync_dist=True)
-        
-        if self.global_rank == 0 and batch_idx == 0:
-            print(f"\nvalidation loss: {loss.item():.4f}")
-            
         return {"val_loss": loss}
     
     def configure_optimizers(self):
