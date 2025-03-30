@@ -122,7 +122,8 @@ class LightningMinLM(pl.LightningModule):
         # For tracking tokens per second
         self.total_tokens_processed = 0
         self.start_time = time.time()
-    
+        self.register_buffer('global_tokens', torch.tensor(0, dtype=torch.long))
+        
     def forward(self, x, prev_hiddens=None):
         return self.model(x, return_loss=False, return_prev_hiddens=True, prev_hiddens=prev_hiddens)
     
@@ -130,15 +131,30 @@ class LightningMinLM(pl.LightningModule):
         loss = self.model(batch, return_loss=True)
         self.log('train_loss', loss, prog_bar=True, sync_dist=True)
         
-        # Update tokens processed count
+        # Update tokens processed count - local to this process
         tokens_in_batch = batch.numel()
         self.total_tokens_processed += tokens_in_batch
+        
+        # Track tokens across all processes
+        if self.trainer.world_size > 1:
+            # Convert to tensor for all_reduce
+            batch_tokens = torch.tensor(tokens_in_batch, device=self.device)
+            # Sum across all processes
+            torch.distributed.all_reduce(batch_tokens, op=torch.distributed.ReduceOp.SUM)
+            # Update global counter
+            self.global_tokens += batch_tokens
+            global_tokens_processed = self.global_tokens.item()
+        else:
+            self.global_tokens += tokens_in_batch
+            global_tokens_processed = self.global_tokens.item()
         
         # Only display on rank 0 to avoid duplicate output
         if self.global_rank == 0:
             elapsed = time.time() - self.start_time
-            tokens_per_sec = self.total_tokens_processed / elapsed if elapsed > 0 else 0
-            print(f"Batch {batch_idx} | Loss: {loss.item():.4f} | {tokens_per_sec:.2f} tokens/s", end="\r")
+            global_tokens_per_sec = global_tokens_processed / elapsed if elapsed > 0 else 0
+            # Log to progress bar
+            self.log('tokens_per_sec', global_tokens_per_sec, prog_bar=True)
+            print(f"Batch {self.trainer.global_step}/{NUM_BATCHES} | Loss: {loss.item():.4f} | Global: {global_tokens_per_sec:.2f} tokens/s", end="\r")
         
         return {"loss": loss}
     
@@ -226,8 +242,9 @@ def main():
     print("Creating datasets and dataloaders...")
     train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
     val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, num_workers=0, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=0, pin_memory=True)
+    # Set shuffle=True to ensure we don't exhaust the dataset
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, num_workers=0, pin_memory=True, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=0, pin_memory=True, shuffle=True)
     
     # Set up model
     print("Creating model...")
@@ -283,15 +300,28 @@ def main():
         log_every_n_steps=10,
         num_sanity_val_steps=0,
         limit_val_batches=4,
+        # This ensures we use max_steps as the stopping criterion
+        max_epochs=None,
+        # This makes training continue indefinitely until max_steps is reached
+        check_val_every_n_epoch=None,
     )
 
     print(f"Starting training with {torch.cuda.device_count()} GPUs")
     print(f"Config: bs={BATCH_SIZE}, grad_accum={GRAD_ACCUM_EVERY}, lr={LEARNING_RATE}, seq_len={SEQ_LEN}")
+    print(f"Will run for {NUM_BATCHES} steps")
     
     # Start training
     print("Starting training...")
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
-    print("Training completed.")
+    
+    # Print final stats
+    if trainer.is_global_zero:
+        print("\nTraining completed.")
+        print(f"Total steps: {trainer.global_step}")
+        print(f"Total tokens: {model.global_tokens.item()}")
+        elapsed = time.time() - model.start_time
+        tokens_per_sec = model.global_tokens.item() / elapsed if elapsed > 0 else 0
+        print(f"Average tokens/sec: {tokens_per_sec:.2f}")
 
 if __name__ == "__main__":
     main()
