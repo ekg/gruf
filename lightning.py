@@ -248,7 +248,7 @@ def main():
     ddp_strategy = DDPStrategy(
         process_group_backend="gloo",
         find_unused_parameters=False,
-        static_graph=True
+        static_graph=False  # Setting to False to avoid DDP autograd hooks issue
     ) if torch.cuda.device_count() > 1 else "auto"
 
     # Create trainer
