@@ -103,46 +103,29 @@ with gzip.open("./data/enwik8.gz") as file:
     data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
 
 class TextSamplerDataset(Dataset):
-    def __init__(self, data, seq_len, shuffle_indices=False):
+    def __init__(self, data, seq_len):
         super().__init__()
         self.data = data
         self.seq_len = seq_len
-        # Total number of valid starting positions
-        self.num_valid_starts = self.data.size(0) - self.seq_len - 1
-        
-        # Create indices for all valid starting positions
-        self.indices = torch.arange(self.num_valid_starts)
-        if shuffle_indices:
-            # Create a shuffled version of indices but keep original ordering available
-            self.shuffled_indices = torch.randperm(self.num_valid_starts)
-        else:
-            self.shuffled_indices = None
+        # Define dataset length such that one epoch covers the full data
+        # Each sample is seq_len tokens, so we need data_size/seq_len samples to cover all
+        self.samples_per_epoch = max(1, self.data.size(0) // self.seq_len)
 
     def __len__(self):
-        return self.num_valid_starts
+        return self.samples_per_epoch
 
     def __getitem__(self, index):
-        # Use shuffled indices if enabled, otherwise use sequential access
-        if self.shuffled_indices is not None:
-            start_idx = self.shuffled_indices[index]
-        else:
-            start_idx = index
-            
-        # Get sequence starting at the determined position
-        full_seq = self.data[start_idx : start_idx + self.seq_len + 1].long()
+        # Random sampling from anywhere in the data
+        rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
+        full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
         return full_seq.cuda()
-    
-    def reshuffle(self):
-        """Reshuffle indices at the beginning of each epoch"""
-        if self.shuffled_indices is not None:
-            self.shuffled_indices = torch.randperm(self.num_valid_starts)
 
 # Calculate optimal number of workers
 num_workers = min(31, os.cpu_count() or 4)
 print(f"Using {num_workers} dataloader workers")
 
-train_dataset = TextSamplerDataset(data_train, SEQ_LEN, shuffle_indices=True)
-val_dataset = TextSamplerDataset(data_val, SEQ_LEN, shuffle_indices=False)
+train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
+val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, num_workers=num_workers, pin_memory=True)
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=num_workers, pin_memory=True, shuffle=False)
 

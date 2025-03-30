@@ -82,39 +82,22 @@ def base_decoding(
 
 # TextSamplerDataset - identical to train.py
 class TextSamplerDataset(Dataset):
-    def __init__(self, data, seq_len, shuffle_indices=False):
+    def __init__(self, data, seq_len):
         super().__init__()
         self.data = data
         self.seq_len = seq_len
-        # Total number of valid starting positions
-        self.num_valid_starts = self.data.size(0) - self.seq_len - 1
-        
-        # Create indices for all valid starting positions
-        self.indices = torch.arange(self.num_valid_starts)
-        if shuffle_indices:
-            # Create a shuffled version of indices but keep original ordering available
-            self.shuffled_indices = torch.randperm(self.num_valid_starts)
-        else:
-            self.shuffled_indices = None
+        # Define dataset length such that one epoch covers the full data
+        # Each sample is seq_len tokens, so we need data_size/seq_len samples to cover all
+        self.samples_per_epoch = max(1, self.data.size(0) // self.seq_len)
 
     def __len__(self):
-        return self.num_valid_starts
+        return self.samples_per_epoch
 
     def __getitem__(self, index):
-        # Use shuffled indices if enabled, otherwise use sequential access
-        if self.shuffled_indices is not None:
-            start_idx = self.shuffled_indices[index]
-        else:
-            start_idx = index
-            
-        # Get sequence starting at the determined position
-        full_seq = self.data[start_idx : start_idx + self.seq_len + 1].long()
+        # Random sampling from anywhere in the data
+        rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
+        full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
         return full_seq  # Let Lightning handle device placement
-    
-    def reshuffle(self):
-        """Reshuffle indices at the beginning of each epoch"""
-        if self.shuffled_indices is not None:
-            self.shuffled_indices = torch.randperm(self.num_valid_starts)
 
 # LightningMinLM model
 class LightningMinLM(pl.LightningModule):
@@ -203,17 +186,6 @@ class TokensPerSecFormatter(TQDMProgressBar):
             items['toks/s'] = f"{items['toks/s']:.2f}k/s"
         return items
 
-# Callback to reshuffle dataset indices at the beginning of each epoch
-class ReshuffleDatasetCallback(pl.Callback):
-    def __init__(self, dataset):
-        super().__init__()
-        self.dataset = dataset
-    
-    def on_train_epoch_start(self, trainer, pl_module):
-        if hasattr(self.dataset, 'reshuffle'):
-            self.dataset.reshuffle()
-            if trainer.global_rank == 0:
-                print(f"Reshuffled dataset indices at epoch {trainer.current_epoch}")
 
 # Text generation callback
 class TextGenerationCallback(pl.Callback):
@@ -285,8 +257,8 @@ def main():
 
     # Create datasets and dataloaders
     print("Creating datasets and dataloaders...")
-    train_dataset = TextSamplerDataset(data_train, SEQ_LEN, shuffle_indices=True)
-    val_dataset = TextSamplerDataset(data_val, SEQ_LEN, shuffle_indices=False)
+    train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
+    val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
     
     # Calculate optimal number of workers (typically CPU count)
     num_workers = min(31, os.cpu_count() or 4)
@@ -366,9 +338,6 @@ def main():
     # Save the config file
     save_model_config()
     
-    # Create a callback to reshuffle the dataset at the beginning of each epoch
-    reshuffle_callback = ReshuffleDatasetCallback(train_dataset)
-    
     text_gen_callback = TextGenerationCallback(
         val_dataset=val_dataset,
         prime_length=PRIME_LENGTH,
@@ -408,7 +377,7 @@ def main():
         devices="auto",
         strategy=ddp_strategy,
         gradient_clip_val=0.5,
-        callbacks=[checkpoint_callback, backup_checkpoint_callback, text_gen_callback, progress_bar, reshuffle_callback],
+        callbacks=[checkpoint_callback, backup_checkpoint_callback, text_gen_callback, progress_bar],
         val_check_interval=VALIDATE_EVERY,
         logger=csv_logger,
         log_every_n_steps=10,
