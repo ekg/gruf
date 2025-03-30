@@ -153,16 +153,8 @@ class LightningMinLM(pl.LightningModule):
             elapsed = time.time() - self.start_time
             global_tokens_per_sec = global_tokens_processed / elapsed if elapsed > 0 else 0
             
-            # Format tokens/s in a human-readable way
-            if global_tokens_per_sec >= 1e6:
-                formatted_toks = f"{global_tokens_per_sec/1e6:.2f}M/s"
-            elif global_tokens_per_sec >= 1e3:
-                formatted_toks = f"{global_tokens_per_sec/1e3:.2f}k/s"
-            else:
-                formatted_toks = f"{global_tokens_per_sec:.2f}/s"
-                
-            # Log to progress bar with better name and value
-            self.log('toks/s', formatted_toks, prog_bar=True)
+            # Just log the raw value - the progress bar will format it
+            self.log('toks/s', global_tokens_per_sec / 1000, prog_bar=True)  # Convert to thousands for cleaner display
         
         return {"loss": loss}
     
