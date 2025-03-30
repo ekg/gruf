@@ -3,6 +3,7 @@ import gzip
 import random
 import tqdm
 import numpy as np
+import time
 
 import torch
 from torch.optim import Adam
@@ -126,6 +127,7 @@ val_loader = cycle(val_loader)
 
 for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
     model.train()
+    start_time = time.time()
 
     for _ in range(GRAD_ACCUM_EVERY):
         data = next(train_loader)
@@ -133,8 +135,12 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
         loss = model(data, return_loss = True)
 
         (loss / GRAD_ACCUM_EVERY).backward()
-
-    print(f"training loss: {loss.item():.3f}")
+    
+    # Calculate tokens per second
+    elapsed = time.time() - start_time
+    tokens_per_sec = (BATCH_SIZE * GRAD_ACCUM_EVERY * SEQ_LEN) / elapsed
+    
+    print(f"training loss: {loss.item():.3f} | {tokens_per_sec:.2f} tokens/s", end="\r")
 
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
 
@@ -147,7 +153,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
             valid_data = next(val_loader)
 
             loss = model(valid_data, return_loss = True)
-            print(f"validation loss: {loss.item():.3f}")
+            print(f"\nvalidation loss: {loss.item():.3f}")
 
     if i % GENERATE_EVERY == 0:
         model.eval()
