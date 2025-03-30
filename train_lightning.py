@@ -9,7 +9,8 @@ import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 import sys
-from pytorch_lightning.loggers import CSVLogger
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.strategies import DDPStrategy
 from torch.utils.data import DataLoader, Dataset
 
 # Set float32 matmul precision to address the warning
@@ -112,7 +113,7 @@ class TrainingMetricsCallback(pl.Callback):
             self.tokens_processed = 0
     
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, unused=0):
-        if trainer.global_rank == 0:  # Only print from rank 0
+        if trainer.global_rank == 0:  # Only log from main process
             # Count tokens processed
             batch_size = batch.size(0)
             seq_len = batch.size(1) - 1  # -1 because we're using the last token as the target
@@ -124,7 +125,15 @@ class TrainingMetricsCallback(pl.Callback):
                 tokens_per_sec = self.tokens_processed / elapsed
                 loss = outputs["loss"] if isinstance(outputs, dict) else outputs
                 
-                print(f"training loss: {loss.item():.3f} | {tokens_per_sec:.2f} tokens/s", end="\r")
+                # Log properly through Lightning instead of direct printing
+                trainer.logger.log_metrics({
+                    "tokens_per_second": tokens_per_sec,
+                    "batch_loss": loss.item()
+                }, step=trainer.global_step)
+                
+                # Still print for immediate feedback, but without \r which doesn't work well in multi-process
+                if batch_idx % 10 == 0:  # Only print every 10 batches to reduce console spam
+                    print(f"Step {trainer.global_step}: loss: {loss.item():.3f} | {tokens_per_sec:.2f} tokens/s")
 
 # Text generation callback - simplified to match train.py pattern
 class TextGenerationCallback(pl.Callback):
@@ -135,9 +144,14 @@ class TextGenerationCallback(pl.Callback):
         self.generate_length = generate_length
         self.generate_every = generate_every
     
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, unused=0):
-        # Only generate text on rank 0
-        if trainer.global_rank == 0 and (batch_idx + 1) % self.generate_every == 0:
+    def on_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        # Only generate text on rank 0 and only during training
+        if (trainer.global_rank == 0 and 
+            trainer.state.stage == "train" and 
+            (trainer.global_step + 1) % self.generate_every == 0):
+            
+            # Store original mode and switch to eval
+            was_training = pl_module.training
             pl_module.eval()
             
             try:
@@ -146,6 +160,7 @@ class TextGenerationCallback(pl.Callback):
                 inp = inp.cuda()
                 
                 prime = decode_tokens(inp)
+                print(f"\n\n--- SAMPLE GENERATION AT STEP {trainer.global_step} ---")
                 print(f"INPUT: {prime}")
                 
                 prompt = inp[None, ...]
@@ -160,11 +175,21 @@ class TextGenerationCallback(pl.Callback):
                 )
                 
                 base_decode_output = decode_tokens(sampled[0])
-                print(f"\nOUTPUT: {base_decode_output}")
+                print(f"OUTPUT: {base_decode_output}")
+                print(f"--- END SAMPLE GENERATION ---\n")
+                
+                # Log the generated text to TensorBoard as text
+                trainer.logger.experiment.add_text(
+                    f"generated_text_step_{trainer.global_step}", 
+                    f"Input: {prime}\n\nOutput: {base_decode_output}",
+                    trainer.global_step
+                )
             except Exception as e:
                 print(f"Error during text generation: {str(e)}")
-            
-            pl_module.train()
+            finally:
+                # Restore the model to its original training state
+                if was_training:
+                    pl_module.train()
 
 if __name__ == "__main__":
     # Load and prepare data - exactly as in train.py
@@ -212,20 +237,21 @@ if __name__ == "__main__":
     
     progress_bar = TQDMProgressBar(refresh_rate=20)  # Update every 20 steps
     
-    # Create a CSV logger
-    logger = CSVLogger("logs", name="min_lm_training")
+    # Create a TensorBoard logger for better real-time visibility
+    logger = TensorBoardLogger("logs", name="min_lm_training")
     
-    # Set up trainer
+    # Set up trainer with improved distributed settings
     trainer = Trainer(
         max_steps=NUM_BATCHES,
         accumulate_grad_batches=GRAD_ACCUM_EVERY,  # Match grad accumulation from train.py
         accelerator="gpu",
         devices="auto",  # use all available GPUs
-        strategy="ddp" if torch.cuda.device_count() > 1 else None,
+        strategy=DDPStrategy(find_unused_parameters=False) if torch.cuda.device_count() > 1 else "auto",
         gradient_clip_val=0.5,
         callbacks=[checkpoint_callback, text_gen_callback, metrics_callback, progress_bar],
         val_check_interval=VALIDATE_EVERY,
-        logger=logger
+        logger=logger,
+        log_every_n_steps=1  # Add explicit logging frequency
     )
     
     # Create a custom dataloader that returns the cycled data
