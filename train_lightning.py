@@ -6,24 +6,31 @@ import gzip
 import numpy as np
 import random
 import logging
+import sys
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
-import sys
 from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
 from pytorch_lightning.strategies import DDPStrategy
 from torch.utils.data import DataLoader, Dataset
 
-# Set up logging
+# Force all print statements to flush immediately
+import builtins
+_original_print = builtins.print
+builtins.print = lambda *args, **kwargs: _original_print(*args, **(dict(kwargs, flush=True)))
+
+# Set up extremely verbose logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Change to DEBUG for maximum verbosity
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("training.log"),
-        logging.StreamHandler()
+        logging.FileHandler("training.log", mode='w'),  # Overwrite existing log
+        logging.StreamHandler(sys.stdout)  # Direct to stdout
     ]
 )
 logger = logging.getLogger("min_lm_training")
+logger.setLevel(logging.DEBUG)
+logger.info("========== LOGGING INITIALIZED ==========")
 
 # Set float32 matmul precision to address the warning
 torch.set_float32_matmul_precision('high')
@@ -114,13 +121,26 @@ def cycle(loader):
 
 # Custom progress tracking callback
 class CustomProgressBar(TQDMProgressBar):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        print("CustomProgressBar initialized")
+        
     def get_metrics(self, trainer, pl_module):
         items = super().get_metrics(trainer, pl_module)
-        # Add tokens/sec if available
+        # Add more visible metrics
         if hasattr(trainer, 'logged_metrics'):
+            items["PROGRESS"] = f"STEP {trainer.global_step}"
             if 'tokens_per_second' in trainer.logged_metrics:
-                items["tokens/s"] = f"{trainer.logged_metrics['tokens_per_second']:.2f}"
+                items["TOKENS/S"] = f"{trainer.logged_metrics['tokens_per_second']:.2f}"
+            if 'batch_loss' in trainer.logged_metrics:
+                items["LOSS"] = f"{trainer.logged_metrics['batch_loss']:.5f}"
         return items
+    
+    def on_train_batch_end(self, *args, **kwargs):
+        # Force progress bar to print on every batch
+        print("\n")  # Add extra newline for visibility
+        print("PROGRESS BAR UPDATE")
+        super().on_train_batch_end(*args, **kwargs)
 
 class TrainingMetricsCallback(pl.Callback):
     def __init__(self):
@@ -128,34 +148,52 @@ class TrainingMetricsCallback(pl.Callback):
         self.start_time = None
         self.tokens_processed = 0
         self.logger = logging.getLogger("min_lm_training.metrics")
+        print("TrainingMetricsCallback initialized")
+        self.logger.info("TrainingMetricsCallback initialized")
     
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        print(f"\n========== STARTING BATCH {batch_idx} ==========")
+        self.logger.debug(f"Starting batch {batch_idx}, global_step={trainer.global_step}")
+        
         if self.start_time is None:
             self.start_time = time.time()
             self.tokens_processed = 0
+            print("Timer started")
     
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, unused=0):
-        if trainer.global_rank == 0:  # Only log from main process
-            # Count tokens processed
-            batch_size = batch.size(0)
-            seq_len = batch.size(1) - 1  # -1 because we're using the last token as the target
-            self.tokens_processed += batch_size * seq_len
+        # Always log on all processes to help debug
+        # Remove the global_rank check to log from all processes
+        
+        # Count tokens processed
+        batch_size = batch.size(0)
+        seq_len = batch.size(1) - 1  # -1 because we're using the last token as the target
+        self.tokens_processed += batch_size * seq_len
+        
+        # Calculate tokens per second
+        elapsed = time.time() - self.start_time
+        if elapsed > 0:
+            tokens_per_sec = self.tokens_processed / elapsed
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs
             
-            # Calculate tokens per second
-            elapsed = time.time() - self.start_time
-            if elapsed > 0:
-                tokens_per_sec = self.tokens_processed / elapsed
-                loss = outputs["loss"] if isinstance(outputs, dict) else outputs
-                
-                # Log properly through Lightning instead of direct printing
-                trainer.logger.log_metrics({
-                    "tokens_per_second": tokens_per_sec,
-                    "batch_loss": loss.item()
-                }, step=trainer.global_step)
-                
-                # Use proper logging instead of print
-                if batch_idx % 10 == 0:  # Only log every 10 batches to reduce console spam
-                    self.logger.info(f"Step {trainer.global_step}: loss: {loss.item():.3f} | {tokens_per_sec:.2f} tokens/s")
+            # Log through Lightning
+            trainer.logger.log_metrics({
+                "tokens_per_second": tokens_per_sec,
+                "batch_loss": loss.item()
+            }, step=trainer.global_step)
+            
+            # Extreme logging - print EVERY batch with clear markers
+            print(f"======== STEP {trainer.global_step} ========")
+            print(f"BATCH {batch_idx} METRICS:")
+            print(f"LOSS: {loss.item():.5f}")
+            print(f"TOKENS/SEC: {tokens_per_sec:.2f}")
+            print(f"ELAPSED TIME: {elapsed:.2f}s")
+            print(f"BATCH SHAPE: {batch.shape}")
+            print(f"GPU MEM ALLOCATED: {torch.cuda.memory_allocated() / 1024**2:.2f}MB")
+            print(f"GPU MEM RESERVED: {torch.cuda.memory_reserved() / 1024**2:.2f}MB")
+            print(f"================================")
+            
+            # Also log to file with extreme detail
+            self.logger.info(f"STEP {trainer.global_step} | BATCH {batch_idx} | LOSS: {loss.item():.5f} | {tokens_per_sec:.2f} tokens/s | TIME: {elapsed:.2f}s")
 
 # Text generation callback - simplified to match train.py pattern
 class TextGenerationCallback(pl.Callback):
@@ -166,6 +204,8 @@ class TextGenerationCallback(pl.Callback):
         self.generate_length = generate_length
         self.generate_every = generate_every
         self.logger = logging.getLogger("min_lm_training.text_gen")
+        print("TextGenerationCallback initialized")
+        self.logger.info("TextGenerationCallback initialized")
     
     def on_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         # Only generate text on rank 0 and only during training
@@ -221,31 +261,80 @@ class TextGenerationCallback(pl.Callback):
                     pl_module.train()
 
 if __name__ == "__main__":
+    # Initial diagnostic output
+    print("========== PROGRAM STARTED ==========")
+    print(f"CUDA AVAILABLE: {torch.cuda.is_available()}")
+    print(f"GPU COUNT: {torch.cuda.device_count()}")
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+    print(f"PYTORCH VERSION: {torch.__version__}")
+    print(f"PYTORCH LIGHTNING VERSION: {pl.__version__}")
+    print("====================================")
+    
     # Load and prepare data - exactly as in train.py
-    with gzip.open("./data/enwik8.gz") as file:
-        data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
-        np_train, np_valid = np.split(data, [int(90e6)])
-        data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
+    print("Loading data from enwik8.gz...")
+    try:
+        with gzip.open("./data/enwik8.gz") as file:
+            print("File opened successfully, reading data...")
+            data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
+            np_train, np_valid = np.split(data, [int(90e6)])
+            data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
+            print("========== DATA LOADED ==========")
+            print(f"TRAIN DATA SHAPE: {data_train.shape}")
+            print(f"VAL DATA SHAPE: {data_val.shape}")
+            print("================================")
+    except Exception as e:
+        print(f"ERROR LOADING DATA: {str(e)}")
+        raise
 
     # Create datasets and dataloaders - exactly as in train.py
+    print("Creating datasets and dataloaders...")
     train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
     val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+    print(f"Train dataset size: {len(train_dataset)}")
+    print(f"Val dataset size: {len(val_dataset)}")
     
     # Cycle the loaders - exactly as in train.py
+    print("Setting up cycled data loaders...")
     train_loader_iter = cycle(train_loader)
     val_loader_iter = cycle(val_loader)
     
+    # Test data loaders
+    print("========== TESTING DATA LOADERS ==========")
+    try:
+        print("Testing train loader...")
+        test_batch = next(train_loader_iter)
+        print(f"SUCCESS - Train batch shape: {test_batch.shape}")
+        
+        print("Testing val loader...")
+        test_batch = next(val_loader_iter)
+        print(f"SUCCESS - Val batch shape: {test_batch.shape}")
+    except Exception as e:
+        print(f"ERROR IN DATA LOADERS: {str(e)}")
+        print("This could be why you're not seeing output!")
+        raise
+    print("=======================================")
+    
     # Set up model
-    model = LightningMinLM(
-        num_tokens=256,
-        dim=512,
-        depth=6,
-        ff_mult=4,
-        learning_rate=LEARNING_RATE,
-        use_lstm=False  # set to True for minLSTM
-    )
+    print("========== CREATING MODEL ==========")
+    try:
+        model = LightningMinLM(
+            num_tokens=256,
+            dim=512,
+            depth=6,
+            ff_mult=4,
+            learning_rate=LEARNING_RATE,
+            use_lstm=False  # set to True for minLSTM
+        )
+        print("MODEL CREATED:")
+        print(model)
+        print("==================================")
+    except Exception as e:
+        print(f"ERROR CREATING MODEL: {str(e)}")
+        raise
     
     # Set up callbacks
     checkpoint_callback = ModelCheckpoint(
@@ -281,23 +370,43 @@ if __name__ == "__main__":
     primary_logger = csv_logger
     
     # Set up trainer with improved distributed settings
-    trainer = Trainer(
-        max_steps=NUM_BATCHES,
-        accumulate_grad_batches=GRAD_ACCUM_EVERY,  # Match grad accumulation from train.py
-        accelerator="gpu",
-        devices="auto",  # use all available GPUs
-        strategy=DDPStrategy(find_unused_parameters=False) if torch.cuda.device_count() > 1 else "auto",
-        gradient_clip_val=0.5,
-        callbacks=[checkpoint_callback, text_gen_callback, metrics_callback, progress_bar],
-        val_check_interval=VALIDATE_EVERY,
-        logger=primary_logger,
-        log_every_n_steps=1  # Add explicit logging frequency
-    )
+    print("Setting up PyTorch Lightning Trainer...")
+    try:
+        trainer = Trainer(
+            max_steps=NUM_BATCHES,
+            accumulate_grad_batches=GRAD_ACCUM_EVERY,  # Match grad accumulation from train.py
+            accelerator="gpu",
+            devices="auto",  # use all available GPUs
+            strategy=DDPStrategy(find_unused_parameters=False) if torch.cuda.device_count() > 1 else "auto",
+            gradient_clip_val=0.5,
+            callbacks=[checkpoint_callback, text_gen_callback, metrics_callback, progress_bar],
+            val_check_interval=VALIDATE_EVERY,
+            logger=primary_logger,
+            log_every_n_steps=1,  # Add explicit logging frequency
+            enable_progress_bar=True,
+            enable_model_summary=True,
+            enable_checkpointing=True
+        )
+        print("Trainer created successfully")
+    except Exception as e:
+        print(f"ERROR CREATING TRAINER: {str(e)}")
+        raise
     
     # Log the training configuration
     logger.info(f"Starting training with {torch.cuda.device_count()} GPUs")
     logger.info(f"Batch size: {BATCH_SIZE}, Grad accumulation: {GRAD_ACCUM_EVERY}")
     logger.info(f"Learning rate: {LEARNING_RATE}, Sequence length: {SEQ_LEN}")
+    
+    print("======== TRAINING CONFIGURATION ========")
+    print(f"BATCH SIZE: {BATCH_SIZE}")
+    print(f"GRAD ACCUMULATION: {GRAD_ACCUM_EVERY}")
+    print(f"EFFECTIVE BATCH SIZE: {BATCH_SIZE * GRAD_ACCUM_EVERY}")
+    print(f"LEARNING RATE: {LEARNING_RATE}")
+    print(f"SEQUENCE LENGTH: {SEQ_LEN}")
+    print(f"NUM BATCHES: {NUM_BATCHES}")
+    print(f"VALIDATE EVERY: {VALIDATE_EVERY}")
+    print(f"GENERATE EVERY: {GENERATE_EVERY}")
+    print("=======================================")
     
     # Create a custom dataloader that returns the cycled data
     # This makes the Lightning version use exactly the same data pattern as train.py
@@ -311,9 +420,22 @@ if __name__ == "__main__":
         def __next__(self):
             return next(self.cycled_iterator)
     
+    # Pre-training sanity check
+    print("========== PRE-TRAINING SANITY CHECK ==========")
+    print("About to call trainer.fit()")
+    print("If you don't see ANY output after this, the training loop may not be starting")
+    print("=============================================")
+    
     # Train model with the cycled data loaders
-    trainer.fit(
-        model, 
-        train_dataloaders=CycledDataLoader(train_loader_iter),
-        val_dataloaders=CycledDataLoader(val_loader_iter)
-    )
+    try:
+        print("STARTING TRAINING NOW!")
+        trainer.fit(
+            model, 
+            train_dataloaders=CycledDataLoader(train_loader_iter),
+            val_dataloaders=CycledDataLoader(val_loader_iter)
+        )
+        print("TRAINING COMPLETED SUCCESSFULLY!")
+    except Exception as e:
+        print(f"ERROR DURING TRAINING: {str(e)}")
+        import traceback
+        traceback.print_exc()
