@@ -5,13 +5,25 @@ import os
 import gzip
 import numpy as np
 import random
+import logging
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 import sys
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
 from pytorch_lightning.strategies import DDPStrategy
 from torch.utils.data import DataLoader, Dataset
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("training.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("min_lm_training")
 
 # Set float32 matmul precision to address the warning
 torch.set_float32_matmul_precision('high')
@@ -101,11 +113,21 @@ def cycle(loader):
             yield data
 
 # Custom progress tracking callback
+class CustomProgressBar(TQDMProgressBar):
+    def get_metrics(self, trainer, pl_module):
+        items = super().get_metrics(trainer, pl_module)
+        # Add tokens/sec if available
+        if hasattr(trainer, 'logged_metrics'):
+            if 'tokens_per_second' in trainer.logged_metrics:
+                items["tokens/s"] = f"{trainer.logged_metrics['tokens_per_second']:.2f}"
+        return items
+
 class TrainingMetricsCallback(pl.Callback):
     def __init__(self):
         super().__init__()
         self.start_time = None
         self.tokens_processed = 0
+        self.logger = logging.getLogger("min_lm_training.metrics")
     
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         if self.start_time is None:
@@ -131,9 +153,9 @@ class TrainingMetricsCallback(pl.Callback):
                     "batch_loss": loss.item()
                 }, step=trainer.global_step)
                 
-                # Still print for immediate feedback, but without \r which doesn't work well in multi-process
-                if batch_idx % 10 == 0:  # Only print every 10 batches to reduce console spam
-                    print(f"Step {trainer.global_step}: loss: {loss.item():.3f} | {tokens_per_sec:.2f} tokens/s")
+                # Use proper logging instead of print
+                if batch_idx % 10 == 0:  # Only log every 10 batches to reduce console spam
+                    self.logger.info(f"Step {trainer.global_step}: loss: {loss.item():.3f} | {tokens_per_sec:.2f} tokens/s")
 
 # Text generation callback - simplified to match train.py pattern
 class TextGenerationCallback(pl.Callback):
@@ -143,6 +165,7 @@ class TextGenerationCallback(pl.Callback):
         self.prime_length = prime_length
         self.generate_length = generate_length
         self.generate_every = generate_every
+        self.logger = logging.getLogger("min_lm_training.text_gen")
     
     def on_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         # Only generate text on rank 0 and only during training
@@ -160,8 +183,8 @@ class TextGenerationCallback(pl.Callback):
                 inp = inp.cuda()
                 
                 prime = decode_tokens(inp)
-                print(f"\n\n--- SAMPLE GENERATION AT STEP {trainer.global_step} ---")
-                print(f"INPUT: {prime}")
+                self.logger.info(f"\n--- SAMPLE GENERATION AT STEP {trainer.global_step} ---")
+                self.logger.info(f"INPUT: {prime}")
                 
                 prompt = inp[None, ...]
                 
@@ -175,17 +198,23 @@ class TextGenerationCallback(pl.Callback):
                 )
                 
                 base_decode_output = decode_tokens(sampled[0])
-                print(f"OUTPUT: {base_decode_output}")
-                print(f"--- END SAMPLE GENERATION ---\n")
+                self.logger.info(f"OUTPUT: {base_decode_output}")
+                self.logger.info(f"--- END SAMPLE GENERATION ---")
                 
-                # Log the generated text to TensorBoard as text
-                trainer.logger.experiment.add_text(
-                    f"generated_text_step_{trainer.global_step}", 
-                    f"Input: {prime}\n\nOutput: {base_decode_output}",
-                    trainer.global_step
-                )
+                # Write generated text to CSV logs too
+                if hasattr(trainer.logger, 'experiment'):
+                    if isinstance(trainer.logger, TensorBoardLogger):
+                        trainer.logger.experiment.add_text(
+                            f"generated_text_step_{trainer.global_step}", 
+                            f"Input: {prime}\n\nOutput: {base_decode_output}",
+                            trainer.global_step
+                        )
+                    
+                # Also save the generated text to a separate file for easy viewing
+                with open(f"generated_text_step_{trainer.global_step}.txt", "w") as f:
+                    f.write(f"INPUT: {prime}\n\nOUTPUT: {base_decode_output}")
             except Exception as e:
-                print(f"Error during text generation: {str(e)}")
+                self.logger.error(f"Error during text generation: {str(e)}")
             finally:
                 # Restore the model to its original training state
                 if was_training:
@@ -235,10 +264,21 @@ if __name__ == "__main__":
     
     metrics_callback = TrainingMetricsCallback()
     
-    progress_bar = TQDMProgressBar(refresh_rate=20)  # Update every 20 steps
+    progress_bar = CustomProgressBar(refresh_rate=20)  # Update every 20 steps
     
-    # Create a TensorBoard logger for better real-time visibility
-    logger = TensorBoardLogger("logs", name="min_lm_training")
+    # Create multi-logger setup for better real-time visibility
+    # Use CSVLogger as the main logger, which works well for CLI environments
+    csv_logger = CSVLogger(
+        save_dir="logs",
+        name="min_lm_training",
+        flush_logs_every_n_steps=10  # Write to disk more frequently
+    )
+    
+    # Keep TensorBoard logger as well if available, but we don't rely on it
+    tb_logger = TensorBoardLogger("logs", name="min_lm_training")
+    
+    # Use CSV logger as our primary logger
+    primary_logger = csv_logger
     
     # Set up trainer with improved distributed settings
     trainer = Trainer(
@@ -250,9 +290,14 @@ if __name__ == "__main__":
         gradient_clip_val=0.5,
         callbacks=[checkpoint_callback, text_gen_callback, metrics_callback, progress_bar],
         val_check_interval=VALIDATE_EVERY,
-        logger=logger,
+        logger=primary_logger,
         log_every_n_steps=1  # Add explicit logging frequency
     )
+    
+    # Log the training configuration
+    logger.info(f"Starting training with {torch.cuda.device_count()} GPUs")
+    logger.info(f"Batch size: {BATCH_SIZE}, Grad accumulation: {GRAD_ACCUM_EVERY}")
+    logger.info(f"Learning rate: {LEARNING_RATE}, Sequence length: {SEQ_LEN}")
     
     # Create a custom dataloader that returns the cycled data
     # This makes the Lightning version use exactly the same data pattern as train.py
