@@ -248,9 +248,26 @@ def main():
     print("Creating datasets and dataloaders...")
     train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
     val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
-    # Set shuffle=True to ensure we don't exhaust the dataset
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, num_workers=0, pin_memory=True, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=0, pin_memory=True, shuffle=True)
+    
+    # Calculate optimal number of workers (typically CPU count)
+    num_workers = min(31, os.cpu_count() or 4)
+    print(f"Using {num_workers} dataloader workers")
+    
+    # Set shuffle=True for training but False for validation as recommended
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=BATCH_SIZE, 
+        num_workers=num_workers, 
+        pin_memory=True, 
+        shuffle=True
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=BATCH_SIZE, 
+        num_workers=num_workers, 
+        pin_memory=True, 
+        shuffle=False  # Disable shuffling for validation as recommended
+    )
     
     # Set up model
     print("Creating model...")

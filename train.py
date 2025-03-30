@@ -4,6 +4,7 @@ import random
 import tqdm
 import numpy as np
 import time
+import os
 
 import torch
 from torch.optim import Adam
@@ -115,10 +116,14 @@ class TextSamplerDataset(Dataset):
         full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
         return full_seq.cuda()
 
+# Calculate optimal number of workers
+num_workers = min(31, os.cpu_count() or 4)
+print(f"Using {num_workers} dataloader workers")
+
 train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
 val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
-train_loader = DataLoader(train_dataset, batch_size = BATCH_SIZE)
-val_loader = DataLoader(val_dataset, batch_size = BATCH_SIZE)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, num_workers=num_workers, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=num_workers, pin_memory=True, shuffle=False)
 
 # optimizer
 
