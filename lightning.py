@@ -121,13 +121,19 @@ class LightningMinLM(pl.LightningModule):
         )
         # For tracking tokens per second
         self.total_tokens_processed = 0
-        self.start_time = time.time()
+        self.start_time = None  # Will be set on first training step
         self.register_buffer('global_tokens', torch.tensor(0, dtype=torch.long))
         
     def forward(self, x, prev_hiddens=None):
         return self.model(x, return_loss=False, return_prev_hiddens=True, prev_hiddens=prev_hiddens)
     
     def training_step(self, batch, batch_idx, hiddens=None):
+        # Initialize start_time on first training step
+        if self.start_time is None:
+            self.start_time = time.time()
+            if self.global_rank == 0:
+                print(f"Starting tokens/s timing at step {batch_idx}")
+                
         loss = self.model(batch, return_loss=True)
         self.log('train_loss', loss, prog_bar=True, sync_dist=True)
         
