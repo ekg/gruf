@@ -14,6 +14,10 @@ from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
 from pytorch_lightning.strategies import DDPStrategy
 from torch.utils.data import DataLoader, Dataset
 
+# Set environment variables for NCCL
+os.environ["NCCL_DEBUG"] = "INFO"
+os.environ["NCCL_SOCKET_IFNAME"] = "eno1"  # Use the specific interface shown in your logs
+
 # Force all print statements to flush immediately
 import builtins
 _original_print = builtins.print
@@ -261,6 +265,10 @@ class TextGenerationCallback(pl.Callback):
                     pl_module.train()
 
 if __name__ == "__main__":
+    # Set precision
+    pl.seed_everything(42)
+    torch.set_float32_matmul_precision('medium')
+    
     # Initial diagnostic output
     print("========== PROGRAM STARTED ==========")
     print(f"CUDA AVAILABLE: {torch.cuda.is_available()}")
@@ -270,6 +278,7 @@ if __name__ == "__main__":
             print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
     print(f"PYTORCH VERSION: {torch.__version__}")
     print(f"PYTORCH LIGHTNING VERSION: {pl.__version__}")
+    print(f"Using gloo backend for distributed training")
     print("====================================")
     
     # Load and prepare data - exactly as in train.py
@@ -369,15 +378,18 @@ if __name__ == "__main__":
     # Use CSV logger as our primary logger
     primary_logger = csv_logger
     
-    # Set up trainer with improved distributed settings
-    print("Setting up PyTorch Lightning Trainer...")
+    # Set up trainer with gloo backend for distributed training
+    print("Setting up PyTorch Lightning Trainer with gloo backend...")
     try:
+        # Create a DDPStrategy with the gloo backend
+        ddp_strategy = DDPStrategy(process_group_backend="gloo") if torch.cuda.device_count() > 1 else "auto"
+        
         trainer = Trainer(
             max_steps=NUM_BATCHES,
             accumulate_grad_batches=GRAD_ACCUM_EVERY,  # Match grad accumulation from train.py
             accelerator="gpu",
             devices="auto",  # use all available GPUs
-            strategy=DDPStrategy(find_unused_parameters=False) if torch.cuda.device_count() > 1 else "auto",
+            strategy=ddp_strategy,
             gradient_clip_val=0.5,
             callbacks=[checkpoint_callback, text_gen_callback, metrics_callback, progress_bar],
             val_check_interval=VALIDATE_EVERY,
