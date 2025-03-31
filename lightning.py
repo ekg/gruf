@@ -10,6 +10,7 @@ import pytorch_lightning as pl
 import torch
 import mmap
 import datetime
+import csv
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from pytorch_lightning.strategies import DDPStrategy
@@ -151,7 +152,7 @@ class LightningMinLM(pl.LightningModule):
                 print(f"Starting tokens/s timing at step {batch_idx}")
                 
         loss = self.model(batch, return_loss=True)
-        self.log('train_loss', loss, prog_bar=True, sync_dist=True)
+        self.log('train_loss', loss, prog_bar=True, sync_dist=True, on_step=True, on_epoch=True)
         
         # Update tokens processed count - local to this process
         tokens_in_batch = batch.numel()
@@ -182,7 +183,7 @@ class LightningMinLM(pl.LightningModule):
     
     def validation_step(self, batch, batch_idx):
         loss = self.model(batch, return_loss=True)
-        self.log('val_loss', loss, prog_bar=True, sync_dist=True)
+        self.log('val_loss', loss, prog_bar=True, sync_dist=True, on_step=False, on_epoch=True)
         return {"val_loss": loss}
     
     def configure_optimizers(self):
@@ -197,6 +198,64 @@ class TokensPerSecFormatter(TQDMProgressBar):
             # Will be in thousands already from our conversion above
             items['toks/s'] = f"{items['toks/s']:.2f}k/s"
         return items
+
+# Training metrics logger callback
+class MetricsLoggerCallback(pl.Callback):
+    def __init__(self, log_path):
+        super().__init__()
+        self.log_path = log_path
+        self.start_time = None
+        
+        # Create headers for the CSV file
+        with open(self.log_path, 'w') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "step", "epoch", "time", "tokens_processed", 
+                "tokens_per_sec", "train_loss", "val_loss", 
+                "learning_rate", "batch_size", "grad_accum", "seq_len"
+            ])
+        
+    def on_train_start(self, trainer, pl_module):
+        self.start_time = time.time()
+        
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        # Log every 10 steps but only on rank 0 to avoid duplicates in distributed training
+        if trainer.is_global_zero and (trainer.global_step % 10 == 0):
+            self._log_metrics(trainer, pl_module)
+    
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.is_global_zero:
+            self._log_metrics(trainer, pl_module, is_validation=True)
+    
+    def _log_metrics(self, trainer, pl_module, is_validation=False):
+        elapsed = time.time() - self.start_time
+        global_tokens = pl_module.global_tokens.item()
+        tokens_per_sec = global_tokens / elapsed if elapsed > 0 else 0
+        
+        # Get the loss values from callback metrics
+        train_loss = trainer.callback_metrics.get('train_loss', torch.tensor(0.0)).item()
+        val_loss = trainer.callback_metrics.get('val_loss')
+        val_loss_value = val_loss.item() if val_loss is not None else "N/A"
+        
+        # Only show validation loss if this is called after validation
+        if not is_validation:
+            val_loss_value = "N/A"
+        
+        with open(self.log_path, 'a') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                trainer.global_step,
+                trainer.current_epoch,
+                f"{elapsed:.2f}",
+                global_tokens,
+                f"{tokens_per_sec:.2f}",
+                f"{train_loss:.6f}",
+                val_loss_value,
+                pl_module.learning_rate,
+                BATCH_SIZE,
+                GRAD_ACCUM_EVERY,
+                SEQ_LEN
+            ])
 
 
 
@@ -620,6 +679,10 @@ def main():
     print(f"Training for {max_epochs} epochs to reach approximately {NUM_BATCHES} steps")
     print(f"-----------------------------\n")
 
+    # Create training metrics logger
+    metrics_log_path = os.path.join(checkpoint_dir, "training_metrics.csv")
+    metrics_logger = MetricsLoggerCallback(metrics_log_path)
+    
     # Create trainer
     trainer = pl.Trainer(
         max_steps=NUM_BATCHES,  # Still use max_steps as a hard limit
@@ -628,7 +691,7 @@ def main():
         devices=gpu_ids if gpu_ids else "auto",
         strategy=ddp_strategy,
         gradient_clip_val=0.5,
-        callbacks=[checkpoint_callback, backup_checkpoint_callback, progress_bar],
+        callbacks=[checkpoint_callback, backup_checkpoint_callback, progress_bar, metrics_logger],
         val_check_interval=VALIDATE_EVERY,
         logger=csv_logger,
         log_every_n_steps=10,
