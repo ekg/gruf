@@ -366,8 +366,8 @@ def main():
     # Model architecture arguments
     parser.add_argument("--dim", type=str, default=None,
                         help="Model hidden dimension (default: 512, will be rounded to multiple of 32). Can use k/m/g suffix.")
-    parser.add_argument("--depth", type=str, default=None,
-                        help="Number of model layers (default: 6). Can use k/m/g suffix.")
+    parser.add_argument("--depth", type=int, default=None,
+                        help="Number of model layers (default: 6).")
     parser.add_argument("--params", type=str, default=None,
                         help="Target parameter count (e.g., 15m for 15M params). Can use k/m/g suffix.")
     
@@ -423,7 +423,7 @@ def main():
     
     # Parse numerical arguments with potential suffixes
     dim_value = parse_size_with_suffix(args.dim) if args.dim is not None else None
-    depth_value = int(parse_size_with_suffix(args.depth)) if args.depth is not None else None
+    depth_value = args.depth  # Already an int, no parsing needed
     params_value = parse_size_with_suffix(args.params) if args.params is not None else None
     
     # Configure model architecture based on command line arguments
