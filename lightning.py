@@ -310,6 +310,10 @@ def solve_for_depth(target_params, dim, vocab_size=256, ff_mult=4, expansion=1.5
     return max(1, round(depth))  # Ensure at least 1 layer
 
 def main():
+    # Make variables global
+    global SEQ_LEN
+    global BATCH_SIZE
+    
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Train a minLM model with PyTorch Lightning")
     parser.add_argument("--data", type=str, required=True,
