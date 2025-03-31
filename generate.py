@@ -311,6 +311,11 @@ def main():
         
         val_dataset = TextSamplerDataset(data_val, args.primer_length)
     
+    # Parse numerical arguments with potential suffixes
+    chunk_length = int(parse_size_with_suffix(args.chunk_length))
+    generation_length = int(parse_size_with_suffix(args.generation_length))
+    primer_length = int(parse_size_with_suffix(args.primer_length)) if args.primer_length else None
+
     # If primer_text is provided directly, use that
     if args.primer_text:
         tokens = [ord(c) for c in args.primer_text]
@@ -334,11 +339,6 @@ def main():
     
     print(f"\nGenerating {generation_length} tokens in chunks of {chunk_length}...")
     print(f"Temperature: {args.temperature}, Top-k threshold: {args.top_k}")
-    
-    # Parse numerical arguments with potential suffixes
-    chunk_length = int(parse_size_with_suffix(args.chunk_length))
-    generation_length = int(parse_size_with_suffix(args.generation_length))
-    primer_length = int(parse_size_with_suffix(args.primer_length)) if args.primer_length else None
     
     # Generate text
     start_time = time.time()
