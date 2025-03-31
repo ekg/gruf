@@ -189,8 +189,8 @@ class LightningMinLM(pl.LightningModule):
         # Calculate bits per byte (bpb)
         bpb = loss / math.log(2)
         self.log('val_loss', loss, prog_bar=True, sync_dist=True, on_step=False, on_epoch=True)
-        self.log('val_bpb', bpb, prog_bar=True, sync_dist=True, on_step=False, on_epoch=True)
-        return {"val_loss": loss, "val_bpb": bpb}
+        self.log('bpb', bpb, prog_bar=True, sync_dist=True, on_step=False, on_epoch=True)  # bits per byte
+        return {"val_loss": loss, "bpb": bpb}
     
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
@@ -217,7 +217,7 @@ class MetricsLoggerCallback(pl.Callback):
             writer = csv.writer(f)
             writer.writerow([
                 "step", "epoch", "time", "tokens_processed", 
-                "tokens_per_sec", "train_loss", "val_loss", "val_bpb",
+                "tokens_per_sec", "train_loss", "val_loss", "bpb",
                 "learning_rate", "batch_size", "grad_accum", "seq_len"
             ])
         
@@ -244,7 +244,7 @@ class MetricsLoggerCallback(pl.Callback):
         val_loss_value = val_loss.item() if val_loss is not None else "N/A"
         
         # Get bits per byte if available
-        val_bpb = trainer.callback_metrics.get('val_bpb')
+        val_bpb = trainer.callback_metrics.get('bpb')  # bits per byte
         val_bpb_value = val_bpb.item() if val_bpb is not None else "N/A"
         
         # Only show validation loss if this is called after validation
@@ -636,7 +636,8 @@ def main():
     csv_logger = CSVLogger(
         save_dir="logs",
         name="min_lm_training",
-        flush_logs_every_n_steps=10
+        flush_logs_every_n_steps=10,
+        version=datetime.datetime.now().strftime("%Y%m%d_%H%M%S")  # Use timestamp instead of v_num
     )
     
     # Create a DDPStrategy with the gloo backend
@@ -677,24 +678,8 @@ def main():
     print(f"Training for {max_epochs} epochs to reach approximately {NUM_BATCHES} steps")
     print(f"-----------------------------\n")
 
-    # Create the checkpoint directory only when we're about to begin training
-    print(f"Saving checkpoints to: {checkpoint_dir}")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    # Save model configuration for easy reloading
-    def save_model_config():
-        import json
-        # Combine model and training configs
-        config = {**MODEL_CONFIG, **{"learning_rate": LEARNING_RATE, "seq_len": SEQ_LEN, "batch_size": BATCH_SIZE}}
-        with open(os.path.join(checkpoint_dir, "model_config.json"), "w") as f:
-            json.dump(config, f, indent=2)
-    
-    # Save the config file
-    save_model_config()
-    
-    # Create training metrics logger
-    metrics_log_path = os.path.join(checkpoint_dir, "training_metrics.csv")
-    metrics_logger = MetricsLoggerCallback(metrics_log_path)
+    # Initialize metrics logger with placeholder
+    metrics_logger = MetricsLoggerCallback("/tmp/metrics_placeholder.csv")  # Will be replaced after dir creation
     
     # Create trainer
     trainer = pl.Trainer(
@@ -717,6 +702,33 @@ def main():
     print(f"Starting training with {torch.cuda.device_count()} GPUs")
     print(f"Config: bs={BATCH_SIZE}, grad_accum={GRAD_ACCUM_EVERY}, lr={LEARNING_RATE}, seq_len={SEQ_LEN}")
     print(f"Will run for {NUM_BATCHES} steps")
+    
+    # Now that we're definitely going to start training, create the checkpoint directory
+    print(f"Saving checkpoints to: {checkpoint_dir}")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Save model configuration for easy reloading
+    def save_model_config():
+        import json
+        # Combine model and training configs
+        config = {**MODEL_CONFIG, **{"learning_rate": LEARNING_RATE, "seq_len": SEQ_LEN, "batch_size": BATCH_SIZE}}
+        with open(os.path.join(checkpoint_dir, "model_config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+    
+    # Save the config file
+    save_model_config()
+    
+    # Create real training metrics logger with correct path
+    metrics_log_path = os.path.join(checkpoint_dir, "training_metrics.csv")
+    metrics_logger.log_path = metrics_log_path
+    # Recreate the CSV file with headers
+    with open(metrics_log_path, 'w') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "step", "epoch", "time", "tokens_processed", 
+            "tokens_per_sec", "train_loss", "val_loss", "bpb",
+            "learning_rate", "batch_size", "grad_accum", "seq_len"
+        ])
     
     # Start training
     print("Starting training...")
