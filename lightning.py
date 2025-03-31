@@ -212,6 +212,9 @@ class MetricsLoggerCallback(pl.Callback):
         super().__init__()
         self.log_path = log_path
         self.start_time = None
+        # Track the last validation loss for reporting during training steps
+        self.last_val_loss = None
+        self.last_val_bpb = None
         # Don't create the file here - it will be created before the trainer is instantiated
         
     def on_train_start(self, trainer, pl_module):
@@ -237,16 +240,24 @@ class MetricsLoggerCallback(pl.Callback):
         
         # Get the loss values from callback metrics
         train_loss = trainer.callback_metrics.get('train_loss', torch.tensor(0.0)).item()
+        
+        # Get validation loss - if present, update our stored value
         val_loss = trainer.callback_metrics.get('val_loss')
-        val_loss_value = val_loss.item() if val_loss is not None else "N/A"
+        if val_loss is not None and is_validation:
+            val_loss_value = val_loss.item()
+            self.last_val_loss = val_loss_value
+        else:
+            # Use last known value or NA if we've never seen one
+            val_loss_value = self.last_val_loss if self.last_val_loss is not None else "NA"
         
-        # Get bits per byte if available
+        # Get bits per byte if available - similar approach
         val_bpb = trainer.callback_metrics.get('bpb')  # bits per byte
-        val_bpb_value = val_bpb.item() if val_bpb is not None else "N/A"
-        
-        # Only show validation loss if this is called after validation
-        if not is_validation:
-            val_loss_value = "N/A"
+        if val_bpb is not None and is_validation:
+            val_bpb_value = val_bpb.item()
+            self.last_val_bpb = val_bpb_value
+        else:
+            # Use last known value or NA if we've never seen one
+            val_bpb_value = self.last_val_bpb if self.last_val_bpb is not None else "NA"
         
         try:
             with open(self.log_path, 'a') as f:
