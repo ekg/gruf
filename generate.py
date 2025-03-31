@@ -73,9 +73,21 @@ def load_model(checkpoint_path, config_path=None):
         dropout=config.get("dropout", 0.0)
     )
     
-    # Load model weights
-    if 'model_state_dict' in checkpoint:
-        # Lightning checkpoint format
+    # Load model weights - handling different checkpoint formats
+    if 'state_dict' in checkpoint:
+        # Standard Lightning checkpoint format
+        pl_state_dict = checkpoint['state_dict']
+        
+        # The model in LightningMinLM is stored under 'model.' prefix
+        model_state_dict = {}
+        for key, value in pl_state_dict.items():
+            # Remove the 'model.' prefix from keys
+            if key.startswith('model.'):
+                model_state_dict[key[6:]] = value
+        
+        model.load_state_dict(model_state_dict)
+    elif 'model_state_dict' in checkpoint:
+        # Our custom Lightning checkpoint format
         model.load_state_dict(checkpoint['model_state_dict'])
     elif 'model' in checkpoint and 'state_dict' in checkpoint['model']:
         # Another possible Lightning format
