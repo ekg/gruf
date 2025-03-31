@@ -152,7 +152,10 @@ class LightningMinLM(pl.LightningModule):
                 print(f"Starting tokens/s timing at step {batch_idx}")
                 
         loss = self.model(batch, return_loss=True)
-        self.log('train_loss', loss, prog_bar=True, sync_dist=True, on_step=True, on_epoch=True)
+        # Log train_loss for display in progress bar (on_step=True) but use a simpler name
+        self.log('train_loss', loss, prog_bar=True, sync_dist=True, on_step=True, on_epoch=False)
+        # Also log for epoch aggregation without showing in progress bar
+        self.log('train_loss_epoch', loss, prog_bar=False, sync_dist=True, on_step=False, on_epoch=True)
         
         # Update tokens processed count - local to this process
         tokens_in_batch = batch.numel()
@@ -183,8 +186,11 @@ class LightningMinLM(pl.LightningModule):
     
     def validation_step(self, batch, batch_idx):
         loss = self.model(batch, return_loss=True)
+        # Calculate bits per byte (bpb)
+        bpb = loss / math.log(2)
         self.log('val_loss', loss, prog_bar=True, sync_dist=True, on_step=False, on_epoch=True)
-        return {"val_loss": loss}
+        self.log('val_bpb', bpb, prog_bar=True, sync_dist=True, on_step=False, on_epoch=True)
+        return {"val_loss": loss, "val_bpb": bpb}
     
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
@@ -211,7 +217,7 @@ class MetricsLoggerCallback(pl.Callback):
             writer = csv.writer(f)
             writer.writerow([
                 "step", "epoch", "time", "tokens_processed", 
-                "tokens_per_sec", "train_loss", "val_loss", 
+                "tokens_per_sec", "train_loss", "val_loss", "val_bpb",
                 "learning_rate", "batch_size", "grad_accum", "seq_len"
             ])
         
@@ -237,6 +243,10 @@ class MetricsLoggerCallback(pl.Callback):
         val_loss = trainer.callback_metrics.get('val_loss')
         val_loss_value = val_loss.item() if val_loss is not None else "N/A"
         
+        # Get bits per byte if available
+        val_bpb = trainer.callback_metrics.get('val_bpb')
+        val_bpb_value = val_bpb.item() if val_bpb is not None else "N/A"
+        
         # Only show validation loss if this is called after validation
         if not is_validation:
             val_loss_value = "N/A"
@@ -251,6 +261,7 @@ class MetricsLoggerCallback(pl.Callback):
                 f"{tokens_per_sec:.2f}",
                 f"{train_loss:.6f}",
                 val_loss_value,
+                val_bpb_value,
                 pl_module.learning_rate,
                 BATCH_SIZE,
                 GRAD_ACCUM_EVERY,
