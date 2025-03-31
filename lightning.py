@@ -4,6 +4,7 @@ import random
 import numpy as np
 import math
 import time
+import argparse
 import pytorch_lightning as pl
 import torch
 from torch import nn
@@ -242,7 +243,41 @@ class TextGenerationCallback(pl.Callback):
                 if was_training:
                     pl_module.train()
 
+def parse_gpu_ids(gpu_spec):
+    """
+    Parse a GPU specification string into a list of GPU ids.
+    Examples: 
+      "0,1,2,3" -> [0, 1, 2, 3]
+      "0-3" -> [0, 1, 2, 3]
+      "0,2-4,7" -> [0, 2, 3, 4, 7]
+    """
+    if not gpu_spec:
+        return None
+        
+    gpu_ids = []
+    parts = gpu_spec.split(',')
+    
+    for part in parts:
+        if '-' in part:
+            # Handle range like "0-3"
+            start, end = map(int, part.split('-'))
+            gpu_ids.extend(range(start, end + 1))
+        else:
+            # Handle single number
+            gpu_ids.append(int(part))
+            
+    return sorted(list(set(gpu_ids)))  # Remove duplicates and sort
+
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Train a minLM model with PyTorch Lightning")
+    parser.add_argument("--gpus", type=str, default=None, 
+                        help="Comma-separated list or range of GPU IDs to use (e.g., '0,1,2' or '0-2' or '0,2-4')")
+    args = parser.parse_args()
+    
+    # Parse GPU IDs
+    gpu_ids = parse_gpu_ids(args.gpus)
+    
     pl.seed_everything(42)
     torch.set_float32_matmul_precision('medium')
 
@@ -251,6 +286,9 @@ def main():
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
             print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+            
+    if gpu_ids:
+        print(f"Using GPUs: {gpu_ids}")
     
     # Load and prepare data
     print("Loading data from enwik8.gz...")
@@ -407,7 +445,7 @@ def main():
         max_steps=NUM_BATCHES,  # Still use max_steps as a hard limit
         accumulate_grad_batches=GRAD_ACCUM_EVERY,
         accelerator="gpu",
-        devices="auto",
+        devices=gpu_ids if gpu_ids else "auto",
         strategy=ddp_strategy,
         gradient_clip_val=0.5,
         callbacks=[checkpoint_callback, backup_checkpoint_callback, text_gen_callback, progress_bar],
