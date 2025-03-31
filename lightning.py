@@ -282,12 +282,12 @@ def main():
     
     # Set up model
     print("Creating model...")
-    # Using a larger dimension size (2048) to create a bigger model
-    model_dim = 2048
+    model_dim = 1024
+    model_depth = 16
     model = LightningMinLM(
         num_tokens=256,
         dim=model_dim,
-        depth=6,
+        depth=model_depth,
         ff_mult=4,
         learning_rate=LEARNING_RATE,
         use_lstm=False  # set to True for minLSTM
@@ -334,7 +334,7 @@ def main():
         config = {
             "num_tokens": 256,
             "dim": model_dim,  # Use the same model_dim variable
-            "depth": 6,
+            "depth": model_depth,
             "ff_mult": 4,
             "expansion": 1.5,
             "conv_kernel_size": 3,
