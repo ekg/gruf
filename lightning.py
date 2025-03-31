@@ -389,6 +389,9 @@ def main():
     global GRAD_ACCUM_EVERY
     global LEARNING_RATE
     
+    # Create a single timestamp for the entire run
+    run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Train a minLM model with PyTorch Lightning")
     parser.add_argument("--data", type=str, required=True,
@@ -606,11 +609,9 @@ def main():
     if args.output:
         checkpoint_dir = args.output
     else:
-        # Auto-generate directory name with model size and timestamp
-        # Use the same timestamp for all processes
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Use the timestamp we created at the beginning of main()
         params_str = f"{actual_params/1000000:.1f}M" if actual_params >= 1000000 else f"{actual_params/1000:.1f}K"
-        checkpoint_dir = f"gruf_{params_str}_{timestamp}"
+        checkpoint_dir = f"gruf_{params_str}_{run_timestamp}"
     
     # Determine if this is the main process
     if torch.distributed.is_initialized():
@@ -670,7 +671,7 @@ def main():
         save_dir="logs",
         name="min_lm_training",
         flush_logs_every_n_steps=10,
-        version=datetime.datetime.now().strftime("%Y%m%d_%H%M%S")  # Use timestamp instead of v_num
+        version=run_timestamp  # Use the same timestamp we created at the beginning
     )
     
     # Create a DDPStrategy with the gloo backend
