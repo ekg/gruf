@@ -295,7 +295,7 @@ def main():
     # Prepare validation dataset if using random primer
     val_dataset = None
     if args.random_primer:
-        data_path = "./data/enwik8.gz"  # Default data path
+        data_path = args.data_path
         print(f"Loading validation dataset for random primer from {data_path}...")
         
         if is_gzip_file(data_path):
