@@ -250,21 +250,22 @@ class MetricsLoggerCallback(pl.Callback):
         
         try:
             with open(self.log_path, 'a') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    trainer.global_step,
-                    trainer.current_epoch,
+                # Write tab-separated values directly
+                values = [
+                    str(trainer.global_step),
+                    str(trainer.current_epoch),
                     f"{elapsed:.2f}",
-                    global_tokens,
+                    str(global_tokens),
                     f"{tokens_per_sec:.2f}",
                     f"{train_loss:.6f}",
-                    val_loss_value,
-                    val_bpb_value,
-                    pl_module.learning_rate,
-                    BATCH_SIZE,
-                    GRAD_ACCUM_EVERY,
-                    SEQ_LEN
-                ])
+                    str(val_loss_value),
+                    str(val_bpb_value),
+                    str(pl_module.learning_rate),
+                    str(BATCH_SIZE),
+                    str(GRAD_ACCUM_EVERY),
+                    str(SEQ_LEN)
+                ]
+                f.write('\t'.join(values) + '\n')
         except (FileNotFoundError, PermissionError):
             # Silently fail if we can't write to the file
             # This can happen during distributed training
@@ -630,15 +631,16 @@ def main():
         with open(os.path.join(checkpoint_dir, "model_config.json"), "w") as f:
             json.dump(config, f, indent=2)
             
-        # Create the metrics CSV file
-        metrics_log_path = os.path.join(checkpoint_dir, "training_metrics.csv")
+        # Create the metrics TSV file
+        metrics_log_path = os.path.join(checkpoint_dir, "training_metrics.tsv")
         with open(metrics_log_path, 'w') as f:
-            writer = csv.writer(f)
-            writer.writerow([
+            # Write tab-separated header
+            header = [
                 "step", "epoch", "time", "tokens_processed", 
                 "tokens_per_sec", "train_loss", "val_loss", "bpb",
                 "learning_rate", "batch_size", "grad_accum", "seq_len"
-            ])
+            ]
+            f.write('\t'.join(header) + '\n')
     else:
         # Non-main processes start with an empty directory name
         checkpoint_dir = ""
@@ -717,7 +719,7 @@ def main():
 
     # Initialize metrics logger with the path that should now exist
     # All processes now have the same checkpoint directory name
-    metrics_log_path = os.path.join(checkpoint_dir, "training_metrics.csv")
+    metrics_log_path = os.path.join(checkpoint_dir, "training_metrics.tsv")
     print(f"Using checkpoint directory: {checkpoint_dir}")
     
     metrics_logger = MetricsLoggerCallback(metrics_log_path)
