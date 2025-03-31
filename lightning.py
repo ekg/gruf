@@ -314,6 +314,7 @@ def main():
     global SEQ_LEN
     global BATCH_SIZE
     global GRAD_ACCUM_EVERY
+    global LEARNING_RATE
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Train a minLM model with PyTorch Lightning")
@@ -335,6 +336,8 @@ def main():
                         help=f"Batch size per GPU (default: {TRAINING_CONFIG['batch_size']})")
     parser.add_argument("--grad_accum", type=int, default=None,
                         help=f"Gradient accumulation steps (default: {TRAINING_CONFIG['grad_accum_every']})")
+    parser.add_argument("--learning_rate", type=float, default=None,
+                        help=f"Learning rate (default: {TRAINING_CONFIG['learning_rate']})")
     parser.add_argument("--seq_len", type=str, default=None,
                         help=f"Sequence length for training (default: {TRAINING_CONFIG['seq_len']}). Can use k/m/g suffix.")
     
@@ -418,11 +421,13 @@ def main():
     seq_len_value = int(parse_size_with_suffix(args.seq_len)) if args.seq_len is not None else SEQ_LEN
     batch_size_value = args.batch_size if args.batch_size is not None else BATCH_SIZE
     grad_accum_value = args.grad_accum if args.grad_accum is not None else GRAD_ACCUM_EVERY
+    learning_rate_value = args.learning_rate if args.learning_rate is not None else LEARNING_RATE
     
     # Override config values with command line arguments if provided
     SEQ_LEN = seq_len_value
     BATCH_SIZE = batch_size_value
     GRAD_ACCUM_EVERY = grad_accum_value
+    LEARNING_RATE = learning_rate_value
     
     # Configure model architecture based on command line arguments
     if params_value is not None:
