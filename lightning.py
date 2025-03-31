@@ -211,15 +211,7 @@ class MetricsLoggerCallback(pl.Callback):
         super().__init__()
         self.log_path = log_path
         self.start_time = None
-        
-        # Create headers for the CSV file
-        with open(self.log_path, 'w') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "step", "epoch", "time", "tokens_processed", 
-                "tokens_per_sec", "train_loss", "val_loss", "bpb",
-                "learning_rate", "batch_size", "grad_accum", "seq_len"
-            ])
+        # Don't create the file here - it will be created before the trainer is instantiated
         
     def on_train_start(self, trainer, pl_module):
         self.start_time = time.time()
@@ -234,6 +226,10 @@ class MetricsLoggerCallback(pl.Callback):
             self._log_metrics(trainer, pl_module, is_validation=True)
     
     def _log_metrics(self, trainer, pl_module, is_validation=False):
+        # Only log metrics on the main process
+        if not trainer.is_global_zero:
+            return
+            
         elapsed = time.time() - self.start_time
         global_tokens = pl_module.global_tokens.item()
         tokens_per_sec = global_tokens / elapsed if elapsed > 0 else 0
@@ -251,22 +247,27 @@ class MetricsLoggerCallback(pl.Callback):
         if not is_validation:
             val_loss_value = "N/A"
         
-        with open(self.log_path, 'a') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                trainer.global_step,
-                trainer.current_epoch,
-                f"{elapsed:.2f}",
-                global_tokens,
-                f"{tokens_per_sec:.2f}",
-                f"{train_loss:.6f}",
-                val_loss_value,
-                val_bpb_value,
-                pl_module.learning_rate,
-                BATCH_SIZE,
-                GRAD_ACCUM_EVERY,
-                SEQ_LEN
-            ])
+        try:
+            with open(self.log_path, 'a') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    trainer.global_step,
+                    trainer.current_epoch,
+                    f"{elapsed:.2f}",
+                    global_tokens,
+                    f"{tokens_per_sec:.2f}",
+                    f"{train_loss:.6f}",
+                    val_loss_value,
+                    val_bpb_value,
+                    pl_module.learning_rate,
+                    BATCH_SIZE,
+                    GRAD_ACCUM_EVERY,
+                    SEQ_LEN
+                ])
+        except (FileNotFoundError, PermissionError):
+            # Silently fail if we can't write to the file
+            # This can happen during distributed training
+            pass
 
 
 
@@ -678,8 +679,47 @@ def main():
     print(f"Training for {max_epochs} epochs to reach approximately {NUM_BATCHES} steps")
     print(f"-----------------------------\n")
 
-    # Initialize metrics logger with placeholder
-    metrics_logger = MetricsLoggerCallback("/tmp/metrics_placeholder.csv")  # Will be replaced after dir creation
+    # Create checkpoint directory on the main process only
+    if args.output:
+        checkpoint_dir = args.output
+    else:
+        # Auto-generate directory name with model size and timestamp
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        params_str = f"{actual_params/1000000:.1f}M" if actual_params >= 1000000 else f"{actual_params/1000:.1f}K"
+        checkpoint_dir = f"gruf_{params_str}_{timestamp}"
+        
+    # Create the directory only on the main process
+    # We'll do this before trainer setup to ensure it exists
+    if torch.distributed.is_initialized():
+        is_main_process = torch.distributed.get_rank() == 0
+    else:
+        is_main_process = True
+        
+    if is_main_process:
+        print(f"Saving checkpoints to: {checkpoint_dir}")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # Save model configuration for easy reloading
+        config = {**MODEL_CONFIG, **{"learning_rate": LEARNING_RATE, "seq_len": SEQ_LEN, "batch_size": BATCH_SIZE}}
+        with open(os.path.join(checkpoint_dir, "model_config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+            
+        # Create the metrics CSV file
+        metrics_log_path = os.path.join(checkpoint_dir, "training_metrics.csv")
+        with open(metrics_log_path, 'w') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "step", "epoch", "time", "tokens_processed", 
+                "tokens_per_sec", "train_loss", "val_loss", "bpb",
+                "learning_rate", "batch_size", "grad_accum", "seq_len"
+            ])
+    
+    # Make sure all processes can see the directory
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    
+    # Initialize metrics logger with the path that now should exist
+    metrics_logger = MetricsLoggerCallback(os.path.join(checkpoint_dir, "training_metrics.csv"))
     
     # Create trainer
     trainer = pl.Trainer(
@@ -702,33 +742,6 @@ def main():
     print(f"Starting training with {torch.cuda.device_count()} GPUs")
     print(f"Config: bs={BATCH_SIZE}, grad_accum={GRAD_ACCUM_EVERY}, lr={LEARNING_RATE}, seq_len={SEQ_LEN}")
     print(f"Will run for {NUM_BATCHES} steps")
-    
-    # Now that we're definitely going to start training, create the checkpoint directory
-    print(f"Saving checkpoints to: {checkpoint_dir}")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    # Save model configuration for easy reloading
-    def save_model_config():
-        import json
-        # Combine model and training configs
-        config = {**MODEL_CONFIG, **{"learning_rate": LEARNING_RATE, "seq_len": SEQ_LEN, "batch_size": BATCH_SIZE}}
-        with open(os.path.join(checkpoint_dir, "model_config.json"), "w") as f:
-            json.dump(config, f, indent=2)
-    
-    # Save the config file
-    save_model_config()
-    
-    # Create real training metrics logger with correct path
-    metrics_log_path = os.path.join(checkpoint_dir, "training_metrics.csv")
-    metrics_logger.log_path = metrics_log_path
-    # Recreate the CSV file with headers
-    with open(metrics_log_path, 'w') as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "step", "epoch", "time", "tokens_processed", 
-            "tokens_per_sec", "train_loss", "val_loss", "bpb",
-            "learning_rate", "batch_size", "grad_accum", "seq_len"
-        ])
     
     # Start training
     print("Starting training...")
