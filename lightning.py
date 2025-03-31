@@ -382,15 +382,15 @@ def solve_for_depth(target_params, dim, vocab_size=256, ff_mult=4, expansion=1.5
     depth = (target_params - embed_params) / layer_params
     return max(1, round(depth))  # Ensure at least 1 layer
 
+# Global run timestamp to ensure consistent directory naming
+RUN_TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
 def main():
     # Make variables global
     global SEQ_LEN
     global BATCH_SIZE
     global GRAD_ACCUM_EVERY
     global LEARNING_RATE
-    
-    # Create a single timestamp for the entire run
-    run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Train a minLM model with PyTorch Lightning")
@@ -609,9 +609,9 @@ def main():
     if args.output:
         checkpoint_dir = args.output
     else:
-        # Use the timestamp we created at the beginning of main()
+        # Use the global timestamp created before main()
         params_str = f"{actual_params/1000000:.1f}M" if actual_params >= 1000000 else f"{actual_params/1000:.1f}K"
-        checkpoint_dir = f"gruf_{params_str}_{run_timestamp}"
+        checkpoint_dir = f"gruf_{params_str}_{RUN_TIMESTAMP}"
     
     # Determine if this is the main process
     if torch.distributed.is_initialized():
@@ -671,7 +671,7 @@ def main():
         save_dir="logs",
         name="min_lm_training",
         flush_logs_every_n_steps=10,
-        version=run_timestamp  # Use the same timestamp we created at the beginning
+        version=RUN_TIMESTAMP  # Use the global timestamp
     )
     
     # Create a DDPStrategy with the gloo backend
