@@ -197,55 +197,6 @@ class TokensPerSecFormatter(TQDMProgressBar):
         return items
 
 
-# Text generation callback
-class TextGenerationCallback(pl.Callback):
-    def __init__(self, val_dataset, prime_length=128, generate_length=512, generate_every=500):
-        super().__init__()
-        self.val_dataset = val_dataset
-        self.prime_length = prime_length
-        self.generate_length = generate_length
-        self.generate_every = generate_every
-    
-    def on_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        # Only generate text on rank 0 and only during training
-        if (trainer.global_rank == 0 and 
-            trainer.state.stage == "train" and 
-            (trainer.global_step + 1) % self.generate_every == 0):
-            
-            # Store original mode and switch to eval
-            was_training = pl_module.training
-            pl_module.eval()
-            
-            try:
-                # Get a sample from validation set
-                inp = random.choice(self.val_dataset)[:self.prime_length]
-                inp = inp.cuda()
-                
-                prime = decode_tokens(inp)
-                print(f"\n--- SAMPLE GENERATION AT STEP {trainer.global_step} ---")
-                print(f"INPUT: {prime}")
-                
-                prompt = inp[None, ...]
-                
-                # Generate text
-                sampled = base_decoding(
-                    pl_module.model, 
-                    prompt, 
-                    self.generate_length,
-                    temperature=1.0,
-                    filter_thres=0.9
-                )
-                
-                base_decode_output = decode_tokens(sampled[0])
-                print(f"\nOUTPUT: {base_decode_output}")
-                print(f"--- END SAMPLE GENERATION ---\n")
-                
-            except Exception as e:
-                print(f"Error during text generation: {str(e)}")
-            finally:
-                # Restore the model to its original training state
-                if was_training:
-                    pl_module.train()
 
 def parse_gpu_ids(gpu_spec):
     """
@@ -561,13 +512,6 @@ def main():
     # Save the config file
     save_model_config()
     
-    text_gen_callback = TextGenerationCallback(
-        val_dataset=val_dataset,
-        prime_length=PRIME_LENGTH,
-        generate_length=GENERATE_LENGTH,
-        generate_every=GENERATE_EVERY
-    )
-    
     # Create logger
     csv_logger = CSVLogger(
         save_dir="logs",
@@ -621,7 +565,7 @@ def main():
         devices=gpu_ids if gpu_ids else "auto",
         strategy=ddp_strategy,
         gradient_clip_val=0.5,
-        callbacks=[checkpoint_callback, backup_checkpoint_callback, text_gen_callback, progress_bar],
+        callbacks=[checkpoint_callback, backup_checkpoint_callback, progress_bar],
         val_check_interval=VALIDATE_EVERY,
         logger=csv_logger,
         log_every_n_steps=10,
