@@ -9,6 +9,7 @@ import re
 import pytorch_lightning as pl
 import torch
 import mmap
+import datetime
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from pytorch_lightning.strategies import DDPStrategy
@@ -340,6 +341,8 @@ def main():
                         help=f"Learning rate (default: {TRAINING_CONFIG['learning_rate']})")
     parser.add_argument("--seq_len", type=str, default=None,
                         help=f"Sequence length for training (default: {TRAINING_CONFIG['seq_len']}). Can use k/m/g suffix.")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Directory to save checkpoints (default: auto-generated name with params and timestamp)")
     
     args = parser.parse_args()
     
@@ -528,7 +531,15 @@ def main():
     print(f"First layer weight shape: {first_layer_shape}")
     
     # Create checkpoint directory
-    checkpoint_dir = "checkpoints"
+    if args.output:
+        checkpoint_dir = args.output
+    else:
+        # Auto-generate directory name with model size and timestamp
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        params_str = f"{actual_params/1000000:.1f}M" if actual_params >= 1000000 else f"{actual_params/1000:.1f}K"
+        checkpoint_dir = f"gruf_{params_str}_{timestamp}"
+    
+    print(f"Saving checkpoints to: {checkpoint_dir}")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Set up callbacks
