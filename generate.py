@@ -208,6 +208,7 @@ def main():
     # Model and data parameters
     parser.add_argument("--model_path", type=str, required=True, help="Path to the trained model checkpoint")
     parser.add_argument("--config_path", type=str, default=None, help="Path to model config (optional)")
+    parser.add_argument("--device", type=str, default="auto", help="Device to run on: 'cpu', 'cuda', 'cuda:0', etc. (default: 'auto')")
     
     # Generation parameters
     parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sampling (default: 1.0)")
@@ -226,7 +227,10 @@ def main():
     args = parser.parse_args()
     
     # Set device
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if args.device == "auto":
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    else:
+        device = args.device
     print(f"Using device: {device}")
     
     # Load the model
