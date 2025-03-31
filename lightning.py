@@ -342,12 +342,35 @@ def main():
     if gpu_ids:
         print(f"Using GPUs: {gpu_ids}")
     
+    # Helper function to detect if a file is gzipped
+    def is_gzip_file(filepath):
+        with open(filepath, 'rb') as test_f:
+            return test_f.read(2) == b'\x1f\x8b'
+    
     # Load and prepare data
     print(f"Loading data from {args.data_path}...")
-    with gzip.open(args.data_path) as file:
-        data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
-        np_train, np_valid = np.split(data, [int(90e6)])
-        data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
+    
+    if is_gzip_file(args.data_path):
+        print("Detected gzip format, loading into memory...")
+        with gzip.open(args.data_path) as file:
+            data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
+            np_train, np_valid = np.split(data, [int(90e6)])
+            data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
+    else:
+        print("Detected raw format, using memory mapping...")
+        # Get file size
+        file_size = os.path.getsize(args.data_path)
+        # Map the file into memory
+        with open(args.data_path, 'r+b') as f:
+            mm = mmap.mmap(f.fileno(), 0)
+            # Create a numpy array using the memory map
+            data = np.frombuffer(mm, dtype=np.uint8, count=min(int(95e6), file_size))
+            # Split data (but don't copy it)
+            train_size = min(int(90e6), len(data))
+            np_train, np_valid = data[:train_size], data[train_size:min(int(95e6), len(data))]
+            # Convert to PyTorch tensors
+            data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
+    
     print(f"Data loaded - Train: {data_train.shape}, Val: {data_val.shape}")
 
     # Create datasets and dataloaders
