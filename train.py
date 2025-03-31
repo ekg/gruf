@@ -12,18 +12,18 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
 from minGRU_pytorch.minLM import minLM
+from config import MODEL_CONFIG, TRAINING_CONFIG, calculate_model_size, get_parameter_count_str
 
-# constants
-
-NUM_BATCHES = int(1e5)
-BATCH_SIZE = 4
-GRAD_ACCUM_EVERY = 4
-LEARNING_RATE = 1e-4
-VALIDATE_EVERY = 100
-PRIME_LENGTH = 128
-GENERATE_EVERY = 500
-GENERATE_LENGTH = 512
-SEQ_LEN = 512
+# Use constants from config (with defaults for backward compatibility if needed)
+NUM_BATCHES = TRAINING_CONFIG["num_batches"]
+BATCH_SIZE = TRAINING_CONFIG["batch_size"]
+GRAD_ACCUM_EVERY = TRAINING_CONFIG.get("grad_accum_every", 4)  # Default for train.py
+LEARNING_RATE = TRAINING_CONFIG["learning_rate"]
+VALIDATE_EVERY = TRAINING_CONFIG.get("validate_every", 100)    # Default for train.py
+PRIME_LENGTH = TRAINING_CONFIG["prime_length"]
+GENERATE_EVERY = TRAINING_CONFIG.get("generate_every", 500)    # Default for train.py
+GENERATE_LENGTH = TRAINING_CONFIG["generate_length"]
+SEQ_LEN = TRAINING_CONFIG.get("seq_len", 512)                  # Default for train.py
 
 # helpers
 
@@ -89,11 +89,18 @@ def base_decoding(
 # the min{GRU|LSTM} char language model
 
 model = minLM(
-    num_tokens = 256,
-    dim = 512,
-    depth = 6,
-    use_lstm = False # set to True for minLSTM
+    num_tokens=MODEL_CONFIG["num_tokens"],
+    dim=MODEL_CONFIG["dim"],
+    depth=MODEL_CONFIG["depth"],
+    ff_mult=MODEL_CONFIG["ff_mult"],
+    expansion=MODEL_CONFIG["expansion"],
+    conv_kernel_size=MODEL_CONFIG["conv_kernel_size"],
+    use_lstm=MODEL_CONFIG["use_lstm"],
+    enable_conv=MODEL_CONFIG["enable_conv"],
+    dropout=MODEL_CONFIG["dropout"]
 ).cuda()
+
+print(f"Created model with {get_parameter_count_str(MODEL_CONFIG)} parameters")
 
 # prepare enwik8 data
 

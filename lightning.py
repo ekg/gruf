@@ -16,19 +16,20 @@ from pytorch_lightning.loggers import CSVLogger
 os.environ["NCCL_DEBUG"] = "INFO"
 os.environ["NCCL_SOCKET_IFNAME"] = "eno1"  # Use the specific interface shown in your logs
 
-# Import the minLM model
+# Import the minLM model and configuration
 from minGRU_pytorch.minLM import minLM
+from config import MODEL_CONFIG, TRAINING_CONFIG, calculate_model_size, get_parameter_count_str
 
-# Constants (matching the original training script)
-NUM_BATCHES = int(1e5)
-BATCH_SIZE = 4
-GRAD_ACCUM_EVERY = 16
-LEARNING_RATE = 1e-4
-VALIDATE_EVERY = 1024
-PRIME_LENGTH = 128
-GENERATE_EVERY = 1024
-GENERATE_LENGTH = 512
-SEQ_LEN = 1024 * 4
+# Load configuration constants
+NUM_BATCHES = TRAINING_CONFIG["num_batches"]
+BATCH_SIZE = TRAINING_CONFIG["batch_size"]
+GRAD_ACCUM_EVERY = TRAINING_CONFIG["grad_accum_every"]
+LEARNING_RATE = TRAINING_CONFIG["learning_rate"]
+VALIDATE_EVERY = TRAINING_CONFIG["validate_every"]
+PRIME_LENGTH = TRAINING_CONFIG["prime_length"]
+GENERATE_EVERY = TRAINING_CONFIG["generate_every"]
+GENERATE_LENGTH = TRAINING_CONFIG["generate_length"]
+SEQ_LEN = TRAINING_CONFIG["seq_len"]
 
 # Functions for text generation
 def decode_token(token):
@@ -110,7 +111,9 @@ class LightningMinLM(pl.LightningModule):
         expansion=1.5,
         conv_kernel_size=3,
         learning_rate=1e-4,
-        use_lstm=False
+        use_lstm=False,
+        enable_conv=False,
+        dropout=0.0
     ):
         super().__init__()
         self.learning_rate = learning_rate
@@ -121,7 +124,9 @@ class LightningMinLM(pl.LightningModule):
             ff_mult=ff_mult,
             expansion=expansion,
             conv_kernel_size=conv_kernel_size,
-            use_lstm=use_lstm
+            use_lstm=use_lstm,
+            enable_conv=enable_conv,
+            dropout=dropout
         )
         # For tracking tokens per second
         self.total_tokens_processed = 0
@@ -282,25 +287,31 @@ def main():
     
     # Set up model
     print("Creating model...")
-    model_dim = 1024
-    model_depth = 16
     model = LightningMinLM(
-        num_tokens=256,
-        dim=model_dim,
-        depth=model_depth,
-        ff_mult=4,
+        num_tokens=MODEL_CONFIG["num_tokens"],
+        dim=MODEL_CONFIG["dim"],
+        depth=MODEL_CONFIG["depth"],
+        ff_mult=MODEL_CONFIG["ff_mult"],
+        expansion=MODEL_CONFIG["expansion"],
+        conv_kernel_size=MODEL_CONFIG["conv_kernel_size"],
         learning_rate=LEARNING_RATE,
-        use_lstm=False  # set to True for minLSTM
+        use_lstm=MODEL_CONFIG["use_lstm"],
+        enable_conv=MODEL_CONFIG["enable_conv"],
+        dropout=MODEL_CONFIG["dropout"]
     )
     
     # Print model parameter count to verify size
-    total_params = sum(p.numel() for p in model.parameters())
+    expected_params = calculate_model_size(MODEL_CONFIG)
+    actual_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel Information:")
-    print(f"Dimension: {model_dim}")
-    print(f"Total parameters: {total_params:,}")
-    # Print the shape of the first layer weight to confirm dimension
+    print(f"Dimension: {MODEL_CONFIG['dim']}")
+    print(f"Depth: {MODEL_CONFIG['depth']}")
+    print(f"Expected parameters: {expected_params:,}")
+    print(f"Actual parameters: {actual_params:,}")
+    
+    # Verify the model configuration
     first_layer_shape = model.model.layers[0][2].to_hidden_and_gate.weight.shape
-    print(f"First layer dimension: {first_layer_shape}")
+    print(f"First layer weight shape: {first_layer_shape}")
     
     # Create checkpoint directory
     checkpoint_dir = "checkpoints"
@@ -331,18 +342,8 @@ def main():
     # Save model configuration for easy reloading
     def save_model_config():
         import json
-        config = {
-            "num_tokens": 256,
-            "dim": model_dim,  # Use the same model_dim variable
-            "depth": model_depth,
-            "ff_mult": 4,
-            "expansion": 1.5,
-            "conv_kernel_size": 3,
-            "learning_rate": LEARNING_RATE,
-            "use_lstm": False,
-            "seq_len": SEQ_LEN,
-            "batch_size": BATCH_SIZE
-        }
+        # Combine model and training configs
+        config = {**MODEL_CONFIG, **{"learning_rate": LEARNING_RATE, "seq_len": SEQ_LEN, "batch_size": BATCH_SIZE}}
         with open(os.path.join(checkpoint_dir, "model_config.json"), "w") as f:
             json.dump(config, f, indent=2)
     
@@ -431,8 +432,12 @@ def main():
     def print_model_details(model):
         """Print detailed information about model parameters"""
         total_params = sum(p.numel() for p in model.parameters())
+        expected_params = calculate_model_size()
+        
         print(f"\nDetailed Model Information:")
-        print(f"Total parameters: {total_params:,}")
+        print(f"Expected parameters: {expected_params:,}")
+        print(f"Actual parameters: {total_params:,}")
+        print(f"Difference: {total_params - expected_params:,}")
         
         # Group parameters by layer type
         param_groups = {}
@@ -440,7 +445,7 @@ def main():
             # Extract the layer type (embedding, RNN, FF, etc.)
             if "token_emb" in name:
                 group = "embedding"
-            elif "mingru" in name or "to_hidden" in name:
+            elif "mingru" in name or "to_hidden" in name or "to_hidden_and_gate" in name:
                 group = "rnn"
             elif "ff" in name:
                 group = "feedforward"
