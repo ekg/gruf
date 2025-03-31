@@ -40,13 +40,14 @@ def top_k(logits, thres=0.9):
     probs.scatter_(-1, ind, val)
     return probs
 
-def load_model(checkpoint_path, config_path=None):
+def load_model(checkpoint_path, config_path=None, use_bf16=False):
     """
     Load a trained minLM model from checkpoint
     
     Args:
         checkpoint_path: Path to the model checkpoint
         config_path: Path to the model config file (optional)
+        use_bf16: Whether to load model in BF16 precision (default: False)
     
     Returns:
         Loaded model
@@ -99,6 +100,12 @@ def load_model(checkpoint_path, config_path=None):
         model.load_state_dict(checkpoint)
         
     model = model.eval()
+    
+    # Convert to BF16 if requested
+    if use_bf16 and torch.cuda.is_available():
+        model = model.to(torch.bfloat16)
+        print("Model converted to BF16 precision")
+    
     return model
 
 def chunked_generation(
@@ -255,6 +262,7 @@ def main():
     parser.add_argument("--model", type=str, required=True, help="Path to the trained model checkpoint")
     parser.add_argument("--config_path", type=str, default=None, help="Path to model config (optional)")
     parser.add_argument("--device", type=str, default="auto", help="Device to run on: 'cpu', 'cuda', 'cuda:0', etc. (default: 'auto')")
+    parser.add_argument("--use_bf16", action="store_true", help="Use BF16 precision to reduce memory usage (default: False)")
     
     # Generation parameters
     parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sampling (default: 1.0)")
@@ -282,7 +290,7 @@ def main():
     
     # Load the model
     print(f"Loading model from {args.model}...")
-    model = load_model(args.model, args.config_path)
+    model = load_model(args.model, args.config_path, use_bf16=args.use_bf16)
     model = model.to(device)
     model.eval()
     print(f"Model loaded with {sum(p.numel() for p in model.parameters()):,} parameters")

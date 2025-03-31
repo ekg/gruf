@@ -430,6 +430,8 @@ def main():
                         help=f"Sequence length for training (default: {TRAINING_CONFIG['seq_len']}). Can use k/m/g suffix.")
     parser.add_argument("--output", type=str, default=None,
                         help="Directory to save checkpoints (default: auto-generated name with params and timestamp)")
+    parser.add_argument("--use_bf16", action="store_true",
+                        help="Use BF16 precision to reduce memory usage (default: False)")
     
     args = parser.parse_args()
     
@@ -638,7 +640,15 @@ def main():
         os.makedirs(checkpoint_dir, exist_ok=True)
         
         # Save model configuration for easy reloading
-        config = {**MODEL_CONFIG, **{"learning_rate": LEARNING_RATE, "seq_len": SEQ_LEN, "batch_size": BATCH_SIZE}}
+        config = {
+            **MODEL_CONFIG, 
+            **{
+                "learning_rate": LEARNING_RATE, 
+                "seq_len": SEQ_LEN, 
+                "batch_size": BATCH_SIZE,
+                "use_bf16": args.use_bf16
+            }
+        }
         with open(os.path.join(checkpoint_dir, "model_config.json"), "w") as f:
             json.dump(config, f, indent=2)
             
@@ -721,6 +731,7 @@ def main():
     print(f"Global batch size: {BATCH_SIZE * world_size}")
     print(f"Gradient accumulation: {GRAD_ACCUM_EVERY}")
     print(f"Effective batch size: {effective_batch_size}")
+    print(f"Precision: {'BF16' if args.use_bf16 else 'FP32'}")
     print(f"Steps per epoch per GPU: {steps_per_epoch_per_gpu}")
     print(f"Steps per epoch total: {steps_per_epoch_global}")
     print(f"Tokens per epoch per GPU: {tokens_per_epoch_per_gpu:,}")
@@ -735,7 +746,9 @@ def main():
     
     metrics_logger = MetricsLoggerCallback(metrics_log_path)
     
-    # Create trainer
+    # Create trainer with precision settings based on args
+    precision = "bf16" if args.use_bf16 else 32
+    
     trainer = pl.Trainer(
         max_steps=NUM_BATCHES,  # Still use max_steps as a hard limit
         accumulate_grad_batches=GRAD_ACCUM_EVERY,
@@ -751,6 +764,7 @@ def main():
         limit_val_batches=4,
         max_epochs=max_epochs,  # Set max_epochs to ensure we can track progress
         check_val_every_n_epoch=None,  # Still validate based on steps, not epochs
+        precision=precision,  # Use BF16 if requested
     )
 
     print(f"Starting training with {torch.cuda.device_count()} GPUs")
