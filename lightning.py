@@ -606,17 +606,11 @@ def main():
     print(f"First layer weight shape: {first_layer_shape}")
     
     # Check if we're using distributed training
-    using_distributed = torch.cuda.device_count() > 1
+    using_distributed = torch.cuda.device_count() > 1 and gpu_ids is not None and len(gpu_ids) > 1
     
-    # Set up distributed environment if not already done
-    if using_distributed and not torch.distributed.is_initialized():
-        torch.distributed.init_process_group(backend="gloo")
-    
-    # Determine if this is the main process
-    if torch.distributed.is_initialized():
-        is_main_process = torch.distributed.get_rank() == 0
-    else:
-        is_main_process = True
+    # Determine if this is the main process - for Lightning, we're the main process on the first GPU or in single GPU mode
+    # We don't manually initialize the process group - Lightning will handle this
+    is_main_process = (not using_distributed) or (gpu_ids is None) or (0 in gpu_ids and gpu_ids.index(0) == 0)
 
     # Only the main process generates the directory name
     if is_main_process:
@@ -649,26 +643,8 @@ def main():
         # Non-main processes start with an empty directory name
         checkpoint_dir = ""
     
-    # Broadcast the directory name from rank 0 to all other processes
-    if torch.distributed.is_initialized():
-        # Convert directory to tensor for broadcasting
-        dir_tensor = torch.zeros(1024, dtype=torch.uint8)
-        if is_main_process:
-            dir_bytes = checkpoint_dir.encode('utf-8')
-            dir_tensor[:len(dir_bytes)] = torch.tensor([ord(c) for c in dir_bytes], dtype=torch.uint8)
-            dir_tensor[len(dir_bytes)] = 0  # null terminator
-        
-        # Broadcast from process 0
-        torch.distributed.broadcast(dir_tensor, 0)
-        
-        # All processes except rank 0 need to decode the directory name
-        if not is_main_process:
-            # Find null terminator position
-            null_pos = (dir_tensor == 0).nonzero()[0].item()
-            checkpoint_dir = ''.join([chr(b) for b in dir_tensor[:null_pos].tolist()])
-        
-        # Make sure all processes wait for directory creation
-        torch.distributed.barrier()
+    # In Lightning, each process will create its own copy of the directory
+    # The main process creates it first, others will see it already exists
     
     # Set up callbacks - all processes use the same directory
     # Best models based on validation loss
