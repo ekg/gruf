@@ -8,6 +8,7 @@ import json
 import re
 from torch import Tensor
 import time
+import mmap
 
 # Import the minLM model and configuration
 from minGRU_pytorch.minLM import minLM
@@ -266,6 +267,7 @@ def main():
     parser.add_argument("--primer_text", type=str, default=None, help="Direct text to use as primer")
     parser.add_argument("--primer_length", type=str, default="128", help="Length of primer sequence (default: 128). Can use k/m/g suffix.")
     parser.add_argument("--random_primer", action="store_true", help="Use a random primer from validation set")
+    parser.add_argument("--data_path", type=str, default="./data/enwik8.gz", help="Path to data file for random primer (default: ./data/enwik8.gz)")
     parser.add_argument("--output_file", type=str, default=None, help="Output file to write generated text (optional)")
     
     # Parse arguments
@@ -285,15 +287,37 @@ def main():
     model.eval()
     print(f"Model loaded with {sum(p.numel() for p in model.parameters()):,} parameters")
     
+    # Helper function to detect if a file is gzipped
+    def is_gzip_file(filepath):
+        with open(filepath, 'rb') as test_f:
+            return test_f.read(2) == b'\x1f\x8b'
+    
     # Prepare validation dataset if using random primer
     val_dataset = None
     if args.random_primer:
-        print("Loading validation dataset for random primer...")
-        with gzip.open("./data/enwik8.gz") as file:
-            data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
-            _, np_valid = np.split(data, [int(90e6)])
-            data_val = torch.from_numpy(np_valid)
-            
+        data_path = "./data/enwik8.gz"  # Default data path
+        print(f"Loading validation dataset for random primer from {data_path}...")
+        
+        if is_gzip_file(data_path):
+            print("Detected gzip format, loading into memory...")
+            with gzip.open(data_path) as file:
+                data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
+                _, np_valid = np.split(data, [int(90e6)])
+                data_val = torch.from_numpy(np_valid)
+        else:
+            print("Detected raw format, using memory mapping...")
+            # Get file size
+            file_size = os.path.getsize(data_path)
+            # Map the file into memory
+            with open(data_path, 'r+b') as f:
+                mm = mmap.mmap(f.fileno(), 0)
+                # Create a numpy array using the memory map
+                data = np.frombuffer(mm, dtype=np.uint8, count=min(int(95e6), file_size))
+                # Get validation data
+                train_size = min(int(90e6), len(data))
+                np_valid = data[train_size:min(int(95e6), len(data))]
+                data_val = torch.from_numpy(np_valid)
+        
         # Create a simple dataset just for primer selection
         from torch.utils.data import Dataset
         
