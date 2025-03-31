@@ -5,6 +5,7 @@ import random
 import torch
 import numpy as np
 import json
+import re
 from torch import Tensor
 import time
 
@@ -214,6 +215,38 @@ def load_primer_text(primer_file=None, primer_length=None, val_dataset=None):
         tokens = [ord(c) for c in text]
         return torch.tensor(tokens, dtype=torch.long)[None, ...]  # Add batch dimension
 
+def parse_size_with_suffix(size_str):
+    """
+    Parse a string with optional k, m, g suffix into a number.
+    Examples:
+      "1k" -> 1024
+      "2m" -> 2097152 (2*1024*1024)
+      "3g" -> 3221225472 (3*1024*1024*1024)
+      "42" -> 42 (no suffix, unchanged)
+    """
+    if not isinstance(size_str, str):
+        return size_str
+        
+    pattern = r'^(\d+(?:\.\d+)?)([kmg])?$'
+    match = re.match(pattern, size_str.lower())
+    if not match:
+        try:
+            return float(size_str)
+        except ValueError:
+            raise ValueError(f"Invalid size format: {size_str}")
+            
+    value, suffix = match.groups()
+    value = float(value)
+    
+    if suffix == 'k':
+        return value * 1024
+    elif suffix == 'm':
+        return value * 1024 * 1024
+    elif suffix == 'g':
+        return value * 1024 * 1024 * 1024
+    else:
+        return value
+
 def main():
     parser = argparse.ArgumentParser(description="Generate text using a trained minLM model")
     
@@ -225,13 +258,13 @@ def main():
     # Generation parameters
     parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sampling (default: 1.0)")
     parser.add_argument("--top_k", type=float, default=0.9, help="Threshold for top-k filtering (default: 0.9)")
-    parser.add_argument("--chunk_length", type=int, default=64, help="Process sequence in chunks of this length (default: 64)")
-    parser.add_argument("--generation_length", type=int, default=512, help="Total number of tokens to generate (default: 512)")
+    parser.add_argument("--chunk_length", type=str, default="64", help="Process sequence in chunks of this length (default: 64). Can use k/m/g suffix.")
+    parser.add_argument("--generation_length", type=str, default="512", help="Total number of tokens to generate (default: 512). Can use k/m/g suffix.")
     
     # Input parameters
     parser.add_argument("--primer_file", type=str, default=None, help="File containing primer text (optional)")
     parser.add_argument("--primer_text", type=str, default=None, help="Direct text to use as primer")
-    parser.add_argument("--primer_length", type=int, default=128, help="Length of primer sequence (default: 128)")
+    parser.add_argument("--primer_length", type=str, default="128", help="Length of primer sequence (default: 128). Can use k/m/g suffix.")
     parser.add_argument("--random_primer", action="store_true", help="Use a random primer from validation set")
     parser.add_argument("--output_file", type=str, default=None, help="Output file to write generated text (optional)")
     
@@ -281,12 +314,12 @@ def main():
     # If primer_text is provided directly, use that
     if args.primer_text:
         tokens = [ord(c) for c in args.primer_text]
-        if args.primer_length:
-            tokens = tokens[:args.primer_length]
+        if primer_length:
+            tokens = tokens[:primer_length]
         prompt = torch.tensor(tokens, dtype=torch.long)[None, ...]  # Add batch dimension
     else:
         # Otherwise get primer text from file or validation dataset
-        prompt = load_primer_text(args.primer_file, args.primer_length, val_dataset)
+        prompt = load_primer_text(args.primer_file, primer_length, val_dataset)
     
     prompt = prompt.to(device)
     
@@ -299,8 +332,13 @@ def main():
         percent_done = progress * 100
         print(f"Progress: {percent_done:.1f}% | Speed: {tokens_per_sec:.2f} tokens/sec", end="\r")
     
-    print(f"\nGenerating {args.generation_length} tokens in chunks of {args.chunk_length}...")
+    print(f"\nGenerating {generation_length} tokens in chunks of {chunk_length}...")
     print(f"Temperature: {args.temperature}, Top-k threshold: {args.top_k}")
+    
+    # Parse numerical arguments with potential suffixes
+    chunk_length = int(parse_size_with_suffix(args.chunk_length))
+    generation_length = int(parse_size_with_suffix(args.generation_length))
+    primer_length = int(parse_size_with_suffix(args.primer_length)) if args.primer_length else None
     
     # Generate text
     start_time = time.time()
@@ -308,8 +346,8 @@ def main():
         generated = chunked_generation(
             model,
             prompt,
-            args.generation_length,
-            args.chunk_length,
+            generation_length,
+            chunk_length,
             args.temperature,
             args.top_k,
             device,
@@ -317,7 +355,7 @@ def main():
         )
     
     total_time = time.time() - start_time
-    total_tokens = args.generation_length
+    total_tokens = generation_length
     tokens_per_sec = total_tokens / total_time if total_time > 0 else 0
     
     # Decode the generated text

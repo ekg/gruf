@@ -5,6 +5,7 @@ import numpy as np
 import math
 import time
 import argparse
+import re
 import pytorch_lightning as pl
 import torch
 from torch import nn
@@ -271,6 +272,38 @@ def parse_gpu_ids(gpu_spec):
             
     return sorted(list(set(gpu_ids)))  # Remove duplicates and sort
 
+def parse_size_with_suffix(size_str):
+    """
+    Parse a string with optional k, m, g suffix into a number.
+    Examples:
+      "1k" -> 1024
+      "2m" -> 2097152 (2*1024*1024)
+      "3g" -> 3221225472 (3*1024*1024*1024)
+      "42" -> 42 (no suffix, unchanged)
+    """
+    if not isinstance(size_str, str):
+        return size_str
+        
+    pattern = r'^(\d+(?:\.\d+)?)([kmg])?$'
+    match = re.match(pattern, size_str.lower())
+    if not match:
+        try:
+            return float(size_str)
+        except ValueError:
+            raise ValueError(f"Invalid size format: {size_str}")
+            
+    value, suffix = match.groups()
+    value = float(value)
+    
+    if suffix == 'k':
+        return value * 1024
+    elif suffix == 'm':
+        return value * 1024 * 1024
+    elif suffix == 'g':
+        return value * 1024 * 1024 * 1024
+    else:
+        return value
+
 def round_to_multiple(n, multiple=32):
     """Round a number to the nearest multiple of a given value."""
     return multiple * round(n / multiple)
@@ -331,12 +364,12 @@ def main():
                         help="Comma-separated list or range of GPU IDs to use (e.g., '0,1,2' or '0-2' or '0,2-4')")
     
     # Model architecture arguments
-    parser.add_argument("--dim", type=int, default=None,
-                        help="Model hidden dimension (default: 512, will be rounded to multiple of 32)")
-    parser.add_argument("--depth", type=int, default=None,
-                        help="Number of model layers (default: 6)")
-    parser.add_argument("--params", type=float, default=None,
-                        help="Target parameter count in millions (e.g., 15 for 15M params). Will adjust dim or depth.")
+    parser.add_argument("--dim", type=str, default=None,
+                        help="Model hidden dimension (default: 512, will be rounded to multiple of 32). Can use k/m/g suffix.")
+    parser.add_argument("--depth", type=str, default=None,
+                        help="Number of model layers (default: 6). Can use k/m/g suffix.")
+    parser.add_argument("--params", type=str, default=None,
+                        help="Target parameter count (e.g., 15m for 15M params). Can use k/m/g suffix.")
     
     args = parser.parse_args()
     
@@ -388,14 +421,19 @@ def main():
         shuffle=False  # Disable shuffling for validation as recommended
     )
     
+    # Parse numerical arguments with potential suffixes
+    dim_value = parse_size_with_suffix(args.dim) if args.dim is not None else None
+    depth_value = int(parse_size_with_suffix(args.depth)) if args.depth is not None else None
+    params_value = parse_size_with_suffix(args.params) if args.params is not None else None
+    
     # Configure model architecture based on command line arguments
-    if args.params is not None:
-        # Convert millions to actual count
-        target_params = args.params * 1e6
+    if params_value is not None:
+        # Get target parameter count
+        target_params = params_value
         
-        if args.dim is not None and args.depth is None:
+        if dim_value is not None and depth_value is None:
             # If dimension is specified but not depth, solve for depth
-            dim = round_to_multiple(args.dim)
+            dim = round_to_multiple(dim_value)
             depth = solve_for_depth(
                 target_params, 
                 dim, 
@@ -404,9 +442,9 @@ def main():
                 MODEL_CONFIG["expansion"]
             )
             print(f"Target params: {args.params}M, Dimension: {dim}, Calculated depth: {depth}")
-        elif args.dim is None and args.depth is not None:
+        elif dim_value is None and depth_value is not None:
             # If depth is specified but not dimension, solve for dimension
-            depth = args.depth
+            depth = depth_value
             dim = solve_for_dimension(
                 target_params, 
                 depth, 
@@ -417,10 +455,10 @@ def main():
             print(f"Target params: {args.params}M, Calculated dimension: {dim}, Depth: {depth}")
         else:
             # If neither is specified or both are specified, adjust dimension
-            if args.dim is not None and args.depth is not None:
+            if dim_value is not None and depth_value is not None:
                 print(f"Warning: Both dimension and depth specified with target params. Ignoring target params.")
-                dim = round_to_multiple(args.dim)
-                depth = args.depth
+                dim = round_to_multiple(dim_value)
+                depth = depth_value
             else:
                 # Default: keep depth=6, solve for dimension
                 depth = MODEL_CONFIG["depth"]
@@ -434,8 +472,8 @@ def main():
                 print(f"Target params: {args.params}M, Calculated dimension: {dim}, Depth: {depth}")
     else:
         # No target params specified, use explicit values or defaults
-        dim = round_to_multiple(args.dim) if args.dim is not None else MODEL_CONFIG["dim"]
-        depth = args.depth if args.depth is not None else MODEL_CONFIG["depth"]
+        dim = round_to_multiple(dim_value) if dim_value is not None else MODEL_CONFIG["dim"]
+        depth = depth_value if depth_value is not None else MODEL_CONFIG["depth"]
         
     # Update model config with the calculated values
     MODEL_CONFIG["dim"] = dim
