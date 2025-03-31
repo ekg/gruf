@@ -325,6 +325,12 @@ def main():
     parser.add_argument("--params", type=str, default=None,
                         help="Target parameter count (e.g., 15m for 15M params). Can use k/m/g suffix.")
     
+    # Training parameters
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help=f"Batch size per GPU (default: {TRAINING_CONFIG['batch_size']})")
+    parser.add_argument("--seq_len", type=str, default=None,
+                        help=f"Sequence length for training (default: {TRAINING_CONFIG['seq_len']}). Can use k/m/g suffix.")
+    
     args = parser.parse_args()
     
     # Parse GPU IDs
@@ -374,7 +380,7 @@ def main():
     print(f"Data loaded - Train: {data_train.shape}, Val: {data_val.shape}")
 
     # Create datasets and dataloaders
-    print("Creating datasets and dataloaders...")
+    print(f"Creating datasets and dataloaders with sequence length: {SEQ_LEN}...")
     train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
     val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
     
@@ -402,6 +408,12 @@ def main():
     dim_value = parse_size_with_suffix(args.dim) if args.dim is not None else None
     depth_value = args.depth  # Already an int, no parsing needed
     params_value = parse_size_with_suffix(args.params) if args.params is not None else None
+    seq_len_value = int(parse_size_with_suffix(args.seq_len)) if args.seq_len is not None else SEQ_LEN
+    batch_size_value = args.batch_size if args.batch_size is not None else BATCH_SIZE
+    
+    # Override config values with command line arguments if provided
+    SEQ_LEN = seq_len_value
+    BATCH_SIZE = batch_size_value
     
     # Configure model architecture based on command line arguments
     if params_value is not None:
