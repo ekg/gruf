@@ -5,21 +5,21 @@ Central configuration for minGRU/minLM model parameters
 # Training configuration
 TRAINING_CONFIG = {
     "num_batches": int(1e5),
-    "batch_size": 4,
-    "grad_accum_every": 16,
-    "learning_rate": 1e-4,
-    "validate_every": 1024,
+    "batch_size": 2,
+    "grad_accum_every": 8,
+    "learning_rate": 1e-3,
+    "validate_every": 128,
     "prime_length": 128,
-    "generate_every": 1024,
+    "generate_every": 128,
     "generate_length": 512,
-    "seq_len": 1024 * 4,
+    "seq_len": 1024 * 8,
 }
 
 # Model architecture configuration
 MODEL_CONFIG = {
     "num_tokens": 256,
-    "dim": 1024,         # Hidden dimension size
-    "depth": 16,         # Number of layers
+    "dim": 512,          # Hidden dimension size
+    "depth": 32,         # Number of layers
     "ff_mult": 4,        # Feedforward multiplier
     "expansion": 1.5,    # Expansion factor for minGRU/minLSTM
     "conv_kernel_size": 3,
