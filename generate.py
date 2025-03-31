@@ -252,7 +252,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate text using a trained minLM model")
     
     # Model and data parameters
-    parser.add_argument("--model_path", type=str, required=True, help="Path to the trained model checkpoint")
+    parser.add_argument("--model", type=str, required=True, help="Path to the trained model checkpoint")
     parser.add_argument("--config_path", type=str, default=None, help="Path to model config (optional)")
     parser.add_argument("--device", type=str, default="auto", help="Device to run on: 'cpu', 'cuda', 'cuda:0', etc. (default: 'auto')")
     
@@ -267,7 +267,7 @@ def main():
     parser.add_argument("--primer_text", type=str, default=None, help="Direct text to use as primer")
     parser.add_argument("--primer_length", type=str, default="128", help="Length of primer sequence (default: 128). Can use k/m/g suffix.")
     parser.add_argument("--random_primer", action="store_true", help="Use a random primer from validation set")
-    parser.add_argument("--data_path", type=str, default="./data/enwik8.gz", help="Path to data file for random primer (default: ./data/enwik8.gz)")
+    parser.add_argument("--data", type=str, default="./data/enwik8.gz", help="Path to data file for random primer (default: ./data/enwik8.gz)")
     parser.add_argument("--output_file", type=str, default=None, help="Output file to write generated text (optional)")
     
     # Parse arguments
@@ -281,8 +281,8 @@ def main():
     print(f"Using device: {device}")
     
     # Load the model
-    print(f"Loading model from {args.model_path}...")
-    model = load_model(args.model_path, args.config_path)
+    print(f"Loading model from {args.model}...")
+    model = load_model(args.model, args.config_path)
     model = model.to(device)
     model.eval()
     print(f"Model loaded with {sum(p.numel() for p in model.parameters()):,} parameters")
@@ -295,7 +295,7 @@ def main():
     # Prepare validation dataset if using random primer
     val_dataset = None
     if args.random_primer:
-        data_path = args.data_path
+        data_path = args.data
         print(f"Loading validation dataset for random primer from {data_path}...")
         
         if is_gzip_file(data_path):

@@ -312,7 +312,7 @@ def solve_for_depth(target_params, dim, vocab_size=256, ff_mult=4, expansion=1.5
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Train a minLM model with PyTorch Lightning")
-    parser.add_argument("--data_path", type=str, required=True,
+    parser.add_argument("--data", type=str, required=True,
                         help="Path to the training data file (e.g., 'data/enwik8.gz')")
     parser.add_argument("--gpus", type=str, default=None, 
                         help="Comma-separated list or range of GPU IDs to use (e.g., '0,1,2' or '0-2' or '0,2-4')")
@@ -348,20 +348,20 @@ def main():
             return test_f.read(2) == b'\x1f\x8b'
     
     # Load and prepare data
-    print(f"Loading data from {args.data_path}...")
+    print(f"Loading data from {args.data}...")
     
-    if is_gzip_file(args.data_path):
+    if is_gzip_file(args.data):
         print("Detected gzip format, loading into memory...")
-        with gzip.open(args.data_path) as file:
+        with gzip.open(args.data) as file:
             data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
             np_train, np_valid = np.split(data, [int(90e6)])
             data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
     else:
         print("Detected raw format, using memory mapping...")
         # Get file size
-        file_size = os.path.getsize(args.data_path)
+        file_size = os.path.getsize(args.data)
         # Map the file into memory
-        with open(args.data_path, 'r+b') as f:
+        with open(args.data, 'r+b') as f:
             mm = mmap.mmap(f.fileno(), 0)
             # Create a numpy array using the memory map
             data = np.frombuffer(mm, dtype=np.uint8, count=min(int(95e6), file_size))
