@@ -460,8 +460,25 @@ def main():
                 dim = round_to_multiple(dim_value)
                 depth = depth_value
             else:
-                # Default: keep depth=6, solve for dimension
-                depth = MODEL_CONFIG["depth"]
+                # Scale both depth and dimension according to scaling laws
+                # Use a logarithmic scaling for depth to get more balanced architecture
+                # Depth scales approximately with the cube root of parameter count
+                # Start with depth=6 for 15M params, then scale appropriately
+                
+                base_params = 15 * 1024 * 1024  # 15M params as the reference point
+                base_depth = 6  # Reference depth for 15M params
+                
+                # Calculate a balanced depth based on parameter count scaling
+                if target_params >= base_params:
+                    # Scale up from the base configuration
+                    scaling_factor = (target_params / base_params) ** (1/3)  # Cube root scaling
+                    depth = max(base_depth, round(base_depth * scaling_factor))
+                else:
+                    # Scale down from the base configuration, but more conservatively
+                    scaling_factor = (target_params / base_params) ** (1/4)  # Fourth root scaling for small models
+                    depth = max(2, round(base_depth * scaling_factor))  # Minimum depth of 2
+                
+                # Now solve for dimension with the calculated depth
                 dim = solve_for_dimension(
                     target_params, 
                     depth, 
@@ -469,7 +486,7 @@ def main():
                     MODEL_CONFIG["ff_mult"], 
                     MODEL_CONFIG["expansion"]
                 )
-                print(f"Target params: {args.params}M, Calculated dimension: {dim}, Depth: {depth}")
+                print(f"Target params: {args.params}, Calculated balanced scaling - Dimension: {dim}, Depth: {depth}")
     else:
         # No target params specified, use explicit values or defaults
         dim = round_to_multiple(dim_value) if dim_value is not None else MODEL_CONFIG["dim"]
