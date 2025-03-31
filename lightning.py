@@ -605,22 +605,29 @@ def main():
     first_layer_shape = model.model.layers[0][2].to_hidden_and_gate.weight.shape
     print(f"First layer weight shape: {first_layer_shape}")
     
-    # Generate a unique checkpoint directory name - but don't create it yet
-    if args.output:
-        checkpoint_dir = args.output
-    else:
-        # Use the global timestamp created before main()
-        params_str = f"{actual_params/1000000:.1f}M" if actual_params >= 1000000 else f"{actual_params/1000:.1f}K"
-        checkpoint_dir = f"gruf_{params_str}_{RUN_TIMESTAMP}"
+    # Check if we're using distributed training
+    using_distributed = torch.cuda.device_count() > 1
+    
+    # Set up distributed environment if not already done
+    if using_distributed and not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(backend="gloo")
     
     # Determine if this is the main process
     if torch.distributed.is_initialized():
         is_main_process = torch.distributed.get_rank() == 0
     else:
         is_main_process = True
-    
-    # Only the main process should create the directory
+
+    # Only the main process generates the directory name
     if is_main_process:
+        if args.output:
+            checkpoint_dir = args.output
+        else:
+            # Generate a unique name based on parameters and timestamp
+            params_str = f"{actual_params/1000000:.1f}M" if actual_params >= 1000000 else f"{actual_params/1000:.1f}K"
+            checkpoint_dir = f"gruf_{params_str}_{RUN_TIMESTAMP}"
+        
+        # Create the directory
         print(f"Creating checkpoint directory: {checkpoint_dir}")
         os.makedirs(checkpoint_dir, exist_ok=True)
         
@@ -638,9 +645,29 @@ def main():
                 "tokens_per_sec", "train_loss", "val_loss", "bpb",
                 "learning_rate", "batch_size", "grad_accum", "seq_len"
             ])
+    else:
+        # Non-main processes start with an empty directory name
+        checkpoint_dir = ""
     
-    # Make sure all processes wait for the directory to be created
+    # Broadcast the directory name from rank 0 to all other processes
     if torch.distributed.is_initialized():
+        # Convert directory to tensor for broadcasting
+        dir_tensor = torch.zeros(1024, dtype=torch.uint8)
+        if is_main_process:
+            dir_bytes = checkpoint_dir.encode('utf-8')
+            dir_tensor[:len(dir_bytes)] = torch.tensor([ord(c) for c in dir_bytes], dtype=torch.uint8)
+            dir_tensor[len(dir_bytes)] = 0  # null terminator
+        
+        # Broadcast from process 0
+        torch.distributed.broadcast(dir_tensor, 0)
+        
+        # All processes except rank 0 need to decode the directory name
+        if not is_main_process:
+            # Find null terminator position
+            null_pos = (dir_tensor == 0).nonzero()[0].item()
+            checkpoint_dir = ''.join([chr(b) for b in dir_tensor[:null_pos].tolist()])
+        
+        # Make sure all processes wait for directory creation
         torch.distributed.barrier()
     
     # Set up callbacks - all processes use the same directory
@@ -713,7 +740,9 @@ def main():
     print(f"-----------------------------\n")
 
     # Initialize metrics logger with the path that should now exist
+    # All processes now have the same checkpoint directory name
     metrics_log_path = os.path.join(checkpoint_dir, "training_metrics.csv")
+    print(f"Using checkpoint directory: {checkpoint_dir}")
     
     metrics_logger = MetricsLoggerCallback(metrics_log_path)
     
