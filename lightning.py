@@ -589,7 +589,7 @@ def main():
     first_layer_shape = model.model.layers[0][2].to_hidden_and_gate.weight.shape
     print(f"First layer weight shape: {first_layer_shape}")
     
-    # Create checkpoint directory
+    # Set up checkpoint directory name but don't create it yet
     if args.output:
         checkpoint_dir = args.output
     else:
@@ -598,9 +598,6 @@ def main():
         params_str = f"{actual_params/1000000:.1f}M" if actual_params >= 1000000 else f"{actual_params/1000:.1f}K"
         checkpoint_dir = f"gruf_{params_str}_{timestamp}"
     
-    print(f"Saving checkpoints to: {checkpoint_dir}")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
     # Set up callbacks
     # Best models based on validation loss
     checkpoint_callback = ModelCheckpoint(
@@ -623,16 +620,6 @@ def main():
     
     progress_bar = TokensPerSecFormatter()
     
-    # Save model configuration for easy reloading
-    def save_model_config():
-        import json
-        # Combine model and training configs
-        config = {**MODEL_CONFIG, **{"learning_rate": LEARNING_RATE, "seq_len": SEQ_LEN, "batch_size": BATCH_SIZE}}
-        with open(os.path.join(checkpoint_dir, "model_config.json"), "w") as f:
-            json.dump(config, f, indent=2)
-    
-    # Save the config file
-    save_model_config()
     
     # Create logger
     csv_logger = CSVLogger(
@@ -679,6 +666,21 @@ def main():
     print(f"Training for {max_epochs} epochs to reach approximately {NUM_BATCHES} steps")
     print(f"-----------------------------\n")
 
+    # Create the checkpoint directory only when we're about to begin training
+    print(f"Saving checkpoints to: {checkpoint_dir}")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Save model configuration for easy reloading
+    def save_model_config():
+        import json
+        # Combine model and training configs
+        config = {**MODEL_CONFIG, **{"learning_rate": LEARNING_RATE, "seq_len": SEQ_LEN, "batch_size": BATCH_SIZE}}
+        with open(os.path.join(checkpoint_dir, "model_config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+    
+    # Save the config file
+    save_model_config()
+    
     # Create training metrics logger
     metrics_log_path = os.path.join(checkpoint_dir, "training_metrics.csv")
     metrics_logger = MetricsLoggerCallback(metrics_log_path)
