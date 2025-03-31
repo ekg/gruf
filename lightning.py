@@ -21,6 +21,9 @@ os.environ["NCCL_SOCKET_IFNAME"] = "eno1"  # Use the specific interface shown in
 from minGRU_pytorch.minLM import minLM
 from config import MODEL_CONFIG, TRAINING_CONFIG, calculate_model_size, get_parameter_count_str
 
+# Override default depth to 6 (already has dim=512 by default)
+MODEL_CONFIG["depth"] = 6
+
 # Load configuration constants
 NUM_BATCHES = TRAINING_CONFIG["num_batches"]
 BATCH_SIZE = TRAINING_CONFIG["batch_size"]
@@ -268,11 +271,73 @@ def parse_gpu_ids(gpu_spec):
             
     return sorted(list(set(gpu_ids)))  # Remove duplicates and sort
 
+def round_to_multiple(n, multiple=32):
+    """Round a number to the nearest multiple of a given value."""
+    return multiple * round(n / multiple)
+
+def solve_for_dimension(target_params, depth, vocab_size=256, ff_mult=4, expansion=1.5):
+    """
+    Solve for the dimension that will give approximately the target parameter count
+    given the other model parameters.
+    """
+    from math import sqrt
+    
+    # Simplified model parameter count formula
+    # params ≈ 2 * dim * vocab_size + depth * (4 * dim * dim * expansion + 2 * dim * dim * ff_mult)
+    
+    # Rearranging to solve for dim:
+    # params = 2 * dim * vocab_size + depth * dim * dim * (4 * expansion + 2 * ff_mult)
+    # params = 2 * dim * vocab_size + depth * dim * dim * factor
+    # params = 2 * dim * vocab_size + depth * factor * dim^2
+    
+    factor = 4 * expansion + 2 * ff_mult
+    
+    # This is a quadratic equation of the form: a*dim^2 + b*dim - target_params = 0
+    a = depth * factor
+    b = 2 * vocab_size
+    c = -target_params
+    
+    # Quadratic formula: dim = (-b + sqrt(b^2 - 4*a*c)) / (2*a)
+    discriminant = b**2 - 4*a*c
+    if discriminant < 0:
+        raise ValueError("No solution exists for the given target parameter count")
+    
+    dim = (-b + sqrt(discriminant)) / (2*a)
+    return round_to_multiple(dim)
+
+def solve_for_depth(target_params, dim, vocab_size=256, ff_mult=4, expansion=1.5):
+    """
+    Solve for the depth that will give approximately the target parameter count
+    given the other model parameters.
+    """
+    # params ≈ 2 * dim * vocab_size + depth * (4 * dim * dim * expansion + 2 * dim * dim * ff_mult)
+    
+    # Rearranging to solve for depth:
+    # params = 2 * dim * vocab_size + depth * dim * dim * (4 * expansion + 2 * ff_mult)
+    # params - 2 * dim * vocab_size = depth * dim * dim * factor
+    # depth = (params - 2 * dim * vocab_size) / (dim * dim * factor)
+    
+    embed_params = 2 * dim * vocab_size
+    factor = 4 * expansion + 2 * ff_mult
+    layer_params = dim * dim * factor
+    
+    depth = (target_params - embed_params) / layer_params
+    return max(1, round(depth))  # Ensure at least 1 layer
+
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Train a minLM model with PyTorch Lightning")
     parser.add_argument("--gpus", type=str, default=None, 
                         help="Comma-separated list or range of GPU IDs to use (e.g., '0,1,2' or '0-2' or '0,2-4')")
+    
+    # Model architecture arguments
+    parser.add_argument("--dim", type=int, default=None,
+                        help="Model hidden dimension (default: 512, will be rounded to multiple of 32)")
+    parser.add_argument("--depth", type=int, default=None,
+                        help="Number of model layers (default: 6)")
+    parser.add_argument("--params", type=float, default=None,
+                        help="Target parameter count in millions (e.g., 15 for 15M params). Will adjust dim or depth.")
+    
     args = parser.parse_args()
     
     # Parse GPU IDs
@@ -323,8 +388,61 @@ def main():
         shuffle=False  # Disable shuffling for validation as recommended
     )
     
+    # Configure model architecture based on command line arguments
+    if args.params is not None:
+        # Convert millions to actual count
+        target_params = args.params * 1e6
+        
+        if args.dim is not None and args.depth is None:
+            # If dimension is specified but not depth, solve for depth
+            dim = round_to_multiple(args.dim)
+            depth = solve_for_depth(
+                target_params, 
+                dim, 
+                MODEL_CONFIG["num_tokens"], 
+                MODEL_CONFIG["ff_mult"], 
+                MODEL_CONFIG["expansion"]
+            )
+            print(f"Target params: {args.params}M, Dimension: {dim}, Calculated depth: {depth}")
+        elif args.dim is None and args.depth is not None:
+            # If depth is specified but not dimension, solve for dimension
+            depth = args.depth
+            dim = solve_for_dimension(
+                target_params, 
+                depth, 
+                MODEL_CONFIG["num_tokens"], 
+                MODEL_CONFIG["ff_mult"], 
+                MODEL_CONFIG["expansion"]
+            )
+            print(f"Target params: {args.params}M, Calculated dimension: {dim}, Depth: {depth}")
+        else:
+            # If neither is specified or both are specified, adjust dimension
+            if args.dim is not None and args.depth is not None:
+                print(f"Warning: Both dimension and depth specified with target params. Ignoring target params.")
+                dim = round_to_multiple(args.dim)
+                depth = args.depth
+            else:
+                # Default: keep depth=6, solve for dimension
+                depth = MODEL_CONFIG["depth"]
+                dim = solve_for_dimension(
+                    target_params, 
+                    depth, 
+                    MODEL_CONFIG["num_tokens"], 
+                    MODEL_CONFIG["ff_mult"], 
+                    MODEL_CONFIG["expansion"]
+                )
+                print(f"Target params: {args.params}M, Calculated dimension: {dim}, Depth: {depth}")
+    else:
+        # No target params specified, use explicit values or defaults
+        dim = round_to_multiple(args.dim) if args.dim is not None else MODEL_CONFIG["dim"]
+        depth = args.depth if args.depth is not None else MODEL_CONFIG["depth"]
+        
+    # Update model config with the calculated values
+    MODEL_CONFIG["dim"] = dim
+    MODEL_CONFIG["depth"] = depth
+    
     # Set up model
-    print("Creating model...")
+    print(f"Creating model with dimension={dim}, depth={depth}...")
     model = LightningMinLM(
         num_tokens=MODEL_CONFIG["num_tokens"],
         dim=MODEL_CONFIG["dim"],
