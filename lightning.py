@@ -314,6 +314,7 @@ def parse_size_with_suffix(size_str):
     Parse a string with optional k, m, g suffix into a number.
     Examples:
       "1k" -> 1024
+      "100k" -> 102400 (100*1024)
       "2m" -> 2097152 (2*1024*1024)
       "3g" -> 3221225472 (3*1024*1024*1024)
       "42" -> 42 (no suffix, unchanged)
