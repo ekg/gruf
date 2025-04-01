@@ -403,6 +403,7 @@ def main():
     global BATCH_SIZE
     global GRAD_ACCUM_EVERY
     global LEARNING_RATE
+    global NUM_BATCHES
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Train a minLM model with PyTorch Lightning")
@@ -427,7 +428,9 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=None,
                         help=f"Learning rate (default: {TRAINING_CONFIG['learning_rate']})")
     parser.add_argument("--seq_len", type=str, default=None,
-                        help=f"Sequence length for training (default: {TRAINING_CONFIG['seq_len']}). Can use k/m/g suffix.")
+                        help=f"Sequence length for training (default: {TRAINING_CONFIG['seq_len']}). Can use k/m/g suffix (e.g., '1k'=1024, '8k'=8192).")
+    parser.add_argument("--steps", type=str, default=None,
+                        help=f"Total training steps (default: {TRAINING_CONFIG['num_batches']}). Can use k/m/g suffix (e.g., '1k'=1024, '100k'=100,000).")
     parser.add_argument("--output", type=str, default=None,
                         help="Directory to save checkpoints (default: auto-generated name with params and timestamp)")
     parser.add_argument("--use_bf16", action="store_true",
@@ -514,12 +517,14 @@ def main():
     batch_size_value = args.batch_size if args.batch_size is not None else BATCH_SIZE
     grad_accum_value = args.grad_accum if args.grad_accum is not None else GRAD_ACCUM_EVERY
     learning_rate_value = args.learning_rate if args.learning_rate is not None else LEARNING_RATE
+    num_batches_value = int(parse_size_with_suffix(args.steps)) if args.steps is not None else NUM_BATCHES
     
     # Override config values with command line arguments if provided
     SEQ_LEN = seq_len_value
     BATCH_SIZE = batch_size_value
     GRAD_ACCUM_EVERY = grad_accum_value
     LEARNING_RATE = learning_rate_value
+    NUM_BATCHES = num_batches_value
     
     # Configure model architecture based on command line arguments
     if params_value is not None:
@@ -646,6 +651,7 @@ def main():
                 "learning_rate": LEARNING_RATE, 
                 "seq_len": SEQ_LEN, 
                 "batch_size": BATCH_SIZE,
+                "num_batches": NUM_BATCHES,
                 "use_bf16": args.use_bf16
             }
         }
@@ -769,7 +775,7 @@ def main():
 
     print(f"Starting training with {torch.cuda.device_count()} GPUs")
     print(f"Config: bs={BATCH_SIZE}, grad_accum={GRAD_ACCUM_EVERY}, lr={LEARNING_RATE}, seq_len={SEQ_LEN}")
-    print(f"Will run for {NUM_BATCHES} steps")
+    print(f"Will run for {NUM_BATCHES:,} steps")
     
     # Start training
     print("Starting training...")
