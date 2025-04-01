@@ -518,14 +518,24 @@ def main():
     batch_size_value = args.batch_size if args.batch_size is not None else BATCH_SIZE
     grad_accum_value = args.grad_accum if args.grad_accum is not None else GRAD_ACCUM_EVERY
     learning_rate_value = args.learning_rate if args.learning_rate is not None else LEARNING_RATE
-    num_batches_value = int(parse_size_with_suffix(args.steps)) if args.steps is not None else NUM_BATCHES
+    
+    # Get user-requested total steps
+    total_requested_steps = int(parse_size_with_suffix(args.steps)) if args.steps is not None else NUM_BATCHES
     
     # Override config values with command line arguments if provided
     SEQ_LEN = seq_len_value
     BATCH_SIZE = batch_size_value
     GRAD_ACCUM_EVERY = grad_accum_value
     LEARNING_RATE = learning_rate_value
-    NUM_BATCHES = num_batches_value
+    
+    # Get world size for distributed training
+    world_size = torch.cuda.device_count() if torch.cuda.is_available() and gpu_ids else 1
+    
+    # Adjust NUM_BATCHES for distributed training - each GPU will do this many steps
+    # So the total steps across all GPUs will equal the requested total
+    NUM_BATCHES = total_requested_steps // world_size
+    if NUM_BATCHES == 0:
+        NUM_BATCHES = 1  # Ensure at least 1 step per GPU
     
     # Configure model architecture based on command line arguments
     if params_value is not None:
@@ -653,6 +663,7 @@ def main():
                 "seq_len": SEQ_LEN, 
                 "batch_size": BATCH_SIZE,
                 "num_batches": NUM_BATCHES,
+                "total_steps": total_requested_steps,
                 "use_bf16": args.use_bf16
             }
         }
@@ -757,7 +768,7 @@ def main():
     precision = "bf16" if args.use_bf16 else 32
     
     trainer = pl.Trainer(
-        max_steps=NUM_BATCHES,  # Still use max_steps as a hard limit
+        max_steps=NUM_BATCHES,  # Each GPU will do this many steps
         accumulate_grad_batches=GRAD_ACCUM_EVERY,
         accelerator="gpu",
         devices=gpu_ids if gpu_ids else "auto",
@@ -776,7 +787,7 @@ def main():
 
     print(f"Starting training with {torch.cuda.device_count()} GPUs")
     print(f"Config: bs={BATCH_SIZE}, grad_accum={GRAD_ACCUM_EVERY}, lr={LEARNING_RATE}, seq_len={SEQ_LEN}")
-    print(f"Will run for {NUM_BATCHES:,} steps")
+    print(f"Will run for {NUM_BATCHES:,} steps per GPU ({total_requested_steps:,} total steps across {world_size} GPUs)")
     
     # Start training
     print("Starting training...")
