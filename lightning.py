@@ -21,6 +21,7 @@ from pytorch_lightning.loggers import CSVLogger
 # Set environment variables
 os.environ["NCCL_DEBUG"] = "INFO"
 os.environ["NCCL_SOCKET_IFNAME"] = "eno1"  # Use the specific interface shown in your logs
+os.environ["DS_BUILD_OPS"] = "0"  # Skip building DeepSpeed custom CUDA kernels
 
 # Import the minLM model and configuration
 from minGRU_pytorch.minLM import minLM
@@ -808,6 +809,8 @@ def main():
                 args.offload_parameters,
                 LEARNING_RATE
             )
+            # Avoid C++ compilation issues by skipping custom ops
+            os.environ["DS_BUILD_OPS"] = "0"
             strategy = DeepSpeedStrategy(config=ds_config)
     else:
         # Regular DDP strategy with NCCL backend for better GPU performance

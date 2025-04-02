@@ -33,6 +33,11 @@ dependencies = [
     "deepspeed>=0.10.0",
 ]
 
+[project.optional-dependencies]
+deepspeed = [
+    "ninja",  # Required for JIT C++ compilation
+]
+
 [project.urls]
 Homepage = "https://pypi.org/project/minGRU-pytorch/"
 Repository = "https://github.com/lucidrains/minGRU-pytorch"
