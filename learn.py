@@ -598,8 +598,9 @@ class MinLMTrainer:
         prime = self.val_dataset.data[rand_start:rand_start + prime_length].long().unsqueeze(0).to(self.model.device)
         
         # Generate text
-        print("\nGenerating sample text...")
-        print(f"Prime: {decode_tokens(prime[0])}")
+        if not self.silent_mode:
+            print("\nGenerating sample text...")
+            print(f"Prime: {decode_tokens(prime[0])}")
         
         self.model.eval()
         with torch.no_grad():
