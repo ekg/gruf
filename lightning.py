@@ -792,12 +792,14 @@ def main():
         min_params = int(parse_size_with_suffix(args.fsdp_min_params))
         print(f"FSDP will auto-wrap modules with > {min_params:,} parameters")
         
-        # Set up auto-wrapping policy to properly shard model
-        # This is critical for memory efficiency with large models
-        auto_wrap_policy = size_based_auto_wrap_policy(
-            min_num_params=min_params
-            # Removed except_types parameter which isn't supported in this PyTorch version
-        )
+        # Define a custom auto-wrap policy function compatible with this PyTorch version
+        def custom_auto_wrap_policy(module, recurse, nonwrapped_numel):
+            if nonwrapped_numel >= min_params:
+                return True
+            return False
+        
+        # Use our custom policy instead of size_based_auto_wrap_policy
+        auto_wrap_policy = custom_auto_wrap_policy
         
         strategy = FSDPStrategy(
             sharding_strategy=sharding_strategy_map[args.fsdp_sharding_strategy],
