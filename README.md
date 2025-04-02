@@ -1,66 +1,37 @@
-## minGRU
+# minGRU
 
-Implementation of the proposed <a href="https://arxiv.org/abs/2410.01201v1">minGRU</a> in Pytorch, only the log-space numerically stable version.
+PyTorch implementation of the minGRU architecture from the paper [Were RNNs All We Needed?](https://arxiv.org/abs/2410.01201v1), using the log-space numerically stable version.
 
-<a href="https://www.youtube.com/watch?v=jE9jAZC42NE">Yannic's paper review</a>
+## Features
 
-## Appreciation
+- Efficient training with DeepSpeed integration via `learn.py`
+- Text generation with efficient KV-caching via `generate.py`
+- Support for CPU offloading and mixed precision training
+- Support for configurable model sizes via dimension and depth parameters
 
-- <a href="https://github.com/mbrotos">Adam Sorenti</a> for contributing `minLSTM`!
+## Training
 
-## Install
-
-```bash
-$ pip install minGRU-pytorch
-```
-
-## Usage
-
-```python
-import torch
-from minGRU_pytorch import minGRU
-
-min_gru = minGRU(512)
-
-x = torch.randn(2, 1024, 512)
-
-out = min_gru(x)
-
-assert x.shape == out.shape
-```
-
-Sanity check
-
-```python
-import torch
-from minGRU_pytorch import minGRU
-
-min_gru = minGRU(dim = 512, expansion_factor = 1.5)
-
-x = torch.randn(1, 2048, 512)
-
-# parallel
-
-parallel_out = min_gru(x)[:, -1:]
-
-# sequential
-
-prev_hidden = None
-for token in x.unbind(dim = 1):
-    sequential_out, prev_hidden = min_gru(token[:, None, :], prev_hidden, return_next_prev_hidden = True)
-
-assert torch.allclose(parallel_out, sequential_out, atol = 1e-4)
-```
-
-## Test
-
-enwik8
+Train a model on your text data:
 
 ```bash
-$ python train.py
+python learn.py --data your_text_file.txt --params 15m --gpus 0,1
 ```
 
-## Citations
+For distributed training with DeepSpeed:
+
+```bash
+python learn.py --data your_text_file.txt --deepspeed --zero_stage 2 --params 19.9m --gpus 0,1,2,3
+```
+
+## Generation
+
+Generate text with a trained model:
+
+```bash
+python generate.py --model checkpoints/best.pt --primer_text "Once upon a time" --temperature 0.8
+```
+
+## Citation
 
 ```bibtex
 @inproceedings{Feng2024WereRA,
@@ -71,13 +42,4 @@ $ python train.py
 }
 ```
 
-```bibtex
-@inproceedings{anonymous2024hymba,
-    title   = {Hymba: A Hybrid-head Architecture for Small Language Models},
-    author  = {Anonymous},
-    booktitle = {Submitted to The Thirteenth International Conference on Learning Representations},
-    year    = {2024},
-    url     = {https://openreview.net/forum?id=A1ztozypga},
-    note    = {under review}
-}
-```
+Original implementation by the authors of the paper.
