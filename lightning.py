@@ -854,8 +854,6 @@ def main():
                 args.offload_parameters,
                 LEARNING_RATE
             )
-            # Avoid C++ compilation issues by skipping custom ops
-            os.environ["DS_BUILD_OPS"] = "0"
             # Let our configure_optimizers handle the optimizer setup
             strategy = DeepSpeedStrategy(
                 config=ds_config,
