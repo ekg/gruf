@@ -127,7 +127,8 @@ class MinLMTrainer:
         dropout=0.0,
         checkpoint_dir=None,
         world_size=1,
-        global_rank=0
+        global_rank=0,
+        silent_mode=False
     ):
         self.learning_rate = learning_rate
         self.model = minLM(
@@ -415,7 +416,9 @@ class MinLMTrainer:
                 # Also save as best model
                 best_path = os.path.join(self.checkpoint_dir, "best.pt")
                 torch.save(checkpoint, best_path)
-                print(f"New best model saved with val_loss: {self.val_loss:.4f}, bpb: {self.val_bpb:.4f}")
+                
+                if not hasattr(self, 'silent_mode') or not self.silent_mode:
+                    print(f"New best model saved with val_loss: {self.val_loss:.4f}, bpb: {self.val_bpb:.4f}")
             
             # Add to best_checkpoints list and sort
             self.best_checkpoints.append((checkpoint_path, self.val_loss))
@@ -505,7 +508,7 @@ class MinLMTrainer:
                         # Log metrics
                         self._log_metrics(True)
                 
-                # Generate samples periodically
+                # Generate samples periodically if not skipped
                 if generate_every > 0 and step > 0 and step % generate_every == 0 and self.global_rank == 0:
                     # Temporarily enable more verbose logging during generation
                     if self.checkpoint_dir:
@@ -697,6 +700,10 @@ def main():
                         help="Path to the training data file (e.g., 'data/enwik8.gz')")
     parser.add_argument("--gpus", type=str, default=None, 
                         help="Comma-separated list or range of GPU IDs to use (e.g., '0,1,2' or '0-2')")
+    parser.add_argument("--silent", action="store_true",
+                        help="Don't print information about new best models")
+    parser.add_argument("--skip-generation", action="store_true",
+                        help="Skip periodic text generation during training")
     
     # Model architecture arguments
     parser.add_argument("--dim", type=str, default=None,
@@ -1027,7 +1034,8 @@ def main():
         dropout=MODEL_CONFIG["dropout"],
         checkpoint_dir=checkpoint_dir,
         world_size=world_size,
-        global_rank=global_rank
+        global_rank=global_rank,
+        silent_mode=args.silent
     )
     
     # Store val_dataset for text generation
@@ -1060,7 +1068,7 @@ def main():
         val_loader,
         NUM_BATCHES,
         VALIDATE_EVERY,
-        GENERATE_EVERY,
+        0 if args.skip_generation else GENERATE_EVERY,
         val_batches=4
     )
 
