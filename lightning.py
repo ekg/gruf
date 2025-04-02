@@ -19,6 +19,11 @@ from torch.utils.data import DataLoader, Dataset
 from pytorch_lightning.strategies import DDPStrategy, DeepSpeedStrategy
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 from pytorch_lightning.loggers import CSVLogger
+try:
+    from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
+    DEEPSPEED_OPTIMIZERS_AVAILABLE = True
+except ImportError:
+    DEEPSPEED_OPTIMIZERS_AVAILABLE = False
 
 # Set environment variables
 os.environ["NCCL_DEBUG"] = "INFO"
@@ -149,7 +154,22 @@ class LightningMinLM(pl.LightningModule):
             self.start_time = time.time()
             if self.global_rank == 0:
                 print(f"Starting tokens/s timing at step {batch_idx}")
+        
+        # Debug optimizer type and parameters every 100 steps
+        if batch_idx % 100 == 0 and self.global_rank == 0:
+            if hasattr(self.trainer, 'optimizers'):
+                opt = self.trainer.optimizers[0] if self.trainer.optimizers else None
+                print(f"Step {batch_idx} - Optimizer type: {type(opt).__name__}")
                 
+                # Check if params are on the expected devices
+                if opt is not None:
+                    param_devices = set()
+                    for param_group in opt.param_groups:
+                        for param in param_group['params']:
+                            if param.device not in param_devices:
+                                param_devices.add(param.device)
+                    print(f"Parameter devices: {param_devices}")
+                    
         loss = self.model(batch, return_loss=True)
         # Log train_loss for display in progress bar (on_step=True) but use a simpler name
         self.log('train_loss', loss, prog_bar=True, sync_dist=True, on_step=True, on_epoch=False)
@@ -192,7 +212,22 @@ class LightningMinLM(pl.LightningModule):
         return {"val_loss": loss, "bpb": bpb}
     
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        # Check if using DeepSpeed strategy
+        using_deepspeed = isinstance(self.trainer.strategy, DeepSpeedStrategy) if self.trainer is not None else False
+        
+        if using_deepspeed and DEEPSPEED_OPTIMIZERS_AVAILABLE:
+            # When using ZeRO-3 with CPU offloading, use DeepSpeedCPUAdam
+            if getattr(self.trainer.strategy.config, "zero_stage", 0) == 3 and getattr(self.trainer.strategy.config, "offload_optimizer", False):
+                print("Using DeepSpeedCPUAdam optimizer for ZeRO-3 with CPU offloading")
+                return DeepSpeedCPUAdam(self.parameters(), lr=self.learning_rate)
+            else:
+                # Otherwise use DeepSpeed's FusedAdam for better performance
+                print("Using DeepSpeed FusedAdam optimizer")
+                return FusedAdam(self.parameters(), lr=self.learning_rate)
+        else:
+            # For regular training or when DeepSpeed optimizers aren't available
+            print("Using standard PyTorch Adam optimizer")
+            return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
 
 # Custom progress bar that formats token/s more cleanly
 class TokensPerSecFormatter(TQDMProgressBar):
@@ -363,14 +398,8 @@ def create_deepspeed_config(zero_stage, bf16, offload_optimizer, offload_paramet
         "bf16": {
             "enabled": bf16
         },
-        "optimizer": {
-            "type": "AdamW",
-            "params": {
-                "lr": learning_rate,
-                "betas": [0.9, 0.95],
-                "eps": 1e-8
-            }
-        },
+        # Remove optimizer config - we'll handle this in configure_optimizers()
+        "zero_allow_untested_optimizer": True,
         "wall_clock_breakdown": False
     }
     
@@ -796,7 +825,7 @@ def main():
         # Use a JSON config file if provided
         if args.deepspeed_config and os.path.exists(args.deepspeed_config):
             print(f"Using DeepSpeed config from: {args.deepspeed_config}")
-            strategy = DeepSpeedStrategy(config=args.deepspeed_config)
+            strategy = DeepSpeedStrategy(config=args.deepspeed_config, zero_allow_untested_optimizer=True)
         else:
             # Create DeepSpeed config from arguments
             ds_config = create_deepspeed_config(
@@ -808,7 +837,12 @@ def main():
             )
             # Avoid C++ compilation issues by skipping custom ops
             os.environ["DS_BUILD_OPS"] = "0"
-            strategy = DeepSpeedStrategy(config=ds_config)
+            # Use zero_force_ds_cpu_optimizer=False to ensure our configure_optimizers is used
+            strategy = DeepSpeedStrategy(
+                config=ds_config,
+                zero_allow_untested_optimizer=True,
+                zero_force_ds_cpu_optimizer=False
+            )
     else:
         # Regular DDP strategy with NCCL backend for better GPU performance
         strategy = DDPStrategy(
