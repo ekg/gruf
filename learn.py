@@ -706,10 +706,10 @@ def main():
                         help="Path to the training data file (e.g., 'data/enwik8.gz')")
     parser.add_argument("--gpus", type=str, default=None, 
                         help="Comma-separated list or range of GPU IDs to use (e.g., '0,1,2' or '0-2')")
-    parser.add_argument("--silent", action="store_true",
-                        help="Don't print information about new best models")
-    parser.add_argument("--skip-generation", action="store_true",
-                        help="Skip periodic text generation during training")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print detailed information during training")
+    parser.add_argument("--generate", action="store_true",
+                        help="Enable periodic text generation during training")
     
     # Model architecture arguments
     parser.add_argument("--dim", type=str, default=None,
@@ -1074,7 +1074,7 @@ def main():
         val_loader,
         NUM_BATCHES,
         VALIDATE_EVERY,
-        0 if args.skip_generation else GENERATE_EVERY,
+        GENERATE_EVERY if args.generate else 0,
         val_batches=4
     )
 
