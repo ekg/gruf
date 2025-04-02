@@ -686,6 +686,8 @@ def main():
                         help="Model hidden dimension (default: 512). Can use k/m/g suffix.")
     parser.add_argument("--depth", type=int, default=None,
                         help="Number of model layers (default: 6).")
+    parser.add_argument("--embedding_dim", type=int, default=None,
+                        help="Embedding dimension (vocabulary size, default: 256)")
     parser.add_argument("--params", type=str, default=None,
                         help="Target parameter count (e.g., 15m for 15M params). Can use k/m/g suffix.")
     
@@ -801,6 +803,9 @@ def main():
     LEARNING_RATE = learning_rate_value
     NUM_BATCHES = total_requested_steps
     
+    # Get embedding dimension from command line or use default
+    embedding_dim = args.embedding_dim if args.embedding_dim is not None else MODEL_CONFIG["num_tokens"]
+    
     # Configure model architecture based on command line arguments
     if params_value is not None:
         # Get target parameter count
@@ -812,7 +817,7 @@ def main():
             depth = solve_for_depth(
                 target_params, 
                 dim, 
-                MODEL_CONFIG["num_tokens"], 
+                embedding_dim, 
                 MODEL_CONFIG["ff_mult"], 
                 MODEL_CONFIG["expansion"]
             )
@@ -824,7 +829,7 @@ def main():
             dim = solve_for_dimension(
                 target_params, 
                 depth, 
-                MODEL_CONFIG["num_tokens"], 
+                embedding_dim, 
                 MODEL_CONFIG["ff_mult"], 
                 MODEL_CONFIG["expansion"]
             )
@@ -966,9 +971,12 @@ def main():
     if global_rank == 0:
         print(f"Creating model with dimension={dim}, depth={depth}...")
     
+    # Update model config with embedding dimension
+    MODEL_CONFIG["num_tokens"] = embedding_dim
+    
     # Initialize the model trainer
     trainer = MinLMTrainer(
-        num_tokens=MODEL_CONFIG["num_tokens"],
+        num_tokens=embedding_dim,
         dim=MODEL_CONFIG["dim"],
         depth=MODEL_CONFIG["depth"],
         ff_mult=MODEL_CONFIG["ff_mult"],
