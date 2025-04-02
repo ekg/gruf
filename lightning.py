@@ -379,7 +379,7 @@ def create_deepspeed_config(zero_stage, bf16, offload_optimizer, offload_paramet
     
     config = {
         "train_micro_batch_size_per_gpu": BATCH_SIZE,
-        "gradient_accumulation_steps": GRAD_ACCUM_EVERY,  # Add explicit gradient accumulation
+        # Removed gradient_accumulation_steps - Lightning handles this via accumulate_grad_batches
         "steps_per_print": 100,
         "optimizer": {
             "type": "Adam",  # Explicitly specify optimizer type
