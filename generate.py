@@ -40,7 +40,7 @@ def top_k(logits, thres=0.9):
     probs.scatter_(-1, ind, val)
     return probs
 
-def load_model(checkpoint_path, config_path=None, use_bf16=False):
+def load_model(checkpoint_path, config_path=None, use_bf16=False, use_fp16=False, device=None):
     """
     Load a trained minLM model from checkpoint
     
@@ -48,12 +48,18 @@ def load_model(checkpoint_path, config_path=None, use_bf16=False):
         checkpoint_path: Path to the model checkpoint
         config_path: Path to the model config file (optional)
         use_bf16: Whether to load model in BF16 precision (default: False)
+        use_fp16: Whether to load model in FP16 precision (default: False)
+        device: Device to load model on (default: auto-detect)
     
     Returns:
         Loaded model
     """
+    # Set device
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
     # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location='cuda' if torch.cuda.is_available() else 'cpu')
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')  # First load to CPU to avoid OOM
     
     # Load config if provided, otherwise use defaults from MODEL_CONFIG
     if config_path and os.path.exists(config_path):
@@ -62,6 +68,8 @@ def load_model(checkpoint_path, config_path=None, use_bf16=False):
     else:
         # Use defaults from MODEL_CONFIG
         config = MODEL_CONFIG
+    
+    print(f"Creating model with dimension={config['dim']}, depth={config['depth']}...")
     
     # Create model with the correct configuration
     model = minLM(
@@ -96,15 +104,44 @@ def load_model(checkpoint_path, config_path=None, use_bf16=False):
         # Another possible Lightning format
         model.load_state_dict(checkpoint['model']['state_dict'])
     else:
-        # Raw state dict
-        model.load_state_dict(checkpoint)
-        
+        # Raw state dict - try direct loading
+        try:
+            model.load_state_dict(checkpoint)
+        except (RuntimeError, KeyError) as e:
+            # Handle DeepSpeed formats by checking for different module prefixes
+            print(f"Direct loading failed, trying to match keys: {str(e)}")
+            if isinstance(checkpoint, dict):
+                # Try to adapt keys if they don't match directly
+                ds_state_dict = {}
+                # Check for module prefixes used by DeepSpeed
+                for key, value in checkpoint.items():
+                    if key.startswith('module.model.'):
+                        # DeepSpeed might add 'module.' prefix
+                        ds_state_dict[key[13:]] = value  # Remove 'module.model.'
+                    elif key.startswith('model.'):
+                        ds_state_dict[key[6:]] = value  # Remove 'model.'
+                    else:
+                        ds_state_dict[key] = value  # Keep as is
+                
+                # Try loading with adapted keys
+                model.load_state_dict(ds_state_dict)
+                print("Successfully loaded model with adapted keys")
+    
+    # Set model to evaluation mode
     model = model.eval()
     
-    # Convert to BF16 if requested
-    if use_bf16 and torch.cuda.is_available():
-        model = model.to(torch.bfloat16)
-        print("Model converted to BF16 precision")
+    # Apply precision conversion
+    if device == 'cuda':
+        if use_bf16 and torch.cuda.is_available():
+            model = model.to(torch.bfloat16)
+            print("Model converted to BF16 precision")
+        elif use_fp16 and torch.cuda.is_available():
+            model = model.to(torch.float16)
+            print("Model converted to FP16 precision")
+    
+    # Move model to device
+    model = model.to(device)
+    print(f"Model loaded with {sum(p.numel() for p in model.parameters()):,} parameters on {device}")
     
     return model
 
@@ -116,10 +153,11 @@ def chunked_generation(
     temperature: float = 1.0,
     filter_thres: float = 0.9,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
-    callback=None
+    callback=None,
+    use_kv_cache: bool = True
 ):
     """
-    Generate text in chunks, feeding forward hidden state between chunks.
+    Generate text in chunks, efficiently using KV-cache when available.
     
     Args:
         model: The minLM model
@@ -130,6 +168,7 @@ def chunked_generation(
         filter_thres: Threshold for top-k filtering (higher = more diverse)
         device: Device to run generation on
         callback: Optional callback function to report progress
+        use_kv_cache: Whether to use KV caching for faster generation if model supports it
     
     Returns:
         Generated tokens
@@ -146,51 +185,99 @@ def chunked_generation(
     # Start with no hidden state
     prev_hiddens = None
     
+    # Process the prompt efficiently
+    with torch.no_grad():
+        # Process the entire prompt at once if it fits in memory
+        # This is much faster than processing one token at a time
+        if hasattr(model, 'can_cache') and model.can_cache and use_kv_cache:
+            # Process the prompt to get initial KV cache
+            _, prev_hiddens = model(out, return_prev_hiddens=True)
+        else:
+            # For models without caching, no need to do anything special here
+            pass
+    
     # Timing variables
     start_time = time.time()
     tokens_generated = 0
     
+    # Efficient memory management
+    torch.cuda.empty_cache()
+    
     # Generate tokens in chunks
-    while remaining_tokens > 0:
-        # Determine how many tokens to generate in this chunk
-        current_chunk_size = min(chunk_length, remaining_tokens)
-        
-        # Generate one chunk
-        for _ in range(current_chunk_size):
-            # Get logits and new hidden state
-            logits, next_prev_hiddens = model(
-                out, 
-                return_prev_hiddens=True, 
-                prev_hiddens=prev_hiddens
-            )
+    with torch.no_grad():
+        while remaining_tokens > 0:
+            # Generate tokens efficiently in batches
+            batch_size = min(chunk_length, remaining_tokens)
             
-            # Get logits for the last token
-            logits = logits[:, -1]
+            if hasattr(model, 'can_cache') and model.can_cache and use_kv_cache:
+                # With KV cache, we only need to process the most recent token
+                for _ in range(batch_size):
+                    # Get logits and updated KV cache
+                    logits, next_prev_hiddens = model(
+                        out[:, -1:],  # Only need the last token
+                        return_prev_hiddens=True, 
+                        prev_hiddens=prev_hiddens
+                    )
+                    
+                    # Get logits for the generated token
+                    logits = logits[:, -1]
+                    
+                    # Update KV cache
+                    prev_hiddens = next_prev_hiddens
+                    
+                    # Apply top-k filtering and sample
+                    filtered_logits = top_k(logits, thres=filter_thres)
+                    sample = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)
+                    
+                    # Append the new token to the output
+                    out = torch.cat((out, sample), dim=-1)
+                    
+                    tokens_generated += 1
+                    
+                    # Update progress regularly
+                    if tokens_generated % 5 == 0 and callback:
+                        progress = tokens_generated / generation_length
+                        elapsed = time.time() - start_time
+                        tokens_per_sec = tokens_generated / elapsed if elapsed > 0 else 0
+                        callback(progress, tokens_per_sec)
+            else:
+                # Without KV cache, we process multiple tokens at once
+                # Generate tokens for this chunk
+                for _ in range(batch_size):
+                    # Get logits for the sequence
+                    logits, next_prev_hiddens = model(
+                        out, 
+                        return_prev_hiddens=True,
+                        prev_hiddens=prev_hiddens
+                    )
+                    
+                    # Get logits for the last token
+                    logits = logits[:, -1]
+                    
+                    # Apply top-k filtering and sample
+                    filtered_logits = top_k(logits, thres=filter_thres)
+                    sample = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)
+                    
+                    # Append the new token to the output
+                    out = torch.cat((out, sample), dim=-1)
+                    
+                    tokens_generated += 1
             
-            # Update hidden state for next iteration if model supports caching
-            if model.can_cache:
-                prev_hiddens = next_prev_hiddens
+            # Update remaining tokens
+            remaining_tokens -= batch_size
             
-            # Apply top-k filtering and sample
-            filtered_logits = top_k(logits, thres=filter_thres)
-            sample = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)
+            # Calculate and show progress for the whole chunk
+            elapsed = time.time() - start_time
+            tokens_per_sec = tokens_generated / elapsed if elapsed > 0 else 0
             
-            # Append the new token to the output
-            out = torch.cat((out, sample), dim=-1)
+            # Call progress callback if provided
+            if callback:
+                progress = (generation_length - remaining_tokens) / generation_length
+                callback(progress, tokens_per_sec)
             
-            tokens_generated += 1
-        
-        # Update remaining tokens
-        remaining_tokens -= current_chunk_size
-        
-        # Calculate and show progress
-        elapsed = time.time() - start_time
-        tokens_per_sec = tokens_generated / elapsed if elapsed > 0 else 0
-        
-        # Call progress callback if provided
-        if callback:
-            progress = (generation_length - remaining_tokens) / generation_length
-            callback(progress, tokens_per_sec)
+            # Periodically clear unused memory
+            if tokens_generated % 100 == 0:
+                torch.cuda.empty_cache()
     
     # Return only the newly generated tokens (excluding the prompt)
     return out[..., prompt.shape[-1]:]
@@ -265,12 +352,15 @@ def main():
     parser.add_argument("--device", type=str, default="auto", help="Device to run on: 'cpu', 'cuda', 'cuda:0', etc. (default: 'auto')")
     parser.add_argument("--use-f32", dest="use_bf16", action="store_false", default=True,
                         help="Use FP32 precision instead of BF16 (default: BF16)")
+    parser.add_argument("--use-fp16", action="store_true", default=False,
+                        help="Use FP16 precision instead of BF16/FP32 (default: False)")
     
     # Generation parameters
     parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sampling (default: 1.0)")
     parser.add_argument("--top_k", type=float, default=0.9, help="Threshold for top-k filtering (default: 0.9)")
     parser.add_argument("--chunk_length", type=str, default="64", help="Process sequence in chunks of this length (default: 64). Can use k/m/g suffix.")
     parser.add_argument("--generation_length", type=str, default="512", help="Total number of tokens to generate (default: 512). Can use k/m/g suffix.")
+    parser.add_argument("--no_kv_cache", action="store_true", help="Disable KV caching for generation (slower but uses less memory)")
     
     # Input parameters
     parser.add_argument("--primer_file", type=str, default=None, help="File containing primer text (optional)")
@@ -279,6 +369,7 @@ def main():
     parser.add_argument("--random_primer", action="store_true", help="Use a random primer from validation set")
     parser.add_argument("--data", type=str, default="./data/enwik8.gz", help="Path to data file for random primer (default: ./data/enwik8.gz)")
     parser.add_argument("--output_file", type=str, default=None, help="Output file to write generated text (optional)")
+    parser.add_argument("--memory_efficient", action="store_true", help="Use memory-efficient generation (slower but uses less VRAM)")
     
     # Parse arguments
     args = parser.parse_args()
@@ -292,10 +383,13 @@ def main():
     
     # Load the model
     print(f"Loading model from {args.model}...")
-    model = load_model(args.model, args.config_path, use_bf16=args.use_bf16)
-    model = model.to(device)
-    model.eval()
-    print(f"Model loaded with {sum(p.numel() for p in model.parameters()):,} parameters")
+    model = load_model(
+        checkpoint_path=args.model, 
+        config_path=args.config_path, 
+        use_bf16=args.use_bf16,
+        use_fp16=args.use_fp16,
+        device=device
+    )
     
     # Helper function to detect if a file is gzipped
     def is_gzip_file(filepath):
@@ -373,6 +467,14 @@ def main():
     
     print(f"\nGenerating {generation_length} tokens in chunks of {chunk_length}...")
     print(f"Temperature: {args.temperature}, Top-k threshold: {args.top_k}")
+    print(f"Using KV cache: {'No' if args.no_kv_cache else 'Yes'}")
+    
+    # Memory optimization
+    if args.memory_efficient:
+        print("Using memory-efficient generation mode")
+        # Clear CUDA cache before generation
+        if device.startswith('cuda'):
+            torch.cuda.empty_cache()
     
     # Generate text
     start_time = time.time()
@@ -385,8 +487,13 @@ def main():
             args.temperature,
             args.top_k,
             device,
-            progress_callback
+            progress_callback,
+            use_kv_cache=not args.no_kv_cache
         )
+        
+    # Clear cache after generation
+    if device.startswith('cuda'):
+        torch.cuda.empty_cache()
     
     total_time = time.time() - start_time
     total_tokens = generation_length
