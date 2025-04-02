@@ -229,8 +229,10 @@ def chunked_generation(
                     filtered_logits = top_k(logits, thres=filter_thres)
                     sample = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)
                     
+                    # Ensure sample is Long before concatenation
+                    sample_long = sample.long()
                     # Append the new token to the output
-                    out = torch.cat((out, sample), dim=-1)
+                    out = torch.cat((out, sample_long), dim=-1)
                     
                     tokens_generated += 1
                     
@@ -258,8 +260,10 @@ def chunked_generation(
                     filtered_logits = top_k(logits, thres=filter_thres)
                     sample = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)
                     
+                    # Ensure sample is Long before concatenation
+                    sample_long = sample.long() 
                     # Append the new token to the output
-                    out = torch.cat((out, sample), dim=-1)
+                    out = torch.cat((out, sample_long), dim=-1)
                     
                     tokens_generated += 1
             
@@ -302,7 +306,8 @@ def load_primer_text(primer_file=None, primer_length=None, val_dataset=None):
         inp = random.choice(val_dataset)
         if primer_length:
             inp = inp[:primer_length]
-        return inp[None, ...]  # Add batch dimension
+        # Ensure this is a Long tensor
+        return inp.long()[None, ...]  # Add batch dimension and convert to long
     
     else:
         # Default to a simple prompt if no primer is provided
@@ -428,7 +433,8 @@ def main():
         class TextSamplerDataset(Dataset):
             def __init__(self, data, seq_len):
                 super().__init__()
-                self.data = data
+                # Ensure data is a Long tensor
+                self.data = data.long() if data.dtype != torch.long else data
                 self.seq_len = seq_len
             
             def __len__(self):
@@ -454,7 +460,8 @@ def main():
         # Otherwise get primer text from file or validation dataset
         prompt = load_primer_text(args.primer_file, primer_length, val_dataset)
     
-    prompt = prompt.to(device)
+    # Ensure prompt is a Long tensor before sending to device
+    prompt = prompt.long().to(device)
     
     # Display the primer text
     primer_text = decode_tokens(prompt[0])
