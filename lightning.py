@@ -126,6 +126,8 @@ class LightningMinLM(pl.LightningModule):
     ):
         super().__init__()
         self.learning_rate = learning_rate
+        
+        # Create the model - make sure it's properly structured for FSDP sharding
         self.model = minLM(
             num_tokens=num_tokens,
             dim=dim,
@@ -137,6 +139,11 @@ class LightningMinLM(pl.LightningModule):
             enable_conv=enable_conv,
             dropout=dropout
         )
+        
+        # Verify model structure for FSDP compatibility
+        param_count = sum(p.numel() for p in self.model.parameters())
+        if self.global_rank == 0:
+            print(f"Model created with {param_count:,} parameters")
         # For tracking tokens per second
         self.total_tokens_processed = 0
         self.start_time = None  # Will be set on first training step
@@ -151,6 +158,13 @@ class LightningMinLM(pl.LightningModule):
             self.start_time = time.time()
             if self.global_rank == 0:
                 print(f"Starting tokens/s timing at step {batch_idx}")
+        
+        # Monitor GPU memory usage (helpful for debugging FSDP issues)
+        if self.global_rank == 0 and batch_idx % 50 == 0:
+            allocated = torch.cuda.memory_allocated() / (1024**3)
+            reserved = torch.cuda.memory_reserved() / (1024**3)
+            max_mem = torch.cuda.max_memory_allocated() / (1024**3)
+            print(f"GPU {self.global_rank} memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, {max_mem:.2f}GB peak")
                 
         loss = self.model(batch, return_loss=True)
         # Log train_loss for display in progress bar (on_step=True) but use a simpler name
@@ -450,6 +464,8 @@ def main():
                         help="Enable activation checkpointing with FSDP to save memory")
     parser.add_argument("--fsdp_cpu_offload", action="store_true",
                         help="Enable CPU offloading with FSDP to save GPU memory")
+    parser.add_argument("--fsdp_min_params", type=str, default="100k",
+                        help="Minimum number of parameters for auto-wrap policy (default: 100k). Can use k/m/g suffix.")
     
     args = parser.parse_args()
     
@@ -770,6 +786,18 @@ def main():
         
         # Configure the FSDP strategy
         from pytorch_lightning.strategies import FSDPStrategy
+        from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, enable_wrap, wrap
+        
+        # Parse min params threshold with suffix support
+        min_params = int(parse_size_with_suffix(args.fsdp_min_params))
+        print(f"FSDP will auto-wrap modules with > {min_params:,} parameters")
+        
+        # Set up auto-wrapping policy to properly shard model
+        # This is critical for memory efficiency with large models
+        auto_wrap_policy = size_based_auto_wrap_policy(
+            min_num_params=min_params,
+            except_types={}  # No exceptions
+        )
         
         strategy = FSDPStrategy(
             sharding_strategy=sharding_strategy_map[args.fsdp_sharding_strategy],
@@ -778,8 +806,10 @@ def main():
             # Removed activation_checkpointing due to compatibility issues
             process_group_backend="gloo",  # Always use gloo backend
             limit_all_gathers=True,  # Help prevent OOMs
+            auto_wrap_policy=auto_wrap_policy,  # Add auto-wrapping policy
         )
         print(f"FSDP configuration: sharding={args.fsdp_sharding_strategy}, state_dict={args.fsdp_state_dict_type}, backend=gloo")
+        print(f"FSDP auto_wrap_policy: {getattr(strategy, 'auto_wrap_policy', None)}")
         if args.fsdp_activation_checkpointing:
             print("Warning: Activation checkpointing was requested but is disabled due to compatibility issues")
     else:
@@ -873,12 +903,12 @@ def main():
         """Print detailed information about model parameters"""
         total_params = sum(p.numel() for p in model.parameters())
         expected_params = calculate_model_size()
-        
+    
         print(f"\nDetailed Model Information:")
         print(f"Expected parameters: {expected_params:,}")
         print(f"Actual parameters: {total_params:,}")
         print(f"Difference: {total_params - expected_params:,}")
-        
+    
         # Group parameters by layer type
         param_groups = {}
         for name, param in model.named_parameters():
@@ -895,14 +925,31 @@ def main():
                 group = "output"
             else:
                 group = "other"
-                
+            
             if group not in param_groups:
                 param_groups[group] = 0
             param_groups[group] += param.numel()
-        
+    
         # Print parameter counts by group
         for group, count in param_groups.items():
             print(f"- {group}: {count:,} parameters ({count/total_params*100:.1f}%)")
+        
+        # Print detailed layer structure to help diagnose FSDP wrapping issues
+        print("\nModule structure for FSDP wrapping:")
+        print_module_structure(model.model)
+
+    def print_module_structure(module, depth=0, min_params=10000):
+        """Print the module structure recursively, focusing on larger modules relevant for FSDP wrapping"""
+        indent = "  " * depth
+        num_params = sum(p.numel() for p in module.parameters())
+    
+        # Only print modules with significant parameter counts
+        if num_params >= min_params:
+            print(f"{indent}- {module.__class__.__name__}: {num_params:,} params")
+        
+            # Recursively print children
+            for name, child in module.named_children():
+                print_module_structure(child, depth + 1, min_params)
     
     # Print final stats and save final model
     if trainer.is_global_zero:
