@@ -128,7 +128,7 @@ class MinLMTrainer:
         checkpoint_dir=None,
         world_size=1,
         global_rank=0,
-        silent_mode=False
+        silent_mode=True
     ):
         self.learning_rate = learning_rate
         self.model = minLM(
@@ -417,7 +417,7 @@ class MinLMTrainer:
                 best_path = os.path.join(self.checkpoint_dir, "best.pt")
                 torch.save(checkpoint, best_path)
                 
-                if not hasattr(self, 'silent_mode') or not self.silent_mode:
+                if hasattr(self, 'silent_mode') and not self.silent_mode:
                     print(f"New best model saved with val_loss: {self.val_loss:.4f}, bpb: {self.val_bpb:.4f}")
             
             # Add to best_checkpoints list and sort
