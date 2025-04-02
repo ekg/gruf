@@ -216,8 +216,27 @@ class LightningMinLM(pl.LightningModule):
         using_deepspeed = isinstance(self.trainer.strategy, DeepSpeedStrategy) if self.trainer is not None else False
         
         if using_deepspeed and DEEPSPEED_OPTIMIZERS_AVAILABLE:
+            # Try to get DeepSpeed config information safely
+            zero_stage = 0
+            offload_optimizer = False
+            
+            try:
+                # Different DeepSpeed versions may have different attribute structures
+                if hasattr(self.trainer.strategy, 'config'):
+                    ds_config = self.trainer.strategy.config
+                    if isinstance(ds_config, dict):
+                        # Config is a dictionary
+                        zero_stage = ds_config.get("zero_optimization", {}).get("stage", 0)
+                        offload_optimizer = ds_config.get("zero_optimization", {}).get("offload_optimizer", False)
+                    else:
+                        # Config might be an object with attributes
+                        zero_stage = getattr(ds_config, "zero_stage", 0)
+                        offload_optimizer = getattr(ds_config, "offload_optimizer", False)
+            except (AttributeError, KeyError) as e:
+                print(f"Warning: Error accessing DeepSpeed config: {e}")
+                
             # When using ZeRO-3 with CPU offloading, use DeepSpeedCPUAdam
-            if getattr(self.trainer.strategy.config, "zero_stage", 0) == 3 and getattr(self.trainer.strategy.config, "offload_optimizer", False):
+            if zero_stage == 3 and offload_optimizer:
                 print("Using DeepSpeedCPUAdam optimizer for ZeRO-3 with CPU offloading")
                 return DeepSpeedCPUAdam(self.parameters(), lr=self.learning_rate)
             else:
@@ -837,11 +856,10 @@ def main():
             )
             # Avoid C++ compilation issues by skipping custom ops
             os.environ["DS_BUILD_OPS"] = "0"
-            # Use zero_force_ds_cpu_optimizer=False to ensure our configure_optimizers is used
+            # Let our configure_optimizers handle the optimizer setup
             strategy = DeepSpeedStrategy(
                 config=ds_config,
-                zero_allow_untested_optimizer=True,
-                zero_force_ds_cpu_optimizer=False
+                zero_allow_untested_optimizer=True
             )
     else:
         # Regular DDP strategy with NCCL backend for better GPU performance
