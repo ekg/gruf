@@ -344,8 +344,11 @@ def parse_size_with_suffix(size_str):
 
 def create_deepspeed_config(zero_stage, bf16, offload_optimizer, offload_parameters, learning_rate):
     """Create DeepSpeed configuration based on user options"""
+    # Calculate world size for correct train_batch_size
+    world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    
     config = {
-        "train_batch_size": BATCH_SIZE * GRAD_ACCUM_EVERY,
+        "train_batch_size": BATCH_SIZE * GRAD_ACCUM_EVERY * world_size,
         "train_micro_batch_size_per_gpu": BATCH_SIZE,
         "steps_per_print": 100,
         "zero_optimization": {
