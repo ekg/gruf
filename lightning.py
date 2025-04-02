@@ -158,13 +158,6 @@ class LightningMinLM(pl.LightningModule):
             self.start_time = time.time()
             if self.global_rank == 0:
                 print(f"Starting tokens/s timing at step {batch_idx}")
-        
-        # Monitor GPU memory usage (helpful for debugging FSDP issues)
-        if self.global_rank == 0 and batch_idx % 50 == 0:
-            allocated = torch.cuda.memory_allocated() / (1024**3)
-            reserved = torch.cuda.memory_reserved() / (1024**3)
-            max_mem = torch.cuda.max_memory_allocated() / (1024**3)
-            print(f"GPU {self.global_rank} memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, {max_mem:.2f}GB peak")
                 
         loss = self.model(batch, return_loss=True)
         # Log train_loss for display in progress bar (on_step=True) but use a simpler name
