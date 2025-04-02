@@ -263,7 +263,8 @@ def main():
     parser.add_argument("--model", type=str, required=True, help="Path to the trained model checkpoint")
     parser.add_argument("--config_path", type=str, default=None, help="Path to model config (optional)")
     parser.add_argument("--device", type=str, default="auto", help="Device to run on: 'cpu', 'cuda', 'cuda:0', etc. (default: 'auto')")
-    parser.add_argument("--use_bf16", action="store_true", help="Use BF16 precision to reduce memory usage (default: False)")
+    parser.add_argument("--use-f32", dest="use_bf16", action="store_false", default=True,
+                        help="Use FP32 precision instead of BF16 (default: BF16)")
     
     # Generation parameters
     parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sampling (default: 1.0)")

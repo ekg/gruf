@@ -489,10 +489,8 @@ def main():
                         help=f"Total training steps (default: {TRAINING_CONFIG['num_batches']}). Can use k/m/g suffix (e.g., '1k'=1024, '100k'=100,000).")
     parser.add_argument("--output", type=str, default=None,
                         help="Directory to save checkpoints (default: auto-generated name with params and timestamp)")
-    parser.add_argument("--use_bf16", dest="use_bf16", action="store_true", default=True,
-                        help="Use BF16 precision (default: True)")
-    parser.add_argument("--no_bf16", dest="use_bf16", action="store_false",
-                        help="Disable BF16 precision and use FP32")
+    parser.add_argument("--use-f32", dest="use_bf16", action="store_false", default=True,
+                        help="Use FP32 precision instead of BF16 (default: BF16)")
                         
     # DeepSpeed arguments
     parser.add_argument("--deepspeed", action="store_true",
