@@ -666,6 +666,9 @@ def main():
     # Check if we're using distributed training
     using_distributed = torch.cuda.device_count() > 1 and gpu_ids is not None and len(gpu_ids) > 1
     
+    # Initialize fsdp_backend variable
+    fsdp_backend = None
+    
     # Determine if this is the main process - for Lightning, we're the main process on the first GPU or in single GPU mode
     # We don't manually initialize the process group - Lightning will handle this
     is_main_process = (not using_distributed) or (gpu_ids is None) or (0 in gpu_ids and gpu_ids.index(0) == 0)
