@@ -116,7 +116,8 @@ def chunked_generation(
     temperature: float = 1.0,
     filter_thres: float = 0.9,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
-    callback=None
+    callback=None,
+    truncate_null: bool = False
 ):
     """
     Generate text in chunks, feeding forward hidden state between chunks.
@@ -174,6 +175,12 @@ def chunked_generation(
             # Apply top-k filtering and sample
             filtered_logits = top_k(logits, thres=filter_thres)
             sample = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)
+            
+            # Check if the new token is a null character (ASCII 0)
+            if truncate_null and sample.item() == 0:
+                # Stop generation if we encounter a null character
+                tokens_generated += 1
+                break
             
             # Append the new token to the output
             out = torch.cat((out, sample), dim=-1)
@@ -278,6 +285,7 @@ def main():
     parser.add_argument("--random_primer", action="store_true", help="Use a random primer from validation set")
     parser.add_argument("--data", type=str, default="./data/enwik8.gz", help="Path to data file for random primer (default: ./data/enwik8.gz)")
     parser.add_argument("--output_file", type=str, default=None, help="Output file to write generated text (optional)")
+    parser.add_argument("--truncate_null", action="store_true", help="Truncate generation when a null character (ASCII 0) is encountered")
     
     # Parse arguments
     args = parser.parse_args()
@@ -384,7 +392,8 @@ def main():
             args.temperature,
             args.top_k,
             device,
-            progress_callback
+            progress_callback,
+            truncate_null=args.truncate_null
         )
     
     total_time = time.time() - start_time
@@ -394,8 +403,13 @@ def main():
     # Decode the generated text
     generated_text = decode_tokens(generated[0])
     
+    # Check if truncation happened (actual tokens less than requested)
+    truncated = generated.shape[1] < generation_length
+    
     # Display the generated text
     print(f"\n\nGeneration complete! ({tokens_per_sec:.2f} tokens/sec)")
+    if truncated and args.truncate_null:
+        print(f"Generation was truncated after encountering a null character.")
     print(f"Generated text ({len(generated_text)} chars):")
     print(generated_text)
     
