@@ -251,11 +251,7 @@ class MinLMTrainer:
             config["zero_optimization"]["offload_optimizer"] = {
                 "device": "cpu",
                 "pin_memory": True,
-                "fast_init": True,
-                "pipeline": [
-                    {"trace_func": "torch.tensor.__floordiv__", "action": "nothing"},
-                    {"trace_func": "torch.linalg.vector_norm", "action": "float_cast_inputs"}
-                ]
+                "fast_init": True
             }
             
         # Parameter offloading only works with ZeRO-3
@@ -269,13 +265,6 @@ class MinLMTrainer:
         if zero_stage == 3:
             # Add stage3_gather_16bit_weights_on_model_save to save in fp16
             config["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = True
-            # Add additional pipeline operations for tensor type handling
-            if "pipeline" not in config["zero_optimization"]:
-                config["zero_optimization"]["pipeline"] = []
-            config["zero_optimization"]["pipeline"].extend([
-                {"trace_func": "torch.linalg.vector_norm", "action": "float_cast_inputs"},
-                {"trace_func": "torch.nn.functional.normalize", "action": "float_cast_inputs"}
-            ])
             
         # Add activation checkpointing
         config["activation_checkpointing"] = {
@@ -438,8 +427,8 @@ class MinLMTrainer:
                 if step >= num_batches:
                     break
                 
-                # Move batch to device (DeepSpeed handles this)
-                batch = batch.to(self.model.device)
+                # Move batch to device and ensure correct type
+                batch = batch.long().to(self.model.device)
                 
                 # Training step
                 loss = self.train_step(batch)
