@@ -251,7 +251,11 @@ class MinLMTrainer:
             config["zero_optimization"]["offload_optimizer"] = {
                 "device": "cpu",
                 "pin_memory": True,
-                "fast_init": True
+                "fast_init": True,
+                "pipeline": [
+                    {"trace_func": "torch.tensor.__floordiv__", "action": "nothing"},
+                    {"trace_func": "torch.linalg.vector_norm", "action": "float_cast_inputs"}
+                ]
             }
             
         # Parameter offloading only works with ZeRO-3
@@ -260,6 +264,18 @@ class MinLMTrainer:
                 "device": "cpu",
                 "pin_memory": True
             }
+                
+        # Special handling for ZeRO-3 to avoid type issues
+        if zero_stage == 3:
+            # Add stage3_gather_16bit_weights_on_model_save to save in fp16
+            config["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = True
+            # Add additional pipeline operations for tensor type handling
+            if "pipeline" not in config["zero_optimization"]:
+                config["zero_optimization"]["pipeline"] = []
+            config["zero_optimization"]["pipeline"].extend([
+                {"trace_func": "torch.linalg.vector_norm", "action": "float_cast_inputs"},
+                {"trace_func": "torch.nn.functional.normalize", "action": "float_cast_inputs"}
+            ])
             
         # Add activation checkpointing
         config["activation_checkpointing"] = {
@@ -282,6 +298,11 @@ class MinLMTrainer:
         # Ensure batch is a Long tensor before forward pass
         if batch.dtype != torch.long:
             batch = batch.long()
+            
+        # Ensure batch is on the right device
+        if batch.device != self.model.device:
+            batch = batch.to(self.model.device)
+            
         # Forward pass - DeepSpeed handles loss scaling and backward
         loss = self.model(batch, return_loss=True)
         
@@ -319,6 +340,9 @@ class MinLMTrainer:
             # Ensure batch is a Long tensor
             if batch.dtype != torch.long:
                 batch = batch.long()
+            # Move batch to device if needed
+            if batch.device != self.model.device:
+                batch = batch.to(self.model.device)
             loss = self.model(batch, return_loss=True)
             # Calculate bits per byte (bpb)
             bpb = loss / math.log(2)
