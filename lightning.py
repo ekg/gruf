@@ -837,6 +837,10 @@ def main():
     # Create trainer with precision settings based on args
     precision = "bf16-mixed" if args.use_bf16 else 32
     
+    # Adjust gradient clipping based on strategy
+    # Use 'value' instead of 'norm' when using FSDP, as 'norm' is not compatible
+    gradient_clip_algorithm = "value" if args.use_fsdp else "norm"
+    
     trainer = pl.Trainer(
         max_steps=NUM_BATCHES,  # Each GPU will do this many steps
         accumulate_grad_batches=GRAD_ACCUM_EVERY,
@@ -844,6 +848,7 @@ def main():
         devices=gpu_ids if gpu_ids else "auto",
         strategy=strategy,
         gradient_clip_val=0.5,
+        gradient_clip_algorithm=gradient_clip_algorithm,
         callbacks=[checkpoint_callback, backup_checkpoint_callback, progress_bar, metrics_logger],
         val_check_interval=VALIDATE_EVERY,
         logger=csv_logger,
