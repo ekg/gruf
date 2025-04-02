@@ -16,14 +16,9 @@ import csv
 import json
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-from pytorch_lightning.strategies import DDPStrategy, DeepSpeedStrategy
+from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 from pytorch_lightning.loggers import CSVLogger
-try:
-    from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
-    DEEPSPEED_OPTIMIZERS_AVAILABLE = True
-except ImportError:
-    DEEPSPEED_OPTIMIZERS_AVAILABLE = False
 
 # Set environment variables
 os.environ["NCCL_DEBUG"] = "INFO"
@@ -114,8 +109,6 @@ class TextSamplerDataset(Dataset):
 
 # LightningMinLM model
 class LightningMinLM(pl.LightningModule):
-    automatic_optimization = False  # Disable automatic optimization for DeepSpeed compatibility
-    
     def __init__(
         self,
         num_tokens=256,
@@ -147,10 +140,6 @@ class LightningMinLM(pl.LightningModule):
         self.start_time = None  # Will be set on first training step
         self.register_buffer('global_tokens', torch.tensor(0, dtype=torch.long))
         
-        # For manual gradient accumulation
-        self.grad_accum_steps = GRAD_ACCUM_EVERY
-        self.grad_accum_counter = 0
-        
     def forward(self, x, prev_hiddens=None):
         return self.model(x, return_loss=False, return_prev_hiddens=True, prev_hiddens=prev_hiddens)
         
@@ -167,104 +156,17 @@ class LightningMinLM(pl.LightningModule):
             if self.global_rank == 0:
                 print(f"Starting tokens/s timing at step {batch_idx}")
         
-        # Enhanced DeepSpeed debugging
-        if self.global_rank == 0:
-            if batch_idx == 0 or batch_idx % 100 == 0:
-                print(f"\n--- Debugging step {batch_idx} ---")
-                # Check optimizer
-                opt = self.optimizers()
-                print(f"Optimizer type: {type(opt).__name__}")
-                print(f"Gradient accumulation: {self.grad_accum_counter}/{self.grad_accum_steps}")
-                
-                # Check optimizer parameters and device placement
-                if opt is not None:
-                    param_devices = set()
-                    param_count = 0
-                    requires_grad_count = 0
-                    
-                    for param_group in opt.param_groups:
-                        for param in param_group['params']:
-                            param_count += 1
-                            if param.requires_grad:
-                                requires_grad_count += 1
-                            if param.device not in param_devices:
-                                param_devices.add(param.device)
-                    
-                    print(f"Parameter devices: {param_devices}")
-                    print(f"Params in optimizer: {param_count}, requires_grad: {requires_grad_count}")
-                
-                # Check model parameters
-                model_param_count = sum(1 for p in self.parameters())
-                model_requires_grad = sum(1 for p in self.parameters() if p.requires_grad)
-                print(f"Model params: {model_param_count}, requires_grad: {model_requires_grad}")
-                
-                # Check if using DeepSpeed ZeRO-3
-                is_zero3 = False
-                if hasattr(self.trainer, 'strategy') and isinstance(self.trainer.strategy, DeepSpeedStrategy):
-                    ds_config = getattr(self.trainer.strategy, 'config', {})
-                    if isinstance(ds_config, dict):
-                        zero_stage = ds_config.get("zero_optimization", {}).get("stage", 0)
-                        is_zero3 = zero_stage == 3
-                    print(f"Using DeepSpeed ZeRO Stage: {zero_stage}")
-                
         # Ensure tensor is on the right device
         batch = batch.to(self.device)
         
         # Forward pass
         loss = self.model(batch, return_loss=True)
         
-        # Debug loss and gradients
+        # Log basic statistics
         if self.global_rank == 0 and (batch_idx == 0 or batch_idx % 100 == 0):
-            print(f"Loss value: {loss.item()}, requires_grad: {loss.requires_grad}")
-            
-            # Check parameter gradients before backward
-            params_before = sum(1 for p in self.parameters() if p.grad is not None)
-            print(f"Params with gradients before backward: {params_before}")
+            print(f"Step {batch_idx} - Loss: {loss.item():.4f}")
         
-        # Manual optimization with gradient accumulation
-        opt = self.optimizers()
-        
-        # Scale loss for gradient accumulation
-        if self.grad_accum_steps > 1:
-            loss = loss / self.grad_accum_steps
-        
-        # Backward pass
-        self.manual_backward(loss)
-        
-        # Increment accumulation counter
-        self.grad_accum_counter += 1
-        
-        # Only update weights after accumulating enough gradients
-        if self.grad_accum_counter >= self.grad_accum_steps:
-            # Reset the counter
-            self.grad_accum_counter = 0
-            
-            # Update parameters - for non-DeepSpeed we need to call step manually
-            # For DeepSpeed, step() is automatically called after manual_backward
-            if not isinstance(self.trainer.strategy, DeepSpeedStrategy):
-                opt.step()
-                
-            # Zero gradients after optimization step
-            opt.zero_grad()
-        
-        # Debug gradients after backward
-        if self.global_rank == 0 and (batch_idx == 0 or batch_idx % 100 == 0):
-            params_after = sum(1 for p in self.parameters() if p.grad is not None)
-            print(f"Params with gradients after backward: {params_after}")
-            
-            # Check gradient values
-            has_grad = any(p.grad is not None for p in self.parameters())
-            print(f"Has gradients: {has_grad}")
-            if has_grad:
-                try:
-                    sample_param = next(p for p in self.parameters() if p.grad is not None)
-                    grad_norm = torch.norm(sample_param.grad).item()
-                    print(f"Sample gradient norm: {grad_norm}")
-                    print(f"Sample parameter device: {sample_param.device}")
-                except StopIteration:
-                    print("Could not find parameter with gradient")
-        
-        # Log train_loss for display in progress bar
+        # Log metrics for the progress bar and for epoch aggregation
         self.log('train_loss', loss, prog_bar=True, sync_dist=True, on_step=True, on_epoch=False)
         self.log('train_loss_epoch', loss, prog_bar=False, sync_dist=True, on_step=False, on_epoch=True)
         
@@ -304,9 +206,6 @@ class LightningMinLM(pl.LightningModule):
         return {"val_loss": loss, "bpb": bpb}
     
     def configure_optimizers(self):
-        # With DeepSpeed, the optimizer is handled in the DeepSpeed config
-        # This method will only be used for non-DeepSpeed training
-        print("Using standard PyTorch Adam optimizer")
         return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
 
 # Custom progress bar that formats token/s more cleanly
@@ -455,65 +354,6 @@ def parse_size_with_suffix(size_str):
     else:
         return value
 
-def create_deepspeed_config(zero_stage, bf16, offload_optimizer, offload_parameters, learning_rate, depth=6):
-    """Create DeepSpeed configuration based on user options"""
-    # Calculate world size for correct train_batch_size
-    world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    
-    config = {
-        # Need to specify total batch size including gradient accumulation
-        "train_batch_size": BATCH_SIZE * world_size * GRAD_ACCUM_EVERY,
-        "train_micro_batch_size_per_gpu": BATCH_SIZE,
-        # Lightning handles grad accumulation
-        "steps_per_print": 10,  # More frequent printing for debugging
-        # Remove optimizer and scheduler config - Lightning will handle this
-        "zero_optimization": {
-            "stage": zero_stage,
-            "contiguous_gradients": True,
-            "overlap_comm": True,
-            "reduce_scatter": True,
-            "reduce_bucket_size": 2e8,
-            "allgather_bucket_size": 2e8,
-            "round_robin_gradients": True
-        },
-        "fp16": {
-            "enabled": not bf16,
-            "loss_scale": 0,
-            "loss_scale_window": 1000,
-            "hysteresis": 2,
-            "min_loss_scale": 1
-        },
-        "bf16": {
-            "enabled": bf16
-        },
-        "zero_allow_untested_optimizer": True,
-        "wall_clock_breakdown": False
-    }
-    
-    # Add CPU offloading if requested (for ZeRO-2 and ZeRO-3)
-    if zero_stage >= 2 and offload_optimizer:
-        config["zero_optimization"]["offload_optimizer"] = {
-            "device": "cpu",
-            "pin_memory": True,
-            "fast_init": True
-        }
-        
-    # Parameter offloading only works with ZeRO-3
-    if zero_stage == 3 and offload_parameters:
-        config["zero_optimization"]["offload_param"] = {
-            "device": "cpu",
-            "pin_memory": True
-        }
-        
-    # Add activation checkpointing for additional memory savings
-    config["activation_checkpointing"] = {
-        "partition_activations": True,
-        "cpu_checkpointing": True,
-        "contiguous_memory_optimization": True,
-        "number_checkpoints": 8  # Use fixed number instead of model depth
-    }
-        
-    return config
 
 def round_to_multiple(n, multiple=32):
     """Round a number to the nearest multiple of a given value."""
@@ -610,17 +450,6 @@ def main():
     parser.add_argument("--use-f32", dest="use_bf16", action="store_false", default=True,
                         help="Use FP32 precision instead of BF16 (default: BF16)")
                         
-    # DeepSpeed arguments
-    parser.add_argument("--deepspeed", action="store_true",
-                        help="Enable DeepSpeed for training (default: False)")
-    parser.add_argument("--zero_stage", type=int, default=2, choices=[0, 1, 2, 3],
-                        help="ZeRO optimization stage (0-3, higher = more memory efficient but slower)")
-    parser.add_argument("--offload_optimizer", action="store_true",
-                        help="Offload optimizer states to CPU (reduces GPU memory, but slower)")
-    parser.add_argument("--offload_parameters", action="store_true",
-                        help="Offload parameters to CPU (for ZeRO-3, reduces GPU memory but slower)")
-    parser.add_argument("--deepspeed_config", type=str, default=None,
-                        help="Path to DeepSpeed JSON config file (overrides other DeepSpeed args)")
     
     args = parser.parse_args()
     
@@ -853,12 +682,6 @@ def main():
             }
         }
         
-        # Add DeepSpeed configuration if enabled
-        if args.deepspeed:
-            config["deepspeed_enabled"] = True
-            config["zero_stage"] = args.zero_stage
-            config["offload_optimizer"] = args.offload_optimizer
-            config["offload_parameters"] = args.offload_parameters
         with open(os.path.join(checkpoint_dir, "model_config.json"), "w") as f:
             json.dump(config, f, indent=2)
             
@@ -910,37 +733,12 @@ def main():
         version=RUN_TIMESTAMP  # Use the global timestamp
     )
     
-    # Setup the appropriate distributed training strategy (DeepSpeed or DDP)
-    if args.deepspeed:
-        print(f"Using DeepSpeed with ZeRO Stage-{args.zero_stage}")
-        if args.offload_optimizer:
-            print(f"Offloading optimizer states to CPU")
-        if args.offload_parameters and args.zero_stage == 3:
-            print(f"Offloading parameters to CPU")
-        
-        # Use a JSON config file if provided
-        if args.deepspeed_config and os.path.exists(args.deepspeed_config):
-            print(f"Using DeepSpeed config from: {args.deepspeed_config}")
-            strategy = DeepSpeedStrategy(config=args.deepspeed_config, zero_allow_untested_optimizer=True)
-        else:
-            # Create DeepSpeed config from arguments
-            ds_config = create_deepspeed_config(
-                args.zero_stage, 
-                args.use_bf16, 
-                args.offload_optimizer,
-                args.offload_parameters,
-                LEARNING_RATE,
-                MODEL_CONFIG["depth"]
-            )
-            # Let DeepSpeed handle the optimizer setup through its config
-            strategy = DeepSpeedStrategy(config=ds_config)
-    else:
-        # Regular DDP strategy with NCCL backend for better GPU performance
-        strategy = DDPStrategy(
-            process_group_backend="nccl",
-            find_unused_parameters=False,
-            static_graph=False  # Setting to False to avoid DDP autograd hooks issue
-        ) if torch.cuda.device_count() > 1 else "auto"
+    # Use DDP for multi-GPU training or 'auto' for single GPU
+    strategy = DDPStrategy(
+        process_group_backend="nccl",
+        find_unused_parameters=False,
+        static_graph=False  # Setting to False to avoid DDP autograd hooks issue
+    ) if torch.cuda.device_count() > 1 else "auto"
 
     # Calculate number of epochs needed to reach NUM_BATCHES
     total_samples = len(train_dataset)
@@ -985,31 +783,23 @@ def main():
     # Create trainer with precision settings based on args
     precision = "bf16-mixed" if args.use_bf16 else 32
     
-    # Don't use gradient clipping with DeepSpeed + manual optimization
-    use_gradient_clip = not args.deepspeed  # Skip gradient clipping for DeepSpeed
-    
-    trainer_kwargs = {
-        "max_steps": NUM_BATCHES,
-        # Removed accumulate_grad_batches - we're handling it manually
-        "accelerator": "gpu",
-        "devices": gpu_ids if gpu_ids else "auto",
-        "strategy": strategy,
-        "callbacks": [checkpoint_callback, backup_checkpoint_callback, progress_bar, metrics_logger],
-        "val_check_interval": VALIDATE_EVERY,
-        "logger": csv_logger,
-        "log_every_n_steps": 10,
-        "num_sanity_val_steps": 0,
-        "limit_val_batches": 4,
-        "max_epochs": max_epochs,
-        "check_val_every_n_epoch": None,
-        "precision": precision,
-    }
-    
-    # Only add gradient clipping when not using DeepSpeed
-    if use_gradient_clip:
-        trainer_kwargs["gradient_clip_val"] = 0.5
-    
-    trainer = pl.Trainer(**trainer_kwargs)
+    trainer = pl.Trainer(
+        max_steps=NUM_BATCHES,
+        accumulate_grad_batches=GRAD_ACCUM_EVERY,
+        accelerator="gpu",
+        devices=gpu_ids if gpu_ids else "auto",
+        strategy=strategy,
+        gradient_clip_val=0.5,
+        callbacks=[checkpoint_callback, backup_checkpoint_callback, progress_bar, metrics_logger],
+        val_check_interval=VALIDATE_EVERY,
+        logger=csv_logger,
+        log_every_n_steps=10,
+        num_sanity_val_steps=0,
+        limit_val_batches=4,
+        max_epochs=max_epochs,
+        check_val_every_n_epoch=None,
+        precision=precision,
+    )
 
     print(f"Starting training with {torch.cuda.device_count()} GPUs")
     print(f"Config: bs={BATCH_SIZE}, grad_accum={GRAD_ACCUM_EVERY}, lr={LEARNING_RATE}, seq_len={SEQ_LEN}")
