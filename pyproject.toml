@@ -37,16 +37,14 @@ dependencies = [
 deepspeed = [
     "ninja",  # Required for JIT C++ compilation
 ]
-
-[project.urls]
-Homepage = "https://pypi.org/project/minGRU-pytorch/"
-Repository = "https://github.com/lucidrains/minGRU-pytorch"
-
-[project.optional-dependencies]
 examples = []
 test = [
     "pytest"
 ]
+
+[project.urls]
+Homepage = "https://pypi.org/project/minGRU-pytorch/"
+Repository = "https://github.com/lucidrains/minGRU-pytorch"
 
 [tool.pytest.ini_options]
 pythonpath = [
