@@ -26,7 +26,14 @@ class ByteVectorEncoder(nn.Module):
         for i in range(8):
             binary[:, :, i] = (x >> i) & 1
         
-        return binary.float()
+        # Use the same dtype as the weight parameters in the model
+        weight_dtype = self.byte_to_model.weight.dtype if hasattr(self, 'byte_to_model') else None
+        if weight_dtype is not None:
+            binary = binary.to(dtype=weight_dtype)
+        else:
+            binary = binary.float()
+        
+        return binary
 
 # classes
 
@@ -71,10 +78,12 @@ class minLM(Module):
         dropout = 0.
     ):
         super().__init__()
-        # Replace token embedding with ByteVectorEncoder
-        self.byte_encoder = ByteVectorEncoder(dim=8)
         # Projection from 8-dim binary vector to model dimension
         self.byte_to_model = nn.Linear(8, dim, bias=False)
+        # Replace token embedding with ByteVectorEncoder
+        self.byte_encoder = ByteVectorEncoder(dim=8)
+        # Give byte_encoder a reference to byte_to_model so it can match dtype
+        self.byte_encoder.byte_to_model = self.byte_to_model
 
         self.layers = ModuleList([])
 
@@ -110,6 +119,9 @@ class minLM(Module):
 
         # Replace embedding lookup with byte vector encoding
         byte_vecs = self.byte_encoder(x)
+        # Ensure byte_vecs is the same dtype as the linear layer weights
+        if byte_vecs.dtype != self.byte_to_model.weight.dtype:
+            byte_vecs = byte_vecs.to(dtype=self.byte_to_model.weight.dtype)
         x = self.byte_to_model(byte_vecs)
 
         # handle previous hiddens, for recurrent decoding
