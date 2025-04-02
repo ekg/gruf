@@ -835,7 +835,7 @@ def main():
     metrics_logger = MetricsLoggerCallback(metrics_log_path)
     
     # Create trainer with precision settings based on args
-    precision = "bf16" if args.use_bf16 else 32
+    precision = "bf16-mixed" if args.use_bf16 else 32
     
     trainer = pl.Trainer(
         max_steps=NUM_BATCHES,  # Each GPU will do this many steps
