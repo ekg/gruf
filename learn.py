@@ -435,9 +435,11 @@ class MinLMTrainer:
                     if os.path.exists(path) and "best" not in path and "latest" not in path:
                         try:
                             os.remove(path)
-                            print(f"Removed checkpoint {os.path.basename(path)} to keep top {self.save_top_k}")
+                            if not self.silent_mode:
+                                print(f"Removed checkpoint {os.path.basename(path)} to keep top {self.save_top_k}")
                         except OSError as e:
-                            print(f"Error removing checkpoint: {e}")
+                            if not self.silent_mode:
+                                print(f"Error removing checkpoint: {e}")
         
         return checkpoint_path
     
@@ -495,7 +497,8 @@ class MinLMTrainer:
                 # Save periodic checkpoint every 1000 steps for safety
                 if self.global_rank == 0 and step > 0 and step % 1000 == 0:
                     self.save_checkpoint({"periodic": True}, is_periodic=True)
-                    print(f"Saved periodic checkpoint at step {step}")
+                    if not self.silent_mode:
+                        print(f"Saved periodic checkpoint at step {step}")
                 
                 # Validate periodically
                 if step > 0 and step % validate_every == 0:
@@ -546,7 +549,8 @@ class MinLMTrainer:
             final_path = self.save_checkpoint({
                 'final': True
             })
-            print(f"Training complete! Final checkpoint saved to: {final_path}")
+            if not self.silent_mode:
+                print(f"Training complete! Final checkpoint saved to: {final_path}")
             
             # Log final metrics
             self._log_metrics(True)
@@ -608,7 +612,8 @@ class MinLMTrainer:
             )
         self.model.train()
         
-        print(f"Generated: {decode_tokens(generated[0])}")
+        if not self.silent_mode:
+            print(f"Generated: {decode_tokens(generated[0])}")
 
 # Helper functions for command line arguments
 def parse_gpu_ids(gpu_spec):
@@ -1045,7 +1050,7 @@ def main():
     trainer.init_deepspeed(train_loader, args)
     
     # Print effective batch size
-    if global_rank == 0:
+    if global_rank == 0 and not trainer.silent_mode:
         print(f"\n--- Training Configuration ---")
         print(f"Model: {MODEL_CONFIG['depth']} layers, {MODEL_CONFIG['dim']} dimensions")
         print(f"Parameters: {get_parameter_count_str(MODEL_CONFIG)}")
