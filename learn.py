@@ -195,7 +195,8 @@ class MinLMTrainer:
     def create_deepspeed_config(self, zero_stage, bf16, offload_optimizer, offload_parameters, learning_rate, depth=6):
         """Create DeepSpeed configuration"""
         config = {
-            "train_batch_size": BATCH_SIZE * self.world_size,
+            # Correctly set train_batch_size as the product of all components
+            "train_batch_size": BATCH_SIZE * self.world_size * self.grad_accum_steps,
             "train_micro_batch_size_per_gpu": BATCH_SIZE,
             "gradient_accumulation_steps": self.grad_accum_steps,
             "steps_per_print": 10,

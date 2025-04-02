@@ -461,6 +461,8 @@ def create_deepspeed_config(zero_stage, bf16, offload_optimizer, offload_paramet
     world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
     
     config = {
+        # Need to specify total batch size including gradient accumulation
+        "train_batch_size": BATCH_SIZE * world_size * GRAD_ACCUM_EVERY,
         "train_micro_batch_size_per_gpu": BATCH_SIZE,
         # Lightning handles grad accumulation
         "steps_per_print": 10,  # More frequent printing for debugging
