@@ -764,15 +764,9 @@ def main():
             print("FSDP CPU offloading enabled")
         
         # Set up activation checkpointing for FSDP
-        activation_checkpointing_config = None
         if args.fsdp_activation_checkpointing:
             # We'll configure this after model creation
             print("FSDP activation checkpointing enabled")
-            # This uses check_fn to apply activation checkpointing only to 
-            # relevant parts of the model (like GRU layers)
-            activation_checkpointing_config = {
-                "check_fn": lambda submodule: hasattr(submodule, 'net')  # Apply to modules containing 'net' attribute
-            }
         
         # Configure the FSDP strategy
         from pytorch_lightning.strategies import FSDPStrategy
@@ -782,7 +776,6 @@ def main():
             state_dict_type=state_dict_type_map[args.fsdp_state_dict_type],
             cpu_offload=cpu_offload,
             activation_checkpointing=args.fsdp_activation_checkpointing,
-            activation_checkpointing_config=activation_checkpointing_config,
             process_group_backend="gloo",  # Always use gloo backend
             limit_all_gathers=True,  # Help prevent OOMs
         )
