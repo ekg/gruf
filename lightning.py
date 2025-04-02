@@ -795,8 +795,8 @@ def main():
         # Set up auto-wrapping policy to properly shard model
         # This is critical for memory efficiency with large models
         auto_wrap_policy = size_based_auto_wrap_policy(
-            min_num_params=min_params,
-            except_types={}  # No exceptions
+            min_num_params=min_params
+            # Removed except_types parameter which isn't supported in this PyTorch version
         )
         
         strategy = FSDPStrategy(
