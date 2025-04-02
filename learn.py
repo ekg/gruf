@@ -157,6 +157,9 @@ class MinLMTrainer:
         self.world_size = world_size
         self.global_rank = global_rank
         
+        # Store silent mode setting
+        self.silent_mode = silent_mode
+        
         # Initialize metric tracking
         self.train_loss = 0.0
         self.val_loss = 0.0
