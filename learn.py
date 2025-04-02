@@ -1035,7 +1035,7 @@ def main():
         checkpoint_dir=checkpoint_dir,
         world_size=world_size,
         global_rank=global_rank,
-        silent_mode=args.silent
+        silent_mode=not args.verbose
     )
     
     # Store val_dataset for text generation
