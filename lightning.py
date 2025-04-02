@@ -372,7 +372,7 @@ def parse_size_with_suffix(size_str):
     else:
         return value
 
-def create_deepspeed_config(zero_stage, bf16, offload_optimizer, offload_parameters, learning_rate):
+def create_deepspeed_config(zero_stage, bf16, offload_optimizer, offload_parameters, learning_rate, depth=6):
     """Create DeepSpeed configuration based on user options"""
     # Calculate world size for correct train_batch_size
     world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
@@ -850,7 +850,8 @@ def main():
                 args.use_bf16, 
                 args.offload_optimizer,
                 args.offload_parameters,
-                LEARNING_RATE
+                LEARNING_RATE,
+                MODEL_CONFIG["depth"]
             )
             # Let DeepSpeed handle the optimizer setup through its config
             strategy = DeepSpeedStrategy(config=ds_config)
