@@ -1,4 +1,8 @@
 import os
+os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9"
+os.environ["DS_BUILD_OPS"] = "0"
+os.environ["NCCL_P2P_DISABLE"] = "1"
+
 import gzip
 import random
 import numpy as np
