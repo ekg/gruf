@@ -12,6 +12,22 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+class ByteVectorEncoder(nn.Module):
+    """Encode bytes as 8-dimensional vectors instead of using an embedding table"""
+    def __init__(self, dim=8):
+        super().__init__()
+        self.dim = dim
+    
+    def forward(self, x):
+        # Convert byte values (0-255) to binary vectors
+        batch_size, seq_len = x.shape
+        # Create 8-bit binary representation
+        binary = torch.zeros(batch_size, seq_len, 8, device=x.device)
+        for i in range(8):
+            binary[:, :, i] = (x >> i) & 1
+        
+        return binary.float()
+
 # classes
 
 def FeedForward(dim, mult = 4):
@@ -55,7 +71,10 @@ class minLM(Module):
         dropout = 0.
     ):
         super().__init__()
-        self.token_emb = nn.Embedding(num_tokens, dim)
+        # Replace token embedding with ByteVectorEncoder
+        self.byte_encoder = ByteVectorEncoder(dim=8)
+        # Projection from 8-dim binary vector to model dimension
+        self.byte_to_model = nn.Linear(8, dim, bias=False)
 
         self.layers = ModuleList([])
 
@@ -72,7 +91,9 @@ class minLM(Module):
             ]))
 
         self.norm = RMSNorm(dim)
-        self.to_logits = nn.Linear(dim, num_tokens, bias = False)
+        # At the output, add bottleneck back to 8 dimensions before final projection
+        self.to_byte_vec = nn.Linear(dim, 8, bias=False)
+        self.to_logits = nn.Linear(8, num_tokens, bias=False)
 
         self.can_cache = not enable_conv
 
@@ -87,7 +108,9 @@ class minLM(Module):
         if return_loss:
             x, labels = x[:, :-1], x[:, 1:]
 
-        x = self.token_emb(x)
+        # Replace embedding lookup with byte vector encoding
+        byte_vecs = self.byte_encoder(x)
+        x = self.byte_to_model(byte_vecs)
 
         # handle previous hiddens, for recurrent decoding
 
@@ -128,7 +151,9 @@ class minLM(Module):
                 x = dropout(x)
 
         embed = self.norm(x)
-        logits = self.to_logits(embed)
+        # Add the bottleneck to 8-dim before logits
+        byte_embed = self.to_byte_vec(embed)
+        logits = self.to_logits(byte_embed)
 
         if not return_loss:
             if not return_prev_hiddens:
