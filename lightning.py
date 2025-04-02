@@ -155,7 +155,7 @@ class LightningMinLM(pl.LightningModule):
             if self.global_rank == 0:
                 print(f"Starting tokens/s timing at step {batch_idx}")
         
-        # Debug optimizer type and parameters every 100 steps
+        # Debug optimizer and gradients every 100 steps
         if batch_idx % 100 == 0 and self.global_rank == 0:
             if hasattr(self.trainer, 'optimizers'):
                 opt = self.trainer.optimizers[0] if self.trainer.optimizers else None
@@ -169,6 +169,15 @@ class LightningMinLM(pl.LightningModule):
                             if param.device not in param_devices:
                                 param_devices.add(param.device)
                     print(f"Parameter devices: {param_devices}")
+            
+            # Debug gradient flow
+            has_grad = any(p.grad is not None for p in self.parameters())
+            print(f"Step {batch_idx} - Has gradients: {has_grad}")
+            if has_grad:
+                # Sample the gradient of a parameter for debugging
+                sample_param = next(p for p in self.parameters() if p.grad is not None)
+                grad_norm = torch.norm(sample_param.grad).item()
+                print(f"Sample gradient norm: {grad_norm}")
                     
         loss = self.model(batch, return_loss=True)
         # Log train_loss for display in progress bar (on_step=True) but use a simpler name
@@ -212,41 +221,10 @@ class LightningMinLM(pl.LightningModule):
         return {"val_loss": loss, "bpb": bpb}
     
     def configure_optimizers(self):
-        # Check if using DeepSpeed strategy
-        using_deepspeed = isinstance(self.trainer.strategy, DeepSpeedStrategy) if self.trainer is not None else False
-        
-        if using_deepspeed and DEEPSPEED_OPTIMIZERS_AVAILABLE:
-            # Try to get DeepSpeed config information safely
-            zero_stage = 0
-            offload_optimizer = False
-            
-            try:
-                # Different DeepSpeed versions may have different attribute structures
-                if hasattr(self.trainer.strategy, 'config'):
-                    ds_config = self.trainer.strategy.config
-                    if isinstance(ds_config, dict):
-                        # Config is a dictionary
-                        zero_stage = ds_config.get("zero_optimization", {}).get("stage", 0)
-                        offload_optimizer = ds_config.get("zero_optimization", {}).get("offload_optimizer", False)
-                    else:
-                        # Config might be an object with attributes
-                        zero_stage = getattr(ds_config, "zero_stage", 0)
-                        offload_optimizer = getattr(ds_config, "offload_optimizer", False)
-            except (AttributeError, KeyError) as e:
-                print(f"Warning: Error accessing DeepSpeed config: {e}")
-                
-            # When using ZeRO-3 with CPU offloading, use DeepSpeedCPUAdam
-            if zero_stage == 3 and offload_optimizer:
-                print("Using DeepSpeedCPUAdam optimizer for ZeRO-3 with CPU offloading")
-                return DeepSpeedCPUAdam(self.parameters(), lr=self.learning_rate)
-            else:
-                # Otherwise use DeepSpeed's FusedAdam for better performance
-                print("Using DeepSpeed FusedAdam optimizer")
-                return FusedAdam(self.parameters(), lr=self.learning_rate)
-        else:
-            # For regular training or when DeepSpeed optimizers aren't available
-            print("Using standard PyTorch Adam optimizer")
-            return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        # With DeepSpeed, the optimizer is handled in the DeepSpeed config
+        # This method will only be used for non-DeepSpeed training
+        print("Using standard PyTorch Adam optimizer")
+        return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
 
 # Custom progress bar that formats token/s more cleanly
 class TokensPerSecFormatter(TQDMProgressBar):
@@ -401,11 +379,23 @@ def create_deepspeed_config(zero_stage, bf16, offload_optimizer, offload_paramet
     
     config = {
         "train_micro_batch_size_per_gpu": BATCH_SIZE,
+        "gradient_accumulation_steps": GRAD_ACCUM_EVERY,  # Add explicit gradient accumulation
         "steps_per_print": 100,
+        "optimizer": {
+            "type": "Adam",  # Explicitly specify optimizer type
+            "params": {
+                "lr": learning_rate,
+                "betas": [0.9, 0.999],
+                "eps": 1e-8
+            }
+        },
         "zero_optimization": {
             "stage": zero_stage,
             "contiguous_gradients": True,
-            "overlap_comm": True
+            "overlap_comm": True,
+            "reduce_scatter": True,
+            "reduce_bucket_size": 5e8,
+            "allgather_bucket_size": 5e8
         },
         "fp16": {
             "enabled": not bf16,
@@ -417,7 +407,6 @@ def create_deepspeed_config(zero_stage, bf16, offload_optimizer, offload_paramet
         "bf16": {
             "enabled": bf16
         },
-        # Remove optimizer config - we'll handle this in configure_optimizers()
         "zero_allow_untested_optimizer": True,
         "wall_clock_breakdown": False
     }
@@ -426,7 +415,8 @@ def create_deepspeed_config(zero_stage, bf16, offload_optimizer, offload_paramet
     if zero_stage >= 2 and offload_optimizer:
         config["zero_optimization"]["offload_optimizer"] = {
             "device": "cpu",
-            "pin_memory": True
+            "pin_memory": True,
+            "fast_init": True
         }
         
     # Parameter offloading only works with ZeRO-3
@@ -435,6 +425,14 @@ def create_deepspeed_config(zero_stage, bf16, offload_optimizer, offload_paramet
             "device": "cpu",
             "pin_memory": True
         }
+        
+    # Add activation checkpointing for additional memory savings
+    config["activation_checkpointing"] = {
+        "partition_activations": True,
+        "cpu_checkpointing": True,
+        "contiguous_memory_optimization": True,
+        "number_checkpoints": depth
+    }
         
     return config
 
@@ -854,11 +852,8 @@ def main():
                 args.offload_parameters,
                 LEARNING_RATE
             )
-            # Let our configure_optimizers handle the optimizer setup
-            strategy = DeepSpeedStrategy(
-                config=ds_config,
-                zero_allow_untested_optimizer=True
-            )
+            # Let DeepSpeed handle the optimizer setup through its config
+            strategy = DeepSpeedStrategy(config=ds_config)
     else:
         # Regular DDP strategy with NCCL backend for better GPU performance
         strategy = DDPStrategy(
