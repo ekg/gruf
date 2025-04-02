@@ -437,6 +437,20 @@ def main():
     parser.add_argument("--use_bf16", action="store_true",
                         help="Use BF16 precision to reduce memory usage (default: False)")
     
+    # FSDP arguments
+    parser.add_argument("--use_fsdp", action="store_true",
+                        help="Use Fully Sharded Data Parallel (FSDP) for distributed training")
+    parser.add_argument("--fsdp_sharding_strategy", type=str, default="FULL_SHARD",
+                        choices=["FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD"],
+                        help="FSDP sharding strategy")
+    parser.add_argument("--fsdp_state_dict_type", type=str, default="FULL_STATE_DICT",
+                        choices=["FULL_STATE_DICT", "SHARDED_STATE_DICT", "LOCAL_STATE_DICT"],
+                        help="FSDP state dict type for checkpointing")
+    parser.add_argument("--fsdp_activation_checkpointing", action="store_true",
+                        help="Enable activation checkpointing with FSDP to save memory")
+    parser.add_argument("--fsdp_cpu_offload", action="store_true",
+                        help="Enable CPU offloading with FSDP to save GPU memory")
+    
     args = parser.parse_args()
     
     # Parse GPU IDs
@@ -664,7 +678,10 @@ def main():
                 "batch_size": BATCH_SIZE,
                 "num_batches": NUM_BATCHES,
                 "total_steps": total_requested_steps,
-                "use_bf16": args.use_bf16
+                "use_bf16": args.use_bf16,
+                "use_fsdp": args.use_fsdp,
+                "fsdp_sharding_strategy": args.fsdp_sharding_strategy if args.use_fsdp else None,
+                "fsdp_state_dict_type": args.fsdp_state_dict_type if args.use_fsdp else None
             }
         }
         with open(os.path.join(checkpoint_dir, "model_config.json"), "w") as f:
@@ -718,12 +735,70 @@ def main():
         version=RUN_TIMESTAMP  # Use the global timestamp
     )
     
-    # Create a DDPStrategy with the gloo backend
-    ddp_strategy = DDPStrategy(
-        process_group_backend="gloo",
-        find_unused_parameters=False,
-        static_graph=False  # Setting to False to avoid DDP autograd hooks issue
-    ) if torch.cuda.device_count() > 1 else "auto"
+    # Configure strategy based on args
+    if args.use_fsdp:
+        # Configure FSDP strategy
+        print("Using Fully Sharded Data Parallel (FSDP) strategy")
+        
+        # Convert string enum to PyTorch enum
+        from torch.distributed.fsdp import ShardingStrategy, StateDictType, CPUOffload
+        import torch.distributed.fsdp.fully_sharded_data_parallel as fsdp
+        
+        # Map command line arguments to PyTorch enums
+        sharding_strategy_map = {
+            "FULL_SHARD": ShardingStrategy.FULL_SHARD,
+            "SHARD_GRAD_OP": ShardingStrategy.SHARD_GRAD_OP,
+            "NO_SHARD": ShardingStrategy.NO_SHARD
+        }
+        
+        state_dict_type_map = {
+            "FULL_STATE_DICT": StateDictType.FULL_STATE_DICT,
+            "SHARDED_STATE_DICT": StateDictType.SHARDED_STATE_DICT,
+            "LOCAL_STATE_DICT": StateDictType.LOCAL_STATE_DICT
+        }
+        
+        # Set up CPU offload if requested
+        cpu_offload = None
+        if args.fsdp_cpu_offload:
+            cpu_offload = CPUOffload(offload_params=True)
+            print("FSDP CPU offloading enabled")
+        
+        # Set up activation checkpointing for FSDP
+        activation_checkpointing_config = None
+        if args.fsdp_activation_checkpointing:
+            # We'll configure this after model creation
+            print("FSDP activation checkpointing enabled")
+            # This uses check_fn to apply activation checkpointing only to 
+            # relevant parts of the model (like GRU layers)
+            activation_checkpointing_config = {
+                "check_fn": lambda submodule: hasattr(submodule, 'net')  # Apply to modules containing 'net' attribute
+            }
+        
+        # Configure the FSDP strategy
+        from pytorch_lightning.strategies import FSDPStrategy
+        
+        strategy = FSDPStrategy(
+            sharding_strategy=sharding_strategy_map[args.fsdp_sharding_strategy],
+            state_dict_type=state_dict_type_map[args.fsdp_state_dict_type],
+            cpu_offload=cpu_offload,
+            activation_checkpointing=args.fsdp_activation_checkpointing,
+            activation_checkpointing_config=activation_checkpointing_config,
+            process_group_backend="gloo",  # Always use gloo backend
+            limit_all_gathers=True,  # Help prevent OOMs
+        )
+        print(f"FSDP configuration: sharding={args.fsdp_sharding_strategy}, state_dict={args.fsdp_state_dict_type}, backend=gloo")
+    else:
+        # Use DDP for multi-GPU or default for single GPU
+        if torch.cuda.device_count() > 1:
+            print("Using Distributed Data Parallel (DDP) strategy")
+            strategy = DDPStrategy(
+                process_group_backend="gloo",
+                find_unused_parameters=False,
+                static_graph=False  # Setting to False to avoid DDP autograd hooks issue
+            )
+        else:
+            print("Using default single-device strategy")
+            strategy = "auto"
 
     # Calculate number of epochs needed to reach NUM_BATCHES
     total_samples = len(train_dataset)
@@ -772,7 +847,7 @@ def main():
         accumulate_grad_batches=GRAD_ACCUM_EVERY,
         accelerator="gpu",
         devices=gpu_ids if gpu_ids else "auto",
-        strategy=ddp_strategy,
+        strategy=strategy,
         gradient_clip_val=0.5,
         callbacks=[checkpoint_callback, backup_checkpoint_callback, progress_bar, metrics_logger],
         val_check_interval=VALIDATE_EVERY,
