@@ -12,28 +12,23 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
-class ByteVectorEncoder(nn.Module):
-    """Encode bytes as 8-dimensional vectors instead of using an embedding table"""
-    def __init__(self, dim=8):
+class OneHotByteEncoder(nn.Module):
+    """Encode bytes as 256-dimensional one-hot vectors instead of using an embedding table"""
+    def __init__(self):
         super().__init__()
-        self.dim = dim
     
     def forward(self, x):
-        # Convert byte values (0-255) to binary vectors
-        batch_size, seq_len = x.shape
-        # Create 8-bit binary representation
-        binary = torch.zeros(batch_size, seq_len, 8, device=x.device)
-        for i in range(8):
-            binary[:, :, i] = (x >> i) & 1
+        # Convert byte values (0-255) to one-hot vectors
+        one_hot = F.one_hot(x, num_classes=256)
         
         # Use the same dtype as the weight parameters in the model
-        weight_dtype = self.byte_to_model.weight.dtype if hasattr(self, 'byte_to_model') else None
+        weight_dtype = self.to_model.weight.dtype if hasattr(self, 'to_model') else None
         if weight_dtype is not None:
-            binary = binary.to(dtype=weight_dtype)
+            one_hot = one_hot.to(dtype=weight_dtype)
         else:
-            binary = binary.float()
+            one_hot = one_hot.float()
         
-        return binary
+        return one_hot
 
 # classes
 
@@ -78,12 +73,12 @@ class minLM(Module):
         dropout = 0.
     ):
         super().__init__()
-        # Projection from 8-dim binary vector to model dimension
-        self.byte_to_model = nn.Linear(8, dim, bias=False)
-        # Replace token embedding with ByteVectorEncoder
-        self.byte_encoder = ByteVectorEncoder(dim=8)
-        # Give byte_encoder a reference to byte_to_model so it can match dtype
-        self.byte_encoder.byte_to_model = self.byte_to_model
+        # Projection from 256-dim one-hot vector to model dimension
+        self.to_model = nn.Linear(256, dim, bias=False)
+        # Replace token embedding with OneHotByteEncoder
+        self.one_hot_encoder = OneHotByteEncoder()
+        # Give encoder a reference to linear layer so it can match dtype
+        self.one_hot_encoder.to_model = self.to_model
 
         self.layers = ModuleList([])
 
@@ -100,9 +95,8 @@ class minLM(Module):
             ]))
 
         self.norm = RMSNorm(dim)
-        # At the output, add bottleneck back to 8 dimensions before final projection
-        self.to_byte_vec = nn.Linear(dim, 8, bias=False)
-        self.to_logits = nn.Linear(8, num_tokens, bias=False)
+        # Direct output projection to logits (no bottleneck needed)
+        self.to_logits = nn.Linear(dim, num_tokens, bias=False)
 
         self.can_cache = not enable_conv
 
@@ -117,12 +111,12 @@ class minLM(Module):
         if return_loss:
             x, labels = x[:, :-1], x[:, 1:]
 
-        # Replace embedding lookup with byte vector encoding
-        byte_vecs = self.byte_encoder(x)
-        # Ensure byte_vecs is the same dtype as the linear layer weights
-        if byte_vecs.dtype != self.byte_to_model.weight.dtype:
-            byte_vecs = byte_vecs.to(dtype=self.byte_to_model.weight.dtype)
-        x = self.byte_to_model(byte_vecs)
+        # Replace embedding lookup with one-hot encoding
+        one_hot = self.one_hot_encoder(x)
+        # Ensure one_hot is the same dtype as the linear layer weights
+        if one_hot.dtype != self.to_model.weight.dtype:
+            one_hot = one_hot.to(dtype=self.to_model.weight.dtype)
+        x = self.to_model(one_hot)
 
         # handle previous hiddens, for recurrent decoding
 
@@ -163,9 +157,8 @@ class minLM(Module):
                 x = dropout(x)
 
         embed = self.norm(x)
-        # Add the bottleneck to 8-dim before logits
-        byte_embed = self.to_byte_vec(embed)
-        logits = self.to_logits(byte_embed)
+        # Direct projection to logits
+        logits = self.to_logits(embed)
 
         if not return_loss:
             if not return_prev_hiddens:

@@ -41,9 +41,9 @@ def calculate_model_size(config=None):
     expansion = config["expansion"]
     num_tokens = config["num_tokens"]
     
-    # ByteVectorEncoder parameters (replacing token embedding)
-    # 8-dim to model dim projection
-    byte_to_model_params = 8 * dim
+    # OneHotByteEncoder parameters (replacing token embedding)
+    # 256-dim to model dim projection
+    to_model_params = 256 * dim
     
     # Each layer has:
     # 1. minGRU/minLSTM parameters
@@ -79,11 +79,11 @@ def calculate_model_size(config=None):
     # Total parameters per layer
     params_per_layer = rnn_params_per_layer + norm_params_per_layer + ff_params_per_layer + conv_params_per_layer
     
-    # Final norm, bottleneck to 8-dim, and projection to logits
-    final_params = dim + (dim * 8) + (8 * num_tokens)
+    # Final norm and direct projection to logits
+    final_params = dim + (dim * num_tokens)
     
     # Total parameters
-    total_params = byte_to_model_params + (params_per_layer * depth) + final_params
+    total_params = to_model_params + (params_per_layer * depth) + final_params
     
     return total_params
 
