@@ -147,6 +147,12 @@ class LightningMinLM(pl.LightningModule):
         
     def forward(self, x, prev_hiddens=None):
         return self.model(x, return_loss=False, return_prev_hiddens=True, prev_hiddens=prev_hiddens)
+        
+    # Make sure loss calculation is properly tracked for gradients
+    def _ensure_tensor_requires_grad(self, t):
+        if isinstance(t, torch.Tensor) and not t.requires_grad:
+            t.requires_grad_(True)
+        return t
     
     def training_step(self, batch, batch_idx, hiddens=None):
         # Initialize start_time on first training step
@@ -155,37 +161,86 @@ class LightningMinLM(pl.LightningModule):
             if self.global_rank == 0:
                 print(f"Starting tokens/s timing at step {batch_idx}")
         
-        # Debug optimizer and gradients every 100 steps
-        if batch_idx % 100 == 0 and self.global_rank == 0:
-            if hasattr(self.trainer, 'optimizers'):
-                opt = self.trainer.optimizers[0] if self.trainer.optimizers else None
-                print(f"Step {batch_idx} - Optimizer type: {type(opt).__name__}")
-                
-                # Check if params are on the expected devices
-                if opt is not None:
-                    param_devices = set()
-                    for param_group in opt.param_groups:
-                        for param in param_group['params']:
-                            if param.device not in param_devices:
-                                param_devices.add(param.device)
-                    print(f"Parameter devices: {param_devices}")
-            
-            # Debug gradient flow
-            has_grad = any(p.grad is not None for p in self.parameters())
-            print(f"Step {batch_idx} - Has gradients: {has_grad}")
-            if has_grad:
-                # Sample the gradient of a parameter for debugging
-                sample_param = next(p for p in self.parameters() if p.grad is not None)
-                grad_norm = torch.norm(sample_param.grad).item()
-                print(f"Sample gradient norm: {grad_norm}")
+        # Enhanced DeepSpeed debugging
+        if self.global_rank == 0:
+            if batch_idx == 0 or batch_idx % 100 == 0:
+                print(f"\n--- Debugging step {batch_idx} ---")
+                # Check optimizer
+                if hasattr(self.trainer, 'optimizers'):
+                    opt = self.trainer.optimizers[0] if self.trainer.optimizers else None
+                    print(f"Optimizer type: {type(opt).__name__}")
                     
+                    # Check optimizer parameters and device placement
+                    if opt is not None:
+                        param_devices = set()
+                        param_count = 0
+                        requires_grad_count = 0
+                        
+                        for param_group in opt.param_groups:
+                            for param in param_group['params']:
+                                param_count += 1
+                                if param.requires_grad:
+                                    requires_grad_count += 1
+                                if param.device not in param_devices:
+                                    param_devices.add(param.device)
+                        
+                        print(f"Parameter devices: {param_devices}")
+                        print(f"Params in optimizer: {param_count}, requires_grad: {requires_grad_count}")
+                
+                # Check model parameters
+                model_param_count = sum(1 for p in self.parameters())
+                model_requires_grad = sum(1 for p in self.parameters() if p.requires_grad)
+                print(f"Model params: {model_param_count}, requires_grad: {model_requires_grad}")
+                
+                # Check if using DeepSpeed ZeRO-3
+                is_zero3 = False
+                if hasattr(self.trainer, 'strategy') and isinstance(self.trainer.strategy, DeepSpeedStrategy):
+                    ds_config = getattr(self.trainer.strategy, 'config', {})
+                    if isinstance(ds_config, dict):
+                        zero_stage = ds_config.get("zero_optimization", {}).get("stage", 0)
+                        is_zero3 = zero_stage == 3
+                    print(f"Using DeepSpeed ZeRO Stage: {zero_stage}")
+                
+        # Ensure tensor is on the right device
+        batch = batch.to(self.device)
+        
+        # Forward pass
         loss = self.model(batch, return_loss=True)
-        # Log train_loss for display in progress bar (on_step=True) but use a simpler name
+        
+        # Debug loss and gradients
+        if self.global_rank == 0 and (batch_idx == 0 or batch_idx % 100 == 0):
+            print(f"Loss value: {loss.item()}, requires_grad: {loss.requires_grad}")
+            
+            # Check parameter gradients before backward
+            params_before = sum(1 for p in self.parameters() if p.grad is not None)
+            print(f"Params with gradients before backward: {params_before}")
+        # Manual backward pass when using DeepSpeed ZeRO-3
+        if isinstance(self.trainer.strategy, DeepSpeedStrategy):
+            # DeepSpeed handles the backward pass differently
+            self.manual_backward(loss)
+            
+            # Debug gradients after manual backward
+            if self.global_rank == 0 and (batch_idx == 0 or batch_idx % 100 == 0):
+                params_after = sum(1 for p in self.parameters() if p.grad is not None)
+                print(f"Params with gradients after backward: {params_after}")
+                
+                # Check gradient values
+                has_grad = any(p.grad is not None for p in self.parameters())
+                print(f"Has gradients: {has_grad}")
+                if has_grad:
+                    try:
+                        sample_param = next(p for p in self.parameters() if p.grad is not None)
+                        grad_norm = torch.norm(sample_param.grad).item()
+                        print(f"Sample gradient norm: {grad_norm}")
+                        print(f"Sample parameter device: {sample_param.device}")
+                    except StopIteration:
+                        print("Could not find parameter with gradient")
+        
+        # Log train_loss for display in progress bar
         self.log('train_loss', loss, prog_bar=True, sync_dist=True, on_step=True, on_epoch=False)
-        # Also log for epoch aggregation without showing in progress bar
         self.log('train_loss_epoch', loss, prog_bar=False, sync_dist=True, on_step=False, on_epoch=True)
         
-        # Update tokens processed count - local to this process
+        # Update tokens processed count
         tokens_in_batch = batch.numel()
         self.total_tokens_processed += tokens_in_batch
         
@@ -379,14 +434,22 @@ def create_deepspeed_config(zero_stage, bf16, offload_optimizer, offload_paramet
     
     config = {
         "train_micro_batch_size_per_gpu": BATCH_SIZE,
-        # Removed gradient_accumulation_steps - Lightning handles this via accumulate_grad_batches
-        "steps_per_print": 100,
+        # Lightning handles grad accumulation
+        "steps_per_print": 10,  # More frequent printing for debugging
         "optimizer": {
-            "type": "Adam",  # Explicitly specify optimizer type
+            "type": "Adam",
             "params": {
                 "lr": learning_rate,
                 "betas": [0.9, 0.999],
                 "eps": 1e-8
+            }
+        },
+        "scheduler": {
+            "type": "WarmupLR",
+            "params": {
+                "warmup_min_lr": 0,
+                "warmup_max_lr": learning_rate,
+                "warmup_num_steps": 1000
             }
         },
         "zero_optimization": {
@@ -394,8 +457,9 @@ def create_deepspeed_config(zero_stage, bf16, offload_optimizer, offload_paramet
             "contiguous_gradients": True,
             "overlap_comm": True,
             "reduce_scatter": True,
-            "reduce_bucket_size": 5e8,
-            "allgather_bucket_size": 5e8
+            "reduce_bucket_size": 2e8,
+            "allgather_bucket_size": 2e8,
+            "round_robin_gradients": True
         },
         "fp16": {
             "enabled": not bf16,
