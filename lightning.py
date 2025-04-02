@@ -147,6 +147,10 @@ class LightningMinLM(pl.LightningModule):
         self.start_time = None  # Will be set on first training step
         self.register_buffer('global_tokens', torch.tensor(0, dtype=torch.long))
         
+        # For manual gradient accumulation
+        self.grad_accum_steps = GRAD_ACCUM_EVERY
+        self.grad_accum_counter = 0
+        
     def forward(self, x, prev_hiddens=None):
         return self.model(x, return_loss=False, return_prev_hiddens=True, prev_hiddens=prev_hiddens)
         
@@ -170,6 +174,7 @@ class LightningMinLM(pl.LightningModule):
                 # Check optimizer
                 opt = self.optimizers()
                 print(f"Optimizer type: {type(opt).__name__}")
+                print(f"Gradient accumulation: {self.grad_accum_counter}/{self.grad_accum_steps}")
                 
                 # Check optimizer parameters and device placement
                 if opt is not None:
@@ -216,19 +221,31 @@ class LightningMinLM(pl.LightningModule):
             params_before = sum(1 for p in self.parameters() if p.grad is not None)
             print(f"Params with gradients before backward: {params_before}")
         
-        # Manual optimization
+        # Manual optimization with gradient accumulation
         opt = self.optimizers()
         
-        # Zero gradients
-        opt.zero_grad()
+        # Scale loss for gradient accumulation
+        if self.grad_accum_steps > 1:
+            loss = loss / self.grad_accum_steps
         
         # Backward pass
         self.manual_backward(loss)
         
-        # Update parameters - for non-DeepSpeed we need to call step manually
-        # For DeepSpeed, step() is automatically called after manual_backward
-        if not isinstance(self.trainer.strategy, DeepSpeedStrategy):
-            opt.step()
+        # Increment accumulation counter
+        self.grad_accum_counter += 1
+        
+        # Only update weights after accumulating enough gradients
+        if self.grad_accum_counter >= self.grad_accum_steps:
+            # Reset the counter
+            self.grad_accum_counter = 0
+            
+            # Update parameters - for non-DeepSpeed we need to call step manually
+            # For DeepSpeed, step() is automatically called after manual_backward
+            if not isinstance(self.trainer.strategy, DeepSpeedStrategy):
+                opt.step()
+                
+            # Zero gradients after optimization step
+            opt.zero_grad()
         
         # Debug gradients after backward
         if self.global_rank == 0 and (batch_idx == 0 or batch_idx % 100 == 0):
@@ -936,6 +953,7 @@ def main():
     tokens_per_sample = SEQ_LEN
     tokens_per_epoch_per_gpu = steps_per_epoch_per_gpu * BATCH_SIZE * tokens_per_sample
     tokens_per_epoch_total = tokens_per_epoch_per_gpu * world_size
+    # We're still accumulating gradients, just manually in the training_step
     effective_batch_size = BATCH_SIZE * world_size * GRAD_ACCUM_EVERY
     
     print(f"\n--- Training Configuration ---")
@@ -970,7 +988,7 @@ def main():
     
     trainer_kwargs = {
         "max_steps": NUM_BATCHES,
-        "accumulate_grad_batches": GRAD_ACCUM_EVERY,
+        # Removed accumulate_grad_batches - we're handling it manually
         "accelerator": "gpu",
         "devices": gpu_ids if gpu_ids else "auto",
         "strategy": strategy,
