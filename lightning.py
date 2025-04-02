@@ -775,11 +775,13 @@ def main():
             sharding_strategy=sharding_strategy_map[args.fsdp_sharding_strategy],
             state_dict_type=state_dict_type_map[args.fsdp_state_dict_type],
             cpu_offload=cpu_offload,
-            activation_checkpointing=args.fsdp_activation_checkpointing,
+            # Removed activation_checkpointing due to compatibility issues
             process_group_backend="gloo",  # Always use gloo backend
             limit_all_gathers=True,  # Help prevent OOMs
         )
         print(f"FSDP configuration: sharding={args.fsdp_sharding_strategy}, state_dict={args.fsdp_state_dict_type}, backend=gloo")
+        if args.fsdp_activation_checkpointing:
+            print("Warning: Activation checkpointing was requested but is disabled due to compatibility issues")
     else:
         # Use DDP for multi-GPU or default for single GPU
         if torch.cuda.device_count() > 1:
