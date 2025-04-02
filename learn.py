@@ -211,7 +211,7 @@ class MinLMTrainer:
             "train_batch_size": BATCH_SIZE * self.world_size * self.grad_accum_steps,
             "train_micro_batch_size_per_gpu": BATCH_SIZE,
             "gradient_accumulation_steps": self.grad_accum_steps,
-            "steps_per_print": 10,
+            "steps_per_print": 500,  # Reduce logging frequency significantly
             "optimizer": {
                 "type": "AdamW",
                 "params": {
@@ -507,7 +507,29 @@ class MinLMTrainer:
                 
                 # Generate samples periodically
                 if generate_every > 0 and step > 0 and step % generate_every == 0 and self.global_rank == 0:
+                    # Temporarily enable more verbose logging during generation
+                    if self.checkpoint_dir:
+                        import logging
+                        ds_logger = logging.getLogger('deepspeed')
+                        prev_level = ds_logger.level
+                        
+                        # Set console handler to INFO temporarily
+                        for handler in ds_logger.handlers:
+                            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                                prev_handler_level = handler.level
+                                handler.setLevel(logging.INFO)
+                                break
+                    
+                    # Generate the sample
                     self._generate_sample()
+                    
+                    # Restore logging level
+                    if self.checkpoint_dir:
+                        ds_logger.setLevel(prev_level)
+                        for handler in ds_logger.handlers:
+                            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                                handler.setLevel(prev_handler_level)
+                                break
                 
                 step += 1
         
@@ -909,6 +931,28 @@ def main():
         # Create the directory
         print(f"Creating checkpoint directory: {checkpoint_dir}")
         os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # Set up logging to file for DeepSpeed
+        import logging
+        ds_logger = logging.getLogger('deepspeed')
+        ds_logger.setLevel(logging.INFO)
+        
+        # Remove any existing handlers to avoid duplicate logs
+        for handler in ds_logger.handlers[:]:
+            ds_logger.removeHandler(handler)
+            
+        # Add file handler
+        log_file = os.path.join(checkpoint_dir, 'deepspeed.log')
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.INFO)
+        ds_logger.addHandler(file_handler)
+        
+        # Reduce console output - only show warnings and errors
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.WARNING)
+        ds_logger.addHandler(console_handler)
+        
+        print(f"DeepSpeed logs will be written to: {log_file}")
         
         # Save model configuration
         config = {
