@@ -1,0 +1,945 @@
+import os
+os.environ["NCCL_P2P_DISABLE"] = "1"
+
+import gzip
+import random
+import numpy as np
+import math
+import time
+import argparse
+import re
+import torch
+import mmap
+import datetime
+import json
+from torch.utils.data import DataLoader, Dataset
+import deepspeed
+from tqdm import tqdm
+
+# Import the minLM model
+from minGRU_pytorch.minLM import minLM
+
+# Import configuration from config.py
+from config import MODEL_CONFIG, TRAINING_CONFIG, calculate_model_size, get_parameter_count_str
+
+# Set environment variables
+os.environ["NCCL_DEBUG"] = "INFO"
+
+# Load configuration constants
+NUM_BATCHES = TRAINING_CONFIG["num_batches"]
+BATCH_SIZE = TRAINING_CONFIG["batch_size"]
+GRAD_ACCUM_EVERY = TRAINING_CONFIG["grad_accum_every"]
+LEARNING_RATE = TRAINING_CONFIG["learning_rate"]
+VALIDATE_EVERY = TRAINING_CONFIG["validate_every"]
+PRIME_LENGTH = TRAINING_CONFIG["prime_length"]
+GENERATE_EVERY = TRAINING_CONFIG["generate_every"]
+GENERATE_LENGTH = TRAINING_CONFIG["generate_length"]
+SEQ_LEN = TRAINING_CONFIG["seq_len"]
+
+# Text generation functions
+def decode_token(token):
+    return str(chr(max(32, token)))
+
+def decode_tokens(tokens):
+    return "".join(list(map(decode_token, tokens)))
+
+def log(t, eps = 1e-20):
+    return torch.log(t.clamp(min = eps))
+
+def gumbel_noise(t):
+    noise = torch.zeros_like(t).uniform_(0, 1)
+    return -log(-log(noise))
+
+def gumbel_sample(t, temperature = 1., dim = -1, keepdim = True):
+    return ((t / max(temperature, 1e-10)) + gumbel_noise(t)).argmax(dim = dim, keepdim = keepdim)
+
+def top_k(logits, thres = 0.9):
+    k = math.ceil((1 - thres) * logits.shape[-1])
+    val, ind = torch.topk(logits, k)
+    probs = torch.full_like(logits, float('-inf'))
+    probs.scatter_(-1, ind, val)
+    return probs
+
+def base_decoding(
+    net,
+    prompt: torch.Tensor,
+    seq_len: int,
+    temperature = 1.,
+    filter_thres = 0.9,
+):
+    prompt_seq_len, out = prompt.shape[-1], prompt.clone()
+    sample_num_times = max(0, seq_len - prompt_seq_len)
+
+    prev_hiddens = None
+
+    for _ in range(sample_num_times):
+        logits, next_prev_hiddens = net(out, return_prev_hiddens = True, prev_hiddens = prev_hiddens)
+        logits = logits[:, -1]
+
+        if hasattr(net, 'can_cache') and net.can_cache:
+            prev_hiddens = next_prev_hiddens
+
+        logits = top_k(logits, thres = filter_thres)
+        sample = gumbel_sample(logits, temperature = temperature, dim = -1)
+
+        out = torch.cat((out, sample), dim = -1)
+
+    return out[..., prompt_seq_len:]
+
+# Dataset class
+class TextSamplerDataset(Dataset):
+    def __init__(self, data, seq_len):
+        super().__init__()
+        self.data = data
+        self.seq_len = seq_len
+        # Define dataset length such that one epoch covers the full data
+        # Each sample is seq_len tokens, so we need data_size/seq_len samples to cover all
+        self.samples_per_epoch = max(1, self.data.size(0) // self.seq_len)
+
+    def __len__(self):
+        return self.samples_per_epoch
+
+    def __getitem__(self, index):
+        # Random sampling from anywhere in the data
+        rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
+        full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
+        return full_seq  # DeepSpeed will handle device placement
+
+# Trainer class
+class MinLMTrainer:
+    def __init__(
+        self,
+        num_tokens=256,
+        dim=512,
+        depth=6,
+        ff_mult=4,
+        expansion=1.5,
+        conv_kernel_size=3,
+        learning_rate=1e-4,
+        use_lstm=False,
+        enable_conv=False,
+        dropout=0.0,
+        checkpoint_dir=None,
+        world_size=1,
+        global_rank=0
+    ):
+        self.learning_rate = learning_rate
+        self.model = minLM(
+            num_tokens=num_tokens,
+            dim=dim,
+            depth=depth,
+            ff_mult=ff_mult,
+            expansion=expansion,
+            conv_kernel_size=conv_kernel_size,
+            use_lstm=use_lstm,
+            enable_conv=enable_conv,
+            dropout=dropout
+        )
+        # For tracking tokens per second
+        self.total_tokens_processed = 0
+        self.start_time = None
+        self.global_tokens = torch.tensor(0, dtype=torch.long)
+        
+        # Gradient accumulation is handled by DeepSpeed
+        self.grad_accum_steps = GRAD_ACCUM_EVERY
+        
+        # Directory for checkpoints
+        self.checkpoint_dir = checkpoint_dir
+        
+        # Distributed training info
+        self.world_size = world_size
+        self.global_rank = global_rank
+        
+        # Initialize metric tracking
+        self.train_loss = 0.0
+        self.val_loss = 0.0
+        self.val_bpb = 0.0
+        self.global_step = 0
+
+    def init_deepspeed(self, train_dataloader, args):
+        """Initialize DeepSpeed engine"""
+        # Create DeepSpeed config
+        if args.deepspeed_config and os.path.exists(args.deepspeed_config):
+            # Load config from file if provided
+            with open(args.deepspeed_config, 'r') as f:
+                ds_config = json.load(f)
+            if self.global_rank == 0:
+                print(f"Using DeepSpeed config from: {args.deepspeed_config}")
+        else:
+            # Create config from arguments
+            ds_config = self.create_deepspeed_config(
+                args.zero_stage, 
+                args.use_bf16, 
+                args.offload_optimizer,
+                args.offload_parameters,
+                self.learning_rate,
+                MODEL_CONFIG["depth"]
+            )
+        
+        # Initialize DeepSpeed engine
+        model_engine, optimizer, _, _ = deepspeed.initialize(
+            model=self.model,
+            model_parameters=self.model.parameters(),
+            config=ds_config
+        )
+        
+        self.model = model_engine
+        self.optimizer = optimizer
+        
+        # Print device info if main process
+        if self.global_rank == 0:
+            param_count = sum(1 for p in self.model.parameters())
+            requires_grad = sum(1 for p in self.model.parameters() if p.requires_grad)
+            print(f"DeepSpeed initialized with {param_count} parameters, {requires_grad} require grad")
+    
+    def create_deepspeed_config(self, zero_stage, bf16, offload_optimizer, offload_parameters, learning_rate, depth=6):
+        """Create DeepSpeed configuration"""
+        config = {
+            "train_batch_size": BATCH_SIZE * self.world_size,
+            "train_micro_batch_size_per_gpu": BATCH_SIZE,
+            "gradient_accumulation_steps": self.grad_accum_steps,
+            "steps_per_print": 10,
+            "optimizer": {
+                "type": "AdamW",
+                "params": {
+                    "lr": learning_rate,
+                    "betas": [0.9, 0.999],
+                    "eps": 1e-8,
+                    "weight_decay": 0.01
+                }
+            },
+            "scheduler": {
+                "type": "WarmupLR",
+                "params": {
+                    "warmup_min_lr": 0,
+                    "warmup_max_lr": learning_rate,
+                    "warmup_num_steps": 1000
+                }
+            },
+            "zero_optimization": {
+                "stage": zero_stage,
+                "contiguous_gradients": True,
+                "overlap_comm": True,
+                "reduce_scatter": True,
+                "reduce_bucket_size": 2e8,
+                "allgather_bucket_size": 2e8,
+                "round_robin_gradients": True
+            },
+            "fp16": {
+                "enabled": not bf16,
+                "loss_scale": 0,
+                "loss_scale_window": 1000,
+                "hysteresis": 2,
+                "min_loss_scale": 1
+            },
+            "bf16": {
+                "enabled": bf16
+            },
+            "zero_allow_untested_optimizer": True,
+            "wall_clock_breakdown": False
+        }
+        
+        # Add CPU offloading if requested (for ZeRO-2 and ZeRO-3)
+        if zero_stage >= 2 and offload_optimizer:
+            config["zero_optimization"]["offload_optimizer"] = {
+                "device": "cpu",
+                "pin_memory": True,
+                "fast_init": True
+            }
+            
+        # Parameter offloading only works with ZeRO-3
+        if zero_stage == 3 and offload_parameters:
+            config["zero_optimization"]["offload_param"] = {
+                "device": "cpu",
+                "pin_memory": True
+            }
+            
+        # Add activation checkpointing
+        config["activation_checkpointing"] = {
+            "partition_activations": True,
+            "cpu_checkpointing": True,
+            "contiguous_memory_optimization": True,
+            "number_checkpoints": min(depth, 8)
+        }
+            
+        return config
+        
+    def train_step(self, batch):
+        """Execute a single training step"""
+        # Initialize start_time on first training step
+        if self.start_time is None:
+            self.start_time = time.time()
+            if self.global_rank == 0:
+                print(f"Starting tokens/s timing at step {self.global_step}")
+        
+        # Forward pass - DeepSpeed handles loss scaling and backward
+        loss = self.model(batch, return_loss=True)
+        
+        # Update step - DeepSpeed handles gradient accumulation internally
+        self.model.backward(loss)
+        self.model.step()
+        
+        # Track loss
+        loss_val = loss.detach().float().item()
+        self.train_loss = loss_val
+        
+        # Update tokens processed count
+        tokens_in_batch = batch.numel()
+        self.total_tokens_processed += tokens_in_batch
+        
+        # Track tokens across all processes
+        if self.world_size > 1:
+            # Convert to tensor for all_reduce
+            batch_tokens = torch.tensor(tokens_in_batch, device=batch.device)
+            # Sum across all processes
+            torch.distributed.all_reduce(batch_tokens, op=torch.distributed.ReduceOp.SUM)
+            # Update global counter
+            self.global_tokens += batch_tokens.item()
+        else:
+            self.global_tokens += tokens_in_batch
+        
+        # Track step
+        self.global_step += 1
+        
+        return loss_val
+        
+    def validation_step(self, batch):
+        """Execute a single validation step"""
+        with torch.no_grad():
+            loss = self.model(batch, return_loss=True)
+            # Calculate bits per byte (bpb)
+            bpb = loss / math.log(2)
+            return {"val_loss": loss.item(), "bpb": bpb.item()}
+    
+    def validate(self, dataloader, max_batches=None):
+        """Run validation on the entire validation dataset"""
+        self.model.eval()
+        val_losses = []
+        val_bpbs = []
+        
+        with torch.no_grad():
+            for i, batch in enumerate(dataloader):
+                if max_batches is not None and i >= max_batches:
+                    break
+                batch = batch.to(self.model.device)
+                result = self.validation_step(batch)
+                val_losses.append(result["val_loss"])
+                val_bpbs.append(result["bpb"])
+        
+        # Calculate average
+        avg_val_loss = sum(val_losses) / len(val_losses)
+        avg_bpb = sum(val_bpbs) / len(val_bpbs)
+        self.val_loss = avg_val_loss
+        self.val_bpb = avg_bpb
+        
+        self.model.train()
+        return {"val_loss": avg_val_loss, "bpb": avg_bpb}
+    
+    def save_checkpoint(self, additional_info=None):
+        """Save a checkpoint of the model"""
+        if not self.checkpoint_dir or self.global_rank != 0:
+            return
+            
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        
+        # Create checkpoint info
+        checkpoint = {
+            'step': self.global_step,
+            'model_state_dict': self.model.module.state_dict(),  # Access the model inside DeepSpeed
+            'global_tokens': self.global_tokens.item(),
+            'training_time': time.time() - self.start_time
+        }
+        
+        if additional_info:
+            checkpoint.update(additional_info)
+        
+        # Save checkpoint
+        checkpoint_path = os.path.join(self.checkpoint_dir, f"minlm-step-{self.global_step}.pt")
+        torch.save(checkpoint, checkpoint_path)
+        
+        # Save latest checkpoint (for resuming)
+        latest_path = os.path.join(self.checkpoint_dir, "latest.pt")
+        torch.save(checkpoint, latest_path)
+        
+        return checkpoint_path
+    
+    def train(self, train_dataloader, val_dataloader, num_batches, validate_every, generate_every, val_batches=4):
+        """Main training loop"""
+        self.start_time = time.time()
+        
+        # Create metrics log file
+        if self.global_rank == 0 and self.checkpoint_dir:
+            metrics_log_path = os.path.join(self.checkpoint_dir, "training_metrics.tsv")
+            with open(metrics_log_path, 'w') as f:
+                header = [
+                    "step", "time", "tokens_processed", 
+                    "tokens_per_sec", "train_loss", "val_loss", "bpb",
+                    "learning_rate", "batch_size", "grad_accum"
+                ]
+                f.write('\t'.join(header) + '\n')
+        
+        # Initial validation
+        if self.global_rank == 0:
+            print("Running initial validation...")
+            val_results = self.validate(val_dataloader, max_batches=val_batches)
+            print(f"Initial validation - Loss: {val_results['val_loss']:.4f}, BPB: {val_results['bpb']:.4f}")
+            self._log_metrics(True)
+        
+        # Training loop
+        self.model.train()
+        pbar = tqdm(total=num_batches, disable=self.global_rank != 0)
+        step = 0
+        
+        while step < num_batches:
+            # Reset dataloader if needed
+            train_iter = iter(train_dataloader)
+            
+            for batch in train_iter:
+                if step >= num_batches:
+                    break
+                
+                # Move batch to device (DeepSpeed handles this)
+                batch = batch.to(self.model.device)
+                
+                # Training step
+                loss = self.train_step(batch)
+                
+                # Update progress bar
+                if self.global_rank == 0:
+                    elapsed = time.time() - self.start_time
+                    tokens_per_sec = self.global_tokens.item() / elapsed if elapsed > 0 else 0
+                    pbar.set_description(f"Loss: {loss:.4f} | {tokens_per_sec:.2f} tok/s")
+                    pbar.update(1)
+                
+                # Log progress
+                if self.global_rank == 0 and step % 10 == 0:
+                    self._log_metrics(False)
+                
+                # Validate periodically
+                if step > 0 and step % validate_every == 0:
+                    if self.global_rank == 0:
+                        print(f"\nValidating at step {step}...")
+                        val_results = self.validate(val_dataloader, max_batches=val_batches)
+                        print(f"Validation - Loss: {val_results['val_loss']:.4f}, BPB: {val_results['bpb']:.4f}")
+                        
+                        # Save checkpoint
+                        self.save_checkpoint({
+                            'val_loss': val_results['val_loss'],
+                            'val_bpb': val_results['bpb']
+                        })
+                        
+                        # Log metrics
+                        self._log_metrics(True)
+                
+                # Generate samples periodically
+                if generate_every > 0 and step > 0 and step % generate_every == 0 and self.global_rank == 0:
+                    self._generate_sample()
+                
+                step += 1
+        
+        pbar.close()
+        
+        # Final validation and checkpoint
+        if self.global_rank == 0:
+            print("\nFinal validation...")
+            val_results = self.validate(val_dataloader)
+            print(f"Final validation - Loss: {val_results['val_loss']:.4f}, BPB: {val_results['bpb']:.4f}")
+            
+            # Save final checkpoint
+            final_path = self.save_checkpoint({
+                'val_loss': val_results['val_loss'],
+                'val_bpb': val_results['bpb'],
+                'final': True
+            })
+            print(f"Training complete! Final checkpoint saved to: {final_path}")
+            
+            # Log final metrics
+            self._log_metrics(True)
+    
+    def _log_metrics(self, is_validation=False):
+        """Log metrics to TSV file"""
+        if not self.checkpoint_dir or self.global_rank != 0:
+            return
+            
+        metrics_log_path = os.path.join(self.checkpoint_dir, "training_metrics.tsv")
+        
+        try:
+            with open(metrics_log_path, 'a') as f:
+                elapsed = time.time() - self.start_time
+                global_tokens = self.global_tokens.item()
+                tokens_per_sec = global_tokens / elapsed if elapsed > 0 else 0
+                
+                # Prepare values
+                values = [
+                    str(self.global_step),
+                    f"{elapsed:.2f}",
+                    str(global_tokens),
+                    f"{tokens_per_sec:.2f}",
+                    f"{self.train_loss:.6f}",
+                    str(self.val_loss if is_validation else "NA"),
+                    str(self.val_bpb if is_validation else "NA"),
+                    str(self.learning_rate),
+                    str(BATCH_SIZE),
+                    str(self.grad_accum_steps)
+                ]
+                
+                f.write('\t'.join(values) + '\n')
+        except Exception as e:
+            print(f"Warning: Could not write to metrics log: {e}")
+    
+    def _generate_sample(self, prime_length=PRIME_LENGTH, gen_length=GENERATE_LENGTH):
+        """Generate a text sample during training"""
+        if not hasattr(self, 'val_dataset') or self.val_dataset is None:
+            print("No validation dataset provided for generation")
+            return
+            
+        # Get a random sample from validation data
+        rand_start = torch.randint(0, len(self.val_dataset.data) - prime_length - 1, (1,))
+        prime = self.val_dataset.data[rand_start:rand_start + prime_length].unsqueeze(0).to(self.model.device)
+        
+        # Generate text
+        print("\nGenerating sample text...")
+        print(f"Prime: {decode_tokens(prime[0])}")
+        
+        self.model.eval()
+        with torch.no_grad():
+            generated = base_decoding(
+                self.model, 
+                prime, 
+                gen_length, 
+                temperature=0.8, 
+                filter_thres=0.9
+            )
+        self.model.train()
+        
+        print(f"Generated: {decode_tokens(generated[0])}")
+
+# Helper functions for command line arguments
+def parse_gpu_ids(gpu_spec):
+    """Parse a GPU specification string into a list of GPU ids"""
+    if not gpu_spec:
+        return None
+        
+    gpu_ids = []
+    parts = gpu_spec.split(',')
+    
+    for part in parts:
+        if '-' in part:
+            # Handle range like "0-3"
+            start, end = map(int, part.split('-'))
+            gpu_ids.extend(range(start, end + 1))
+        else:
+            # Handle single number
+            gpu_ids.append(int(part))
+            
+    return sorted(list(set(gpu_ids)))  # Remove duplicates and sort
+
+def parse_size_with_suffix(size_str):
+    """Parse a string with optional k, m, g suffix into a number"""
+    if not isinstance(size_str, str):
+        return size_str
+        
+    pattern = r'^(\d+(?:\.\d+)?)([kmg])?$'
+    match = re.match(pattern, size_str.lower())
+    if not match:
+        try:
+            return float(size_str)
+        except ValueError:
+            raise ValueError(f"Invalid size format: {size_str}")
+            
+    value, suffix = match.groups()
+    value = float(value)
+    
+    if suffix == 'k':
+        return value * 1024
+    elif suffix == 'm':
+        return value * 1024 * 1024
+    elif suffix == 'g':
+        return value * 1024 * 1024 * 1024
+    else:
+        return value
+
+def round_to_multiple(n, multiple=32):
+    """Round a number to the nearest multiple of a given value"""
+    return multiple * round(n / multiple)
+
+def solve_for_dimension(target_params, depth, vocab_size=256, ff_mult=4, expansion=1.5):
+    """Solve for the dimension that gives the target parameter count"""
+    from math import sqrt
+    
+    factor = 4 * expansion + 2 * ff_mult
+    
+    # Quadratic equation: a*dim^2 + b*dim - target_params = 0
+    a = depth * factor
+    b = 2 * vocab_size
+    c = -target_params
+    
+    discriminant = b**2 - 4*a*c
+    if discriminant < 0:
+        raise ValueError("No solution exists for the given target parameter count")
+    
+    dim = (-b + sqrt(discriminant)) / (2*a)
+    return round_to_multiple(dim)
+
+def solve_for_depth(target_params, dim, vocab_size=256, ff_mult=4, expansion=1.5):
+    """Solve for the depth that gives the target parameter count"""
+    embed_params = 2 * dim * vocab_size
+    factor = 4 * expansion + 2 * ff_mult
+    layer_params = dim * dim * factor
+    
+    depth = (target_params - embed_params) / layer_params
+    return max(1, round(depth))
+
+def main():
+    # Make variables global
+    global SEQ_LEN
+    global BATCH_SIZE
+    global GRAD_ACCUM_EVERY
+    global LEARNING_RATE
+    global NUM_BATCHES
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Train a minLM model with DeepSpeed")
+    parser.add_argument("--data", type=str, required=True,
+                        help="Path to the training data file (e.g., 'data/enwik8.gz')")
+    parser.add_argument("--gpus", type=str, default=None, 
+                        help="Comma-separated list or range of GPU IDs to use (e.g., '0,1,2' or '0-2')")
+    
+    # Model architecture arguments
+    parser.add_argument("--dim", type=str, default=None,
+                        help="Model hidden dimension (default: 512). Can use k/m/g suffix.")
+    parser.add_argument("--depth", type=int, default=None,
+                        help="Number of model layers (default: 6).")
+    parser.add_argument("--params", type=str, default=None,
+                        help="Target parameter count (e.g., 15m for 15M params). Can use k/m/g suffix.")
+    
+    # Training parameters
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help=f"Batch size per GPU (default: {TRAINING_CONFIG['batch_size']})")
+    parser.add_argument("--grad_accum", type=int, default=None,
+                        help=f"Gradient accumulation steps (default: {TRAINING_CONFIG['grad_accum_every']})")
+    parser.add_argument("--learning_rate", type=float, default=None,
+                        help=f"Learning rate (default: {TRAINING_CONFIG['learning_rate']})")
+    parser.add_argument("--seq_len", type=str, default=None,
+                        help=f"Sequence length for training (default: {TRAINING_CONFIG['seq_len']}). Can use k suffix.")
+    parser.add_argument("--steps", type=str, default=None,
+                        help=f"Total training steps (default: {TRAINING_CONFIG['num_batches']}). Can use k suffix.")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Directory to save checkpoints (default: auto-generated name)")
+    parser.add_argument("--use-f32", dest="use_bf16", action="store_false", default=True,
+                        help="Use FP32 precision instead of BF16 (default: BF16)")
+                        
+    # DeepSpeed arguments
+    parser.add_argument("--deepspeed_config", type=str, default=None,
+                        help="Path to DeepSpeed JSON config file (overrides other DeepSpeed args)")
+    parser.add_argument("--zero_stage", type=int, default=2, choices=[0, 1, 2, 3],
+                        help="ZeRO optimization stage (0-3, default: 2)")
+    parser.add_argument("--offload_optimizer", action="store_true",
+                        help="Offload optimizer states to CPU (reduces GPU memory)")
+    parser.add_argument("--offload_parameters", action="store_true",
+                        help="Offload parameters to CPU (for ZeRO-3)")
+    parser.add_argument("--local_rank", type=int, default=-1,
+                        help="Local rank for distributed training (set by deepspeed launcher)")
+    
+    args = parser.parse_args()
+    
+    # Set up distributed training
+    deepspeed.init_distributed()
+    
+    # Get distributed training info
+    local_rank = args.local_rank if args.local_rank >= 0 else 0
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    global_rank = int(os.environ.get("RANK", 0)) if world_size > 1 else 0
+    
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    random.seed(42)
+    np.random.seed(42)
+    
+    # Print CUDA information
+    if global_rank == 0:
+        print(f"CUDA AVAILABLE: {torch.cuda.is_available()}")
+        print(f"GPU COUNT: {torch.cuda.device_count()}")
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+        
+        print(f"World size: {world_size}")
+        print(f"Global rank: {global_rank}")
+        print(f"Local rank: {local_rank}")
+    
+    # Helper function to detect if a file is gzipped
+    def is_gzip_file(filepath):
+        with open(filepath, 'rb') as test_f:
+            return test_f.read(2) == b'\x1f\x8b'
+    
+    # Load and prepare data
+    if global_rank == 0:
+        print(f"Loading data from {args.data}...")
+    
+    if is_gzip_file(args.data):
+        if global_rank == 0:
+            print("Detected gzip format, loading into memory...")
+        with gzip.open(args.data) as file:
+            data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
+            np_train, np_valid = np.split(data, [int(90e6)])
+            data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
+    else:
+        if global_rank == 0:
+            print("Detected raw format, using memory mapping...")
+        # Get file size
+        file_size = os.path.getsize(args.data)
+        # Map the file into memory
+        with open(args.data, 'r+b') as f:
+            mm = mmap.mmap(f.fileno(), 0)
+            # Create a numpy array using the memory map
+            data = np.frombuffer(mm, dtype=np.uint8, count=min(int(95e6), file_size))
+            # Split data (but don't copy it)
+            train_size = min(int(90e6), len(data))
+            np_train, np_valid = data[:train_size], data[train_size:min(int(95e6), len(data))]
+            # Convert to PyTorch tensors
+            data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
+    
+    if global_rank == 0:
+        print(f"Data loaded - Train: {data_train.shape}, Val: {data_val.shape}")
+    
+    # Parse numerical arguments with potential suffixes
+    dim_value = parse_size_with_suffix(args.dim) if args.dim is not None else None
+    depth_value = args.depth  # Already an int, no parsing needed
+    params_value = parse_size_with_suffix(args.params) if args.params is not None else None
+    seq_len_value = int(parse_size_with_suffix(args.seq_len)) if args.seq_len is not None else SEQ_LEN
+    batch_size_value = args.batch_size if args.batch_size is not None else BATCH_SIZE
+    grad_accum_value = args.grad_accum if args.grad_accum is not None else GRAD_ACCUM_EVERY
+    learning_rate_value = args.learning_rate if args.learning_rate is not None else LEARNING_RATE
+    
+    # Get user-requested total steps
+    total_requested_steps = int(parse_size_with_suffix(args.steps)) if args.steps is not None else NUM_BATCHES
+    
+    # Override config values with command line arguments
+    SEQ_LEN = seq_len_value
+    BATCH_SIZE = batch_size_value
+    GRAD_ACCUM_EVERY = grad_accum_value
+    LEARNING_RATE = learning_rate_value
+    NUM_BATCHES = total_requested_steps
+    
+    # Configure model architecture based on command line arguments
+    if params_value is not None:
+        # Get target parameter count
+        target_params = params_value
+        
+        if dim_value is not None and depth_value is None:
+            # If dimension is specified but not depth, solve for depth
+            dim = round_to_multiple(dim_value)
+            depth = solve_for_depth(
+                target_params, 
+                dim, 
+                MODEL_CONFIG["num_tokens"], 
+                MODEL_CONFIG["ff_mult"], 
+                MODEL_CONFIG["expansion"]
+            )
+            if global_rank == 0:
+                print(f"Target params: {target_params/1e6:.1f}M, Dimension: {dim}, Calculated depth: {depth}")
+        elif dim_value is None and depth_value is not None:
+            # If depth is specified but not dimension, solve for dimension
+            depth = depth_value
+            dim = solve_for_dimension(
+                target_params, 
+                depth, 
+                MODEL_CONFIG["num_tokens"], 
+                MODEL_CONFIG["ff_mult"], 
+                MODEL_CONFIG["expansion"]
+            )
+            if global_rank == 0:
+                print(f"Target params: {target_params/1e6:.1f}M, Calculated dimension: {dim}, Depth: {depth}")
+        else:
+            # If neither or both are specified
+            if dim_value is not None and depth_value is not None:
+                dim = round_to_multiple(dim_value)
+                depth = depth_value
+                if global_rank == 0:
+                    print(f"Warning: Both dimension and depth specified with target params. Ignoring target params.")
+            else:
+                # Scale both according to parameter count
+                base_params = 15 * 1024 * 1024  # 15M params reference
+                base_depth = 6  # Reference depth
+                
+                # Calculate balanced depth based on parameter count
+                if target_params >= base_params:
+                    scaling_factor = (target_params / base_params) ** (1/3)
+                    depth = max(base_depth, round(base_depth * scaling_factor))
+                else:
+                    scaling_factor = (target_params / base_params) ** (1/4)
+                    depth = max(2, round(base_depth * scaling_factor))
+                
+                # Solve for dimension with the calculated depth
+                dim = solve_for_dimension(
+                    target_params, 
+                    depth, 
+                    MODEL_CONFIG["num_tokens"], 
+                    MODEL_CONFIG["ff_mult"], 
+                    MODEL_CONFIG["expansion"]
+                )
+                if global_rank == 0:
+                    print(f"Target params: {target_params/1e6:.1f}M, Balanced scaling - Dimension: {dim}, Depth: {depth}")
+    else:
+        # No target params specified, use explicit values or defaults
+        dim = round_to_multiple(dim_value) if dim_value is not None else MODEL_CONFIG["dim"]
+        depth = depth_value if depth_value is not None else MODEL_CONFIG["depth"]
+        
+    # Update model config with the calculated values
+    MODEL_CONFIG["dim"] = dim
+    MODEL_CONFIG["depth"] = depth
+    
+    # Create datasets and dataloaders
+    if global_rank == 0:
+        print(f"Creating datasets with sequence length: {SEQ_LEN}...")
+    
+    train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
+    val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
+    
+    # Calculate optimal workers
+    num_workers = min(4, os.cpu_count() or 2)
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=BATCH_SIZE, 
+        num_workers=num_workers,
+        shuffle=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=BATCH_SIZE, 
+        num_workers=num_workers,
+        shuffle=False
+    )
+    
+    # Generate unique run name
+    RUN_TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Create output directory name
+    if global_rank == 0:
+        if args.output:
+            checkpoint_dir = args.output
+        else:
+            # Calculate expected model size
+            expected_params = calculate_model_size(MODEL_CONFIG)
+            params_str = f"{expected_params/1000000:.1f}M" if expected_params >= 1000000 else f"{expected_params/1000:.1f}K"
+            checkpoint_dir = f"gruf_{params_str}_{RUN_TIMESTAMP}"
+        
+        # Create the directory
+        print(f"Creating checkpoint directory: {checkpoint_dir}")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # Save model configuration
+        config = {
+            **MODEL_CONFIG, 
+            **{
+                "learning_rate": LEARNING_RATE, 
+                "seq_len": SEQ_LEN, 
+                "batch_size": BATCH_SIZE,
+                "num_batches": NUM_BATCHES,
+                "total_steps": total_requested_steps,
+                "use_bf16": args.use_bf16,
+                "zero_stage": args.zero_stage,
+                "offload_optimizer": args.offload_optimizer,
+                "offload_parameters": args.offload_parameters
+            }
+        }
+        
+        with open(os.path.join(checkpoint_dir, "model_config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+            
+        # Create the metrics TSV file
+        metrics_log_path = os.path.join(checkpoint_dir, "training_metrics.tsv")
+        with open(metrics_log_path, 'w') as f:
+            header = [
+                "step", "time", "tokens_processed", 
+                "tokens_per_sec", "train_loss", "val_loss", "bpb",
+                "learning_rate", "batch_size", "grad_accum"
+            ]
+            f.write('\t'.join(header) + '\n')
+    else:
+        checkpoint_dir = ""
+        
+    # Synchronize checkpoint directory across processes
+    if world_size > 1:
+        if global_rank == 0:
+            checkpoint_dir_tensor = torch.tensor([ord(c) for c in checkpoint_dir], dtype=torch.long).cuda()
+            # Pad to fixed length
+            padded_dir = torch.zeros(256, dtype=torch.long).cuda()
+            padded_dir[:len(checkpoint_dir_tensor)] = checkpoint_dir_tensor
+        else:
+            padded_dir = torch.zeros(256, dtype=torch.long).cuda()
+            
+        # Broadcast from rank 0 to all other ranks
+        torch.distributed.broadcast(padded_dir, 0)
+        
+        # Convert back to string
+        if global_rank != 0:
+            nonzero_indices = padded_dir.nonzero().squeeze(-1)
+            if len(nonzero_indices) > 0:
+                str_len = nonzero_indices[-1].item() + 1
+                checkpoint_dir = ''.join([chr(i) for i in padded_dir[:str_len].tolist()])
+            else:
+                checkpoint_dir = ""
+    
+    if global_rank == 0:
+        print(f"Creating model with dimension={dim}, depth={depth}...")
+    
+    # Initialize the model trainer
+    trainer = MinLMTrainer(
+        num_tokens=MODEL_CONFIG["num_tokens"],
+        dim=MODEL_CONFIG["dim"],
+        depth=MODEL_CONFIG["depth"],
+        ff_mult=MODEL_CONFIG["ff_mult"],
+        expansion=MODEL_CONFIG["expansion"],
+        conv_kernel_size=MODEL_CONFIG["conv_kernel_size"],
+        learning_rate=LEARNING_RATE,
+        use_lstm=MODEL_CONFIG["use_lstm"],
+        enable_conv=MODEL_CONFIG["enable_conv"],
+        dropout=MODEL_CONFIG["dropout"],
+        checkpoint_dir=checkpoint_dir,
+        world_size=world_size,
+        global_rank=global_rank
+    )
+    
+    # Store val_dataset for text generation
+    trainer.val_dataset = val_dataset
+    
+    # Initialize DeepSpeed
+    trainer.init_deepspeed(train_loader, args)
+    
+    # Print effective batch size
+    if global_rank == 0:
+        print(f"\n--- Training Configuration ---")
+        print(f"Model: {MODEL_CONFIG['depth']} layers, {MODEL_CONFIG['dim']} dimensions")
+        print(f"Parameters: {get_parameter_count_str(MODEL_CONFIG)}")
+        print(f"Batch size per GPU: {BATCH_SIZE}")
+        print(f"Global batch size: {BATCH_SIZE * world_size}")
+        print(f"Gradient accumulation: {GRAD_ACCUM_EVERY}")
+        print(f"Effective batch size: {BATCH_SIZE * world_size * GRAD_ACCUM_EVERY}")
+        print(f"Learning rate: {LEARNING_RATE}")
+        print(f"Sequence length: {SEQ_LEN}")
+        print(f"Training steps: {NUM_BATCHES}")
+        print(f"ZeRO Stage: {args.zero_stage}")
+        print(f"Optimizer offload: {args.offload_optimizer}")
+        print(f"Parameter offload: {args.offload_parameters}")
+        print(f"Precision: {'BF16' if args.use_bf16 else 'FP32'}")
+        print(f"-----------------------------\n")
+    
+    # Start training
+    trainer.train(
+        train_loader,
+        val_loader,
+        NUM_BATCHES,
+        VALIDATE_EVERY,
+        GENERATE_EVERY,
+        val_batches=4
+    )
+
+if __name__ == "__main__":
+    main()
