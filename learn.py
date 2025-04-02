@@ -67,6 +67,9 @@ def base_decoding(
     temperature = 1.,
     filter_thres = 0.9,
 ):
+    # Ensure prompt is a Long tensor
+    if prompt.dtype != torch.long:
+        prompt = prompt.long()
     prompt_seq_len, out = prompt.shape[-1], prompt.clone()
     sample_num_times = max(0, seq_len - prompt_seq_len)
 
@@ -104,6 +107,7 @@ class TextSamplerDataset(Dataset):
     def __getitem__(self, index):
         # Random sampling from anywhere in the data
         rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
+        # Always ensure we return a Long tensor
         full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
         return full_seq  # DeepSpeed will handle device placement
 
@@ -275,6 +279,9 @@ class MinLMTrainer:
             if self.global_rank == 0:
                 print(f"Starting tokens/s timing at step {self.global_step}")
         
+        # Ensure batch is a Long tensor before forward pass
+        if batch.dtype != torch.long:
+            batch = batch.long()
         # Forward pass - DeepSpeed handles loss scaling and backward
         loss = self.model(batch, return_loss=True)
         
@@ -309,6 +316,9 @@ class MinLMTrainer:
     def validation_step(self, batch):
         """Execute a single validation step"""
         with torch.no_grad():
+            # Ensure batch is a Long tensor
+            if batch.dtype != torch.long:
+                batch = batch.long()
             loss = self.model(batch, return_loss=True)
             # Calculate bits per byte (bpb)
             bpb = loss / math.log(2)
@@ -325,6 +335,9 @@ class MinLMTrainer:
                 if max_batches is not None and i >= max_batches:
                     break
                 batch = batch.to(self.model.device)
+                # Ensure batch is a Long tensor
+                if batch.dtype != torch.long:
+                    batch = batch.long()
                 result = self.validation_step(batch)
                 val_losses.append(result["val_loss"])
                 val_bpbs.append(result["bpb"])
@@ -498,7 +511,8 @@ class MinLMTrainer:
             
         # Get a random sample from validation data
         rand_start = torch.randint(0, len(self.val_dataset.data) - prime_length - 1, (1,))
-        prime = self.val_dataset.data[rand_start:rand_start + prime_length].unsqueeze(0).to(self.model.device)
+        # Ensure prime is a Long tensor before passing to the model
+        prime = self.val_dataset.data[rand_start:rand_start + prime_length].long().unsqueeze(0).to(self.model.device)
         
         # Generate text
         print("\nGenerating sample text...")
