@@ -19,7 +19,7 @@ TRAINING_CONFIG = {
 MODEL_CONFIG = {
     "num_tokens": 256,
     "dim": 512,          # Hidden dimension size
-    "depth": 32,         # Number of layers
+    "depth": 6,          # Number of layers
     "ff_mult": 4,        # Feedforward multiplier
     "expansion": 1.5,    # Expansion factor for minGRU/minLSTM
     "conv_kernel_size": 3,

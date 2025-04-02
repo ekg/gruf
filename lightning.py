@@ -1,6 +1,4 @@
 import os
-os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9"
-os.environ["DS_BUILD_OPS"] = "0"
 os.environ["NCCL_P2P_DISABLE"] = "1"
 
 import gzip
@@ -24,15 +22,10 @@ from pytorch_lightning.loggers import CSVLogger
 
 # Set environment variables
 os.environ["NCCL_DEBUG"] = "INFO"
-os.environ["NCCL_SOCKET_IFNAME"] = "eno1"  # Use the specific interface shown in your logs
-os.environ["DS_BUILD_OPS"] = "0"  # Skip building DeepSpeed custom CUDA kernels
 
 # Import the minLM model and configuration
 from minGRU_pytorch.minLM import minLM
 from config import MODEL_CONFIG, TRAINING_CONFIG, calculate_model_size, get_parameter_count_str
-
-# Override default depth to 6 (already has dim=512 by default)
-MODEL_CONFIG["depth"] = 6
 
 # Load configuration constants
 NUM_BATCHES = TRAINING_CONFIG["num_batches"]
