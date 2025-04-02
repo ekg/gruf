@@ -81,7 +81,9 @@ def base_decoding(
 
         logits = top_k(logits, thres = filter_thres)
         sample = gumbel_sample(logits, temperature = temperature, dim = -1)
-
+        
+        # Ensure sample is Long type before concatenation
+        sample = sample.long()
         out = torch.cat((out, sample), dim = -1)
 
     return out[..., prompt_seq_len:]
