@@ -786,12 +786,35 @@ def main():
         version=RUN_TIMESTAMP  # Use the global timestamp
     )
     
-    # Create a DDPStrategy with the gloo backend
-    ddp_strategy = DDPStrategy(
-        process_group_backend="gloo",
-        find_unused_parameters=False,
-        static_graph=False  # Setting to False to avoid DDP autograd hooks issue
-    ) if torch.cuda.device_count() > 1 else "auto"
+    # Setup the appropriate distributed training strategy (DeepSpeed or DDP)
+    if args.deepspeed:
+        print(f"Using DeepSpeed with ZeRO Stage-{args.zero_stage}")
+        if args.offload_optimizer:
+            print(f"Offloading optimizer states to CPU")
+        if args.offload_parameters and args.zero_stage == 3:
+            print(f"Offloading parameters to CPU")
+        
+        # Use a JSON config file if provided
+        if args.deepspeed_config and os.path.exists(args.deepspeed_config):
+            print(f"Using DeepSpeed config from: {args.deepspeed_config}")
+            strategy = DeepSpeedStrategy(config=args.deepspeed_config)
+        else:
+            # Create DeepSpeed config from arguments
+            ds_config = create_deepspeed_config(
+                args.zero_stage, 
+                args.use_bf16, 
+                args.offload_optimizer,
+                args.offload_parameters,
+                LEARNING_RATE
+            )
+            strategy = DeepSpeedStrategy(config=ds_config)
+    else:
+        # Regular DDP strategy with NCCL backend for better GPU performance
+        strategy = DDPStrategy(
+            process_group_backend="nccl",
+            find_unused_parameters=False,
+            static_graph=False  # Setting to False to avoid DDP autograd hooks issue
+        ) if torch.cuda.device_count() > 1 else "auto"
 
     # Calculate number of epochs needed to reach NUM_BATCHES
     total_samples = len(train_dataset)
