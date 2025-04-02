@@ -161,6 +161,12 @@ class MinLMTrainer:
         self.val_loss = 0.0
         self.val_bpb = 0.0
         self.global_step = 0
+        
+        # Checkpoint tracking
+        self.best_val_loss = float('inf')
+        self.best_val_bpb = float('inf')
+        self.best_checkpoints = []  # List of (path, val_loss) tuples to track top_k checkpoints
+        self.save_top_k = 3  # Number of best checkpoints to keep
 
     def init_deepspeed(self, train_dataloader, args):
         """Initialize DeepSpeed engine"""
@@ -364,7 +370,7 @@ class MinLMTrainer:
         self.model.train()
         return {"val_loss": avg_val_loss, "bpb": avg_bpb}
     
-    def save_checkpoint(self, additional_info=None):
+    def save_checkpoint(self, additional_info=None, is_periodic=False):
         """Save a checkpoint of the model"""
         if not self.checkpoint_dir or self.global_rank != 0:
             return
@@ -376,19 +382,59 @@ class MinLMTrainer:
             'step': self.global_step,
             'model_state_dict': self.model.module.state_dict(),  # Access the model inside DeepSpeed
             'global_tokens': self.global_tokens.item(),
-            'training_time': time.time() - self.start_time
+            'training_time': time.time() - self.start_time,
+            'val_loss': self.val_loss,
+            'val_bpb': self.val_bpb
         }
         
         if additional_info:
             checkpoint.update(additional_info)
         
-        # Save checkpoint
-        checkpoint_path = os.path.join(self.checkpoint_dir, f"minlm-step-{self.global_step}.pt")
+        # Format checkpoint filename with validation metrics
+        val_loss_str = f"{self.val_loss:.4f}" if self.val_loss is not None else "NA"
+        bpb_str = f"{self.val_bpb:.4f}" if self.val_bpb is not None else "NA"
+        
+        # Save checkpoint with informative name
+        filename = f"minlm-step-{self.global_step}-loss-{val_loss_str}-bpb-{bpb_str}.pt"
+        checkpoint_path = os.path.join(self.checkpoint_dir, filename)
         torch.save(checkpoint, checkpoint_path)
         
         # Save latest checkpoint (for resuming)
         latest_path = os.path.join(self.checkpoint_dir, "latest.pt")
         torch.save(checkpoint, latest_path)
+        
+        # Track best checkpoints (top k)
+        if not is_periodic and self.val_loss is not None:
+            # Check if this is a best model
+            is_best = False
+            if self.val_loss < self.best_val_loss:
+                self.best_val_loss = self.val_loss
+                self.best_val_bpb = self.val_bpb
+                is_best = True
+                
+                # Also save as best model
+                best_path = os.path.join(self.checkpoint_dir, "best.pt")
+                torch.save(checkpoint, best_path)
+                print(f"New best model saved with val_loss: {self.val_loss:.4f}, bpb: {self.val_bpb:.4f}")
+            
+            # Add to best_checkpoints list and sort
+            self.best_checkpoints.append((checkpoint_path, self.val_loss))
+            self.best_checkpoints.sort(key=lambda x: x[1])  # Sort by val_loss (lower is better)
+            
+            # Keep only top_k best checkpoints
+            if len(self.best_checkpoints) > self.save_top_k:
+                # Get paths of checkpoints to remove (everything after top_k)
+                to_remove = self.best_checkpoints[self.save_top_k:]
+                self.best_checkpoints = self.best_checkpoints[:self.save_top_k]
+                
+                # Delete the checkpoints that didn't make the cut
+                for path, _ in to_remove:
+                    if os.path.exists(path) and "best" not in path and "latest" not in path:
+                        try:
+                            os.remove(path)
+                            print(f"Removed checkpoint {os.path.basename(path)} to keep top {self.save_top_k}")
+                        except OSError as e:
+                            print(f"Error removing checkpoint: {e}")
         
         return checkpoint_path
     
@@ -443,6 +489,11 @@ class MinLMTrainer:
                 # Log progress
                 if self.global_rank == 0 and step % 10 == 0:
                     self._log_metrics(False)
+                    
+                # Save periodic checkpoint every 1000 steps for safety
+                if self.global_rank == 0 and step > 0 and step % 1000 == 0:
+                    self.save_checkpoint({"periodic": True}, is_periodic=True)
+                    print(f"Saved periodic checkpoint at step {step}")
                 
                 # Validate periodically
                 if step > 0 and step % validate_every == 0:
@@ -451,11 +502,8 @@ class MinLMTrainer:
                         val_results = self.validate(val_dataloader, max_batches=val_batches)
                         print(f"Validation - Loss: {val_results['val_loss']:.4f}, BPB: {val_results['bpb']:.4f}")
                         
-                        # Save checkpoint
-                        self.save_checkpoint({
-                            'val_loss': val_results['val_loss'],
-                            'val_bpb': val_results['bpb']
-                        })
+                        # Save checkpoint with validation results
+                        self.save_checkpoint()
                         
                         # Log metrics
                         self._log_metrics(True)
@@ -476,8 +524,6 @@ class MinLMTrainer:
             
             # Save final checkpoint
             final_path = self.save_checkpoint({
-                'val_loss': val_results['val_loss'],
-                'val_bpb': val_results['bpb'],
                 'final': True
             })
             print(f"Training complete! Final checkpoint saved to: {final_path}")
