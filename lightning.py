@@ -965,23 +965,31 @@ def main():
     # Create trainer with precision settings based on args
     precision = "bf16-mixed" if args.use_bf16 else 32
     
-    trainer = pl.Trainer(
-        max_steps=NUM_BATCHES,  # Each GPU will do this many steps
-        accumulate_grad_batches=GRAD_ACCUM_EVERY,
-        accelerator="gpu",
-        devices=gpu_ids if gpu_ids else "auto",
-        strategy=strategy,  # Use the strategy variable we set above (DeepSpeed or DDP)
-        gradient_clip_val=0.5,
-        callbacks=[checkpoint_callback, backup_checkpoint_callback, progress_bar, metrics_logger],
-        val_check_interval=VALIDATE_EVERY,
-        logger=csv_logger,
-        log_every_n_steps=10,
-        num_sanity_val_steps=0,
-        limit_val_batches=4,
-        max_epochs=max_epochs,  # Set max_epochs to ensure we can track progress
-        check_val_every_n_epoch=None,  # Still validate based on steps, not epochs
-        precision=precision,  # Use BF16 if requested
-    )
+    # Don't use gradient clipping with DeepSpeed + manual optimization
+    use_gradient_clip = not args.deepspeed  # Skip gradient clipping for DeepSpeed
+    
+    trainer_kwargs = {
+        "max_steps": NUM_BATCHES,
+        "accumulate_grad_batches": GRAD_ACCUM_EVERY,
+        "accelerator": "gpu",
+        "devices": gpu_ids if gpu_ids else "auto",
+        "strategy": strategy,
+        "callbacks": [checkpoint_callback, backup_checkpoint_callback, progress_bar, metrics_logger],
+        "val_check_interval": VALIDATE_EVERY,
+        "logger": csv_logger,
+        "log_every_n_steps": 10,
+        "num_sanity_val_steps": 0,
+        "limit_val_batches": 4,
+        "max_epochs": max_epochs,
+        "check_val_every_n_epoch": None,
+        "precision": precision,
+    }
+    
+    # Only add gradient clipping when not using DeepSpeed
+    if use_gradient_clip:
+        trainer_kwargs["gradient_clip_val"] = 0.5
+    
+    trainer = pl.Trainer(**trainer_kwargs)
 
     print(f"Starting training with {torch.cuda.device_count()} GPUs")
     print(f"Config: bs={BATCH_SIZE}, grad_accum={GRAD_ACCUM_EVERY}, lr={LEARNING_RATE}, seq_len={SEQ_LEN}")
