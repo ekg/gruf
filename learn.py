@@ -455,9 +455,7 @@ class MinLMTrainer:
         
         # Initial validation
         if self.global_rank == 0:
-            print("Running initial validation...")
             val_results = self.validate(val_dataloader, max_batches=val_batches)
-            print(f"Initial validation - Loss: {val_results['val_loss']:.4f}, BPB: {val_results['bpb']:.4f}")
             self._log_metrics(True)
         
         # Training loop
@@ -483,7 +481,8 @@ class MinLMTrainer:
                 if self.global_rank == 0:
                     elapsed = time.time() - self.start_time
                     tokens_per_sec = self.global_tokens.item() / elapsed if elapsed > 0 else 0
-                    pbar.set_description(f"Loss: {loss:.4f} | {tokens_per_sec:.2f} tok/s")
+                    val_info = f"Val: {self.val_loss:.4f} BPB: {self.val_bpb:.4f} | " if self.val_loss > 0 else ""
+                    pbar.set_description(f"Loss: {loss:.4f} | {val_info}{tokens_per_sec:.2f} tok/s")
                     pbar.update(1)
                 
                 # Log progress
@@ -498,9 +497,7 @@ class MinLMTrainer:
                 # Validate periodically
                 if step > 0 and step % validate_every == 0:
                     if self.global_rank == 0:
-                        print(f"\nValidating at step {step}...")
                         val_results = self.validate(val_dataloader, max_batches=val_batches)
-                        print(f"Validation - Loss: {val_results['val_loss']:.4f}, BPB: {val_results['bpb']:.4f}")
                         
                         # Save checkpoint with validation results
                         self.save_checkpoint()
@@ -518,9 +515,7 @@ class MinLMTrainer:
         
         # Final validation and checkpoint
         if self.global_rank == 0:
-            print("\nFinal validation...")
             val_results = self.validate(val_dataloader)
-            print(f"Final validation - Loss: {val_results['val_loss']:.4f}, BPB: {val_results['bpb']:.4f}")
             
             # Save final checkpoint
             final_path = self.save_checkpoint({
