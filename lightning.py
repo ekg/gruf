@@ -347,7 +347,6 @@ def create_deepspeed_config(zero_stage, bf16, offload_optimizer, offload_paramet
     config = {
         "train_batch_size": BATCH_SIZE * GRAD_ACCUM_EVERY,
         "train_micro_batch_size_per_gpu": BATCH_SIZE,
-        "gradient_accumulation_steps": GRAD_ACCUM_EVERY,
         "steps_per_print": 100,
         "zero_optimization": {
             "stage": zero_stage,
