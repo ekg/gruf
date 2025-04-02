@@ -114,6 +114,8 @@ class TextSamplerDataset(Dataset):
 
 # LightningMinLM model
 class LightningMinLM(pl.LightningModule):
+    automatic_optimization = False  # Disable automatic optimization for DeepSpeed compatibility
+    
     def __init__(
         self,
         num_tokens=256,
@@ -166,26 +168,25 @@ class LightningMinLM(pl.LightningModule):
             if batch_idx == 0 or batch_idx % 100 == 0:
                 print(f"\n--- Debugging step {batch_idx} ---")
                 # Check optimizer
-                if hasattr(self.trainer, 'optimizers'):
-                    opt = self.trainer.optimizers[0] if self.trainer.optimizers else None
-                    print(f"Optimizer type: {type(opt).__name__}")
+                opt = self.optimizers()
+                print(f"Optimizer type: {type(opt).__name__}")
+                
+                # Check optimizer parameters and device placement
+                if opt is not None:
+                    param_devices = set()
+                    param_count = 0
+                    requires_grad_count = 0
                     
-                    # Check optimizer parameters and device placement
-                    if opt is not None:
-                        param_devices = set()
-                        param_count = 0
-                        requires_grad_count = 0
-                        
-                        for param_group in opt.param_groups:
-                            for param in param_group['params']:
-                                param_count += 1
-                                if param.requires_grad:
-                                    requires_grad_count += 1
-                                if param.device not in param_devices:
-                                    param_devices.add(param.device)
-                        
-                        print(f"Parameter devices: {param_devices}")
-                        print(f"Params in optimizer: {param_count}, requires_grad: {requires_grad_count}")
+                    for param_group in opt.param_groups:
+                        for param in param_group['params']:
+                            param_count += 1
+                            if param.requires_grad:
+                                requires_grad_count += 1
+                            if param.device not in param_devices:
+                                param_devices.add(param.device)
+                    
+                    print(f"Parameter devices: {param_devices}")
+                    print(f"Params in optimizer: {param_count}, requires_grad: {requires_grad_count}")
                 
                 # Check model parameters
                 model_param_count = sum(1 for p in self.parameters())
@@ -214,27 +215,37 @@ class LightningMinLM(pl.LightningModule):
             # Check parameter gradients before backward
             params_before = sum(1 for p in self.parameters() if p.grad is not None)
             print(f"Params with gradients before backward: {params_before}")
-        # Manual backward pass when using DeepSpeed ZeRO-3
-        if isinstance(self.trainer.strategy, DeepSpeedStrategy):
-            # DeepSpeed handles the backward pass differently
-            self.manual_backward(loss)
+        
+        # Manual optimization
+        opt = self.optimizers()
+        
+        # Zero gradients
+        opt.zero_grad()
+        
+        # Backward pass
+        self.manual_backward(loss)
+        
+        # Update parameters - for non-DeepSpeed we need to call step manually
+        # For DeepSpeed, step() is automatically called after manual_backward
+        if not isinstance(self.trainer.strategy, DeepSpeedStrategy):
+            opt.step()
+        
+        # Debug gradients after backward
+        if self.global_rank == 0 and (batch_idx == 0 or batch_idx % 100 == 0):
+            params_after = sum(1 for p in self.parameters() if p.grad is not None)
+            print(f"Params with gradients after backward: {params_after}")
             
-            # Debug gradients after manual backward
-            if self.global_rank == 0 and (batch_idx == 0 or batch_idx % 100 == 0):
-                params_after = sum(1 for p in self.parameters() if p.grad is not None)
-                print(f"Params with gradients after backward: {params_after}")
-                
-                # Check gradient values
-                has_grad = any(p.grad is not None for p in self.parameters())
-                print(f"Has gradients: {has_grad}")
-                if has_grad:
-                    try:
-                        sample_param = next(p for p in self.parameters() if p.grad is not None)
-                        grad_norm = torch.norm(sample_param.grad).item()
-                        print(f"Sample gradient norm: {grad_norm}")
-                        print(f"Sample parameter device: {sample_param.device}")
-                    except StopIteration:
-                        print("Could not find parameter with gradient")
+            # Check gradient values
+            has_grad = any(p.grad is not None for p in self.parameters())
+            print(f"Has gradients: {has_grad}")
+            if has_grad:
+                try:
+                    sample_param = next(p for p in self.parameters() if p.grad is not None)
+                    grad_norm = torch.norm(sample_param.grad).item()
+                    print(f"Sample gradient norm: {grad_norm}")
+                    print(f"Sample parameter device: {sample_param.device}")
+                except StopIteration:
+                    print("Could not find parameter with gradient")
         
         # Log train_loss for display in progress bar
         self.log('train_loss', loss, prog_bar=True, sync_dist=True, on_step=True, on_epoch=False)
@@ -436,22 +447,7 @@ def create_deepspeed_config(zero_stage, bf16, offload_optimizer, offload_paramet
         "train_micro_batch_size_per_gpu": BATCH_SIZE,
         # Lightning handles grad accumulation
         "steps_per_print": 10,  # More frequent printing for debugging
-        "optimizer": {
-            "type": "Adam",
-            "params": {
-                "lr": learning_rate,
-                "betas": [0.9, 0.999],
-                "eps": 1e-8
-            }
-        },
-        "scheduler": {
-            "type": "WarmupLR",
-            "params": {
-                "warmup_min_lr": 0,
-                "warmup_max_lr": learning_rate,
-                "warmup_num_steps": 1000
-            }
-        },
+        # Remove optimizer and scheduler config - Lightning will handle this
         "zero_optimization": {
             "stage": zero_stage,
             "contiguous_gradients": True,
@@ -495,7 +491,7 @@ def create_deepspeed_config(zero_stage, bf16, offload_optimizer, offload_paramet
         "partition_activations": True,
         "cpu_checkpointing": True,
         "contiguous_memory_optimization": True,
-        "number_checkpoints": depth
+        "number_checkpoints": 8  # Use fixed number instead of model depth
     }
         
     return config
