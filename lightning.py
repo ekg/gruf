@@ -14,7 +14,7 @@ import csv
 import json
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-from pytorch_lightning.strategies import DDPStrategy
+from pytorch_lightning.strategies import DDPStrategy, DeepSpeedStrategy
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 from pytorch_lightning.loggers import CSVLogger
 
@@ -342,6 +342,55 @@ def parse_size_with_suffix(size_str):
     else:
         return value
 
+def create_deepspeed_config(zero_stage, bf16, offload_optimizer, offload_parameters, learning_rate):
+    """Create DeepSpeed configuration based on user options"""
+    config = {
+        "train_batch_size": BATCH_SIZE * GRAD_ACCUM_EVERY,
+        "train_micro_batch_size_per_gpu": BATCH_SIZE,
+        "gradient_accumulation_steps": GRAD_ACCUM_EVERY,
+        "steps_per_print": 100,
+        "zero_optimization": {
+            "stage": zero_stage,
+            "contiguous_gradients": True,
+            "overlap_comm": True
+        },
+        "fp16": {
+            "enabled": not bf16,
+            "loss_scale": 0,
+            "loss_scale_window": 1000,
+            "hysteresis": 2,
+            "min_loss_scale": 1
+        },
+        "bf16": {
+            "enabled": bf16
+        },
+        "optimizer": {
+            "type": "AdamW",
+            "params": {
+                "lr": learning_rate,
+                "betas": [0.9, 0.95],
+                "eps": 1e-8
+            }
+        },
+        "wall_clock_breakdown": False
+    }
+    
+    # Add CPU offloading if requested (for ZeRO-2 and ZeRO-3)
+    if zero_stage >= 2 and offload_optimizer:
+        config["zero_optimization"]["offload_optimizer"] = {
+            "device": "cpu",
+            "pin_memory": True
+        }
+        
+    # Parameter offloading only works with ZeRO-3
+    if zero_stage == 3 and offload_parameters:
+        config["zero_optimization"]["offload_param"] = {
+            "device": "cpu",
+            "pin_memory": True
+        }
+        
+    return config
+
 def round_to_multiple(n, multiple=32):
     """Round a number to the nearest multiple of a given value."""
     return multiple * round(n / multiple)
@@ -436,6 +485,18 @@ def main():
                         help="Directory to save checkpoints (default: auto-generated name with params and timestamp)")
     parser.add_argument("--use_bf16", action="store_true",
                         help="Use BF16 precision to reduce memory usage (default: False)")
+                        
+    # DeepSpeed arguments
+    parser.add_argument("--deepspeed", action="store_true",
+                        help="Enable DeepSpeed for training (default: False)")
+    parser.add_argument("--zero_stage", type=int, default=2, choices=[0, 1, 2, 3],
+                        help="ZeRO optimization stage (0-3, higher = more memory efficient but slower)")
+    parser.add_argument("--offload_optimizer", action="store_true",
+                        help="Offload optimizer states to CPU (reduces GPU memory, but slower)")
+    parser.add_argument("--offload_parameters", action="store_true",
+                        help="Offload parameters to CPU (for ZeRO-3, reduces GPU memory but slower)")
+    parser.add_argument("--deepspeed_config", type=str, default=None,
+                        help="Path to DeepSpeed JSON config file (overrides other DeepSpeed args)")
     
     args = parser.parse_args()
     
@@ -667,6 +728,13 @@ def main():
                 "use_bf16": args.use_bf16
             }
         }
+        
+        # Add DeepSpeed configuration if enabled
+        if args.deepspeed:
+            config["deepspeed_enabled"] = True
+            config["zero_stage"] = args.zero_stage
+            config["offload_optimizer"] = args.offload_optimizer
+            config["offload_parameters"] = args.offload_parameters
         with open(os.path.join(checkpoint_dir, "model_config.json"), "w") as f:
             json.dump(config, f, indent=2)
             
@@ -772,7 +840,7 @@ def main():
         accumulate_grad_batches=GRAD_ACCUM_EVERY,
         accelerator="gpu",
         devices=gpu_ids if gpu_ids else "auto",
-        strategy=ddp_strategy,
+        strategy=strategy,  # Use the strategy variable we set above (DeepSpeed or DDP)
         gradient_clip_val=0.5,
         callbacks=[checkpoint_callback, backup_checkpoint_callback, progress_bar, metrics_logger],
         val_check_interval=VALIDATE_EVERY,
