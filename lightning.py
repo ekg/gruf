@@ -459,6 +459,11 @@ def main():
                         help="Enable CPU offloading with FSDP to save GPU memory")
     parser.add_argument("--fsdp_min_params", type=str, default="100k",
                         help="Minimum number of parameters for auto-wrap policy (default: 100k). Can use k/m/g suffix.")
+    parser.add_argument("--fsdp_backend", type=str, default="auto",
+                        choices=["auto", "nccl", "gloo"],
+                        help="Process group backend for FSDP (default: auto selects NCCL for GPU, Gloo otherwise)")
+    parser.add_argument("--force_gloo", action="store_true",
+                        help="Force using Gloo backend even when NCCL might be available (legacy option)")
     
     args = parser.parse_args()
     
@@ -690,7 +695,8 @@ def main():
                 "use_bf16": args.use_bf16,
                 "use_fsdp": args.use_fsdp,
                 "fsdp_sharding_strategy": args.fsdp_sharding_strategy if args.use_fsdp else None,
-                "fsdp_state_dict_type": args.fsdp_state_dict_type if args.use_fsdp else None
+                "fsdp_state_dict_type": args.fsdp_state_dict_type if args.use_fsdp else None,
+                "fsdp_backend": fsdp_backend if args.use_fsdp else None
             }
         }
         with open(os.path.join(checkpoint_dir, "model_config.json"), "w") as f:
@@ -794,16 +800,34 @@ def main():
         # Use our custom policy instead of size_based_auto_wrap_policy
         auto_wrap_policy = custom_auto_wrap_policy
         
+        # Determine the best backend for FSDP
+        if args.force_gloo:
+            # Legacy option for forcing gloo
+            fsdp_backend = "gloo"
+        elif args.fsdp_backend != "auto":
+            # Explicit backend selection
+            fsdp_backend = args.fsdp_backend
+        else:
+            # Auto selection based on GPU availability
+            fsdp_backend = "nccl" if torch.cuda.is_available() else "gloo"
+            
+        # Set environment variables to help with NCCL debugging if needed
+        if fsdp_backend == "nccl":
+            # These help with debugging NCCL issues
+            if "NCCL_DEBUG" not in os.environ:
+                os.environ["NCCL_DEBUG"] = "INFO"
+            print("NCCL DEBUG level set to INFO for better error reporting")
+        
         strategy = FSDPStrategy(
             sharding_strategy=sharding_strategy_map[args.fsdp_sharding_strategy],
             state_dict_type=state_dict_type_map[args.fsdp_state_dict_type],
             cpu_offload=cpu_offload,
             # Removed activation_checkpointing due to compatibility issues
-            process_group_backend="gloo",  # Always use gloo backend
+            process_group_backend=fsdp_backend,
             limit_all_gathers=True,  # Help prevent OOMs
             auto_wrap_policy=auto_wrap_policy,  # Add auto-wrapping policy
         )
-        print(f"FSDP configuration: sharding={args.fsdp_sharding_strategy}, state_dict={args.fsdp_state_dict_type}, backend=gloo")
+        print(f"FSDP configuration: sharding={args.fsdp_sharding_strategy}, state_dict={args.fsdp_state_dict_type}, backend={fsdp_backend}")
         print(f"FSDP auto_wrap_policy: {getattr(strategy, 'auto_wrap_policy', None)}")
         if args.fsdp_activation_checkpointing:
             print("Warning: Activation checkpointing was requested but is disabled due to compatibility issues")
@@ -840,6 +864,12 @@ def main():
     print(f"Sequence length: {SEQ_LEN} tokens")
     print(f"Total samples: {total_samples:,} (dataset size / sequence length)")
     print(f"Running on {world_size} GPUs")
+    
+    # Print FSDP-specific information if enabled
+    if args.use_fsdp:
+        print(f"FSDP enabled with {args.fsdp_sharding_strategy} sharding strategy")
+        print(f"FSDP using {fsdp_backend} backend for process group communication")
+        print(f"FSDP auto-wrapping modules with > {min_params:,} parameters")
     print(f"Batch size per GPU: {BATCH_SIZE}")
     print(f"Global batch size: {BATCH_SIZE * world_size}")
     print(f"Gradient accumulation: {GRAD_ACCUM_EVERY}")
@@ -889,9 +919,23 @@ def main():
     print(f"Config: bs={BATCH_SIZE}, grad_accum={GRAD_ACCUM_EVERY}, lr={LEARNING_RATE}, seq_len={SEQ_LEN}")
     print(f"Will run for {NUM_BATCHES:,} steps per GPU ({total_requested_steps:,} total steps across {world_size} GPUs)")
     
-    # Start training
+    # Start training with better error handling for NCCL issues
     print("Starting training...")
-    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    try:
+        trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    except RuntimeError as e:
+        error_str = str(e)
+        if "NCCL" in error_str:
+            print("\n\nNCCL error detected! Error details:")
+            print(error_str)
+            print("\nTry running with --force_gloo or --fsdp_backend=gloo to use the more reliable Gloo backend")
+            print("You can also check your network configuration and NCCL environment variables")
+            print("Common fixes include:")
+            print("  - Setting NCCL_SOCKET_IFNAME to the correct network interface")
+            print("  - Using NCCL_IB_DISABLE=1 if InfiniBand is causing issues")
+            print("  - Setting NCCL_DEBUG=INFO for more detailed error messages")
+        # Re-raise the exception to preserve the original error behavior
+        raise
     
     # Helper function to print detailed model information
     def print_model_details(model):
