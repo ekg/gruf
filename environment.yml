@@ -1,0 +1,14 @@
+name: cuda_ok
+channels:
+- conda-forge
+- pytorch
+dependencies:
+- gcc_linux-64=13
+- gxx_linux-64=13
+- lightning
+- python=3.10
+- pytorch
+- torchaudio
+- torchvision
+- pip:
+  - git+https://github.com/deepspeedai/DeepSpeed.git@3c1817f38fc46aba3a2d5b0b10e56c33aca11a22#egg=deepspeed
