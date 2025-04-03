@@ -216,13 +216,17 @@ class MinLMTrainer:
             "train_micro_batch_size_per_gpu": BATCH_SIZE,
             "gradient_accumulation_steps": self.grad_accum_steps,
             "steps_per_print": 500,  # Reduce logging frequency significantly
+        
+            # Add gradient clipping to match PyTorch Lightning's default behavior
+            "gradient_clipping": 0.5,
+        
             "optimizer": {
-                "type": "AdamW",
+                "type": "Adam",  # Changed from AdamW to standard Adam to match Lightning's default
                 "params": {
                     "lr": learning_rate,
                     "betas": [0.9, 0.999],
-                    "eps": 1e-8,
-                    "weight_decay": 0.01
+                    "eps": 1e-8
+                    # Removed weight_decay to match standard Adam in Lightning
                 }
             },
             "scheduler": {
