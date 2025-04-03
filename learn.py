@@ -247,14 +247,14 @@ class MinLMTrainer:
                 "round_robin_gradients": True
             },
             "fp16": {
-                "enabled": not bf16,
+                "enabled": not bf16,  # Use FP16 when not using FP32
                 "loss_scale": 0,
                 "loss_scale_window": 1000,
                 "hysteresis": 2,
                 "min_loss_scale": 1
             },
             "bf16": {
-                "enabled": bf16
+                "enabled": False  # Always disable BF16
             },
             "zero_allow_untested_optimizer": True,
             "wall_clock_breakdown": False
@@ -741,8 +741,8 @@ def main():
                         help=f"Total training steps (default: {TRAINING_CONFIG['num_batches']}). Can use k suffix.")
     parser.add_argument("--output", type=str, default=None,
                         help="Directory to save checkpoints (default: auto-generated name)")
-    parser.add_argument("--use-f32", dest="use_bf16", action="store_false", default=True,
-                        help="Use FP32 precision instead of BF16 (default: BF16)")
+    parser.add_argument("--use-f32", dest="use_fp16", action="store_false", default=True,
+                        help="Use FP32 precision instead of FP16 (default: FP16)")
                         
     # DeepSpeed arguments
     parser.add_argument("--deepspeed_config", type=str, default=None,
@@ -983,7 +983,7 @@ def main():
                 "batch_size": BATCH_SIZE,
                 "num_batches": NUM_BATCHES,
                 "total_steps": total_requested_steps,
-                "use_bf16": args.use_bf16,
+                "use_fp16": args.use_fp16,
                 "zero_stage": args.zero_stage,
                 "offload_optimizer": args.offload_optimizer,
                 "offload_parameters": args.offload_parameters
@@ -1072,7 +1072,7 @@ def main():
         print(f"ZeRO Stage: {args.zero_stage}")
         print(f"Optimizer offload: {args.offload_optimizer}")
         print(f"Parameter offload: {args.offload_parameters}")
-        print(f"Precision: {'BF16' if args.use_bf16 else 'FP32'}")
+        print(f"Precision: {'FP16' if args.use_fp16 else 'FP32'}")
         print(f"-----------------------------\n")
     
     # Start training
