@@ -185,7 +185,7 @@ class MinLMTrainer:
             # Create config from arguments
             ds_config = self.create_deepspeed_config(
                 args.zero_stage, 
-                args.use_bf16, 
+                args.use_fp16, 
                 args.offload_optimizer,
                 args.offload_parameters,
                 self.learning_rate,
@@ -208,7 +208,7 @@ class MinLMTrainer:
             requires_grad = sum(1 for p in self.model.parameters() if p.requires_grad)
             print(f"DeepSpeed initialized with {param_count} parameters, {requires_grad} require grad")
     
-    def create_deepspeed_config(self, zero_stage, bf16, offload_optimizer, offload_parameters, learning_rate, depth=6):
+    def create_deepspeed_config(self, zero_stage, fp16, offload_optimizer, offload_parameters, learning_rate, depth=6):
         """Create DeepSpeed configuration"""
         config = {
             # Correctly set train_batch_size as the product of all components
@@ -247,7 +247,7 @@ class MinLMTrainer:
                 "round_robin_gradients": True
             },
             "fp16": {
-                "enabled": not bf16,  # Use FP16 when not using FP32
+                "enabled": not fp16,  # Use FP16 when not using FP32
                 "loss_scale": 0,
                 "loss_scale_window": 1000,
                 "hysteresis": 2,
