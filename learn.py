@@ -378,6 +378,62 @@ class MinLMTrainer:
         self.model.train()
         return {"val_loss": avg_val_loss, "bpb": avg_bpb}
     
+    def load_checkpoint(self, checkpoint_path):
+        """Load model and optimizer state from checkpoint"""
+        if self.global_rank == 0 and not self.silent_mode:
+            print(f"Loading checkpoint from {checkpoint_path}")
+        
+        # Check if this is a directory (DeepSpeed checkpoint) or file (PyTorch checkpoint)
+        if os.path.isdir(checkpoint_path):
+            # This is a DeepSpeed checkpoint directory
+            # DeepSpeed handles loading both model and optimizer state
+            success = self.model.load_checkpoint(checkpoint_path)
+            if not success:
+                raise ValueError(f"Failed to load DeepSpeed checkpoint from {checkpoint_path}")
+                
+            # Try to extract step from the checkpoint path or tag file
+            tag_file = os.path.join(checkpoint_path, "latest_tag")
+            if os.path.exists(tag_file):
+                with open(tag_file, 'r') as f:
+                    tag_content = f.read().strip()
+                    # Extract step if format is like "global_step{N}"
+                    if tag_content.startswith("global_step"):
+                        try:
+                            self.global_step = int(tag_content.split("global_step")[1])
+                        except (IndexError, ValueError):
+                            # If parsing fails, keep the current step
+                            pass
+        else:
+            # This is a vanilla PyTorch checkpoint file
+            # Load checkpoint on CPU first to avoid OOM issues
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            
+            # Load model state (DeepSpeed requires unwrapping the state_dict)
+            missing_keys, unexpected_keys = self.model.module.load_state_dict(
+                checkpoint['model_state_dict'], strict=False
+            )
+            
+            if missing_keys and self.global_rank == 0 and not self.silent_mode:
+                print(f"Warning: Missing keys in checkpoint: {missing_keys}")
+            if unexpected_keys and self.global_rank == 0 and not self.silent_mode:
+                print(f"Warning: Unexpected keys in checkpoint: {unexpected_keys}")
+            
+            # Set training state variables
+            self.global_step = checkpoint.get('step', 0)
+            self.global_tokens = torch.tensor(checkpoint.get('global_tokens', 0), dtype=torch.long)
+            self.val_loss = checkpoint.get('val_loss', float('inf'))
+            self.val_bpb = checkpoint.get('val_bpb', float('inf'))
+            self.best_val_loss = checkpoint.get('val_loss', float('inf'))
+            self.best_val_bpb = checkpoint.get('val_bpb', float('inf'))
+            
+            # Note: With DeepSpeed, we don't manually load optimizer state
+            # DeepSpeed will reinitialize the optimizer with our parameters
+        
+        if self.global_rank == 0 and not self.silent_mode:
+            print(f"✅ Checkpoint loaded. Resuming from step {self.global_step}")
+        
+        return self.global_step
+    
     def save_checkpoint(self, additional_info=None, is_periodic=False):
         """Save a checkpoint of the model"""
         if not self.checkpoint_dir or self.global_rank != 0:
@@ -452,7 +508,9 @@ class MinLMTrainer:
     
     def train(self, train_dataloader, val_dataloader, num_batches, validate_every, generate_every, val_batches=4):
         """Main training loop"""
-        self.start_time = time.time()
+        # Set start time if it's not already set (could be set when resuming)
+        if self.start_time is None:
+            self.start_time = time.time()
         
         # Create metrics log file
         if self.global_rank == 0 and self.checkpoint_dir:
@@ -709,6 +767,8 @@ def main():
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Train a minLM model with DeepSpeed")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint file to resume training from")
     parser.add_argument("--data", type=str, required=True,
                         help="Path to the training data file (e.g., 'data/enwik8.gz')")
     parser.add_argument("--gpus", type=str, default=None, 
@@ -1080,6 +1140,24 @@ def main():
         print(f"Parameter offload: {args.offload_parameters}")
         print(f"Precision: {args.precision.upper()}")
         print(f"-----------------------------\n")
+    
+    # Resume from checkpoint if specified
+    if args.resume:
+        # Load checkpoint
+        step_offset = trainer.load_checkpoint(args.resume)
+        
+        # Adjust remaining steps to account for already completed training
+        if args.steps is not None:
+            NUM_BATCHES = total_requested_steps - step_offset
+            if NUM_BATCHES <= 0:
+                if global_rank == 0:
+                    print(f"Warning: All {total_requested_steps} requested steps have already been completed.")
+                    print("Continuing with additional 1000 training steps.")
+                NUM_BATCHES = 1000
+        else:
+            # If steps not specified, just continue with default number of batches
+            if global_rank == 0:
+                print(f"Resuming training for {NUM_BATCHES} more steps")
     
     # Start training
     trainer.train(
