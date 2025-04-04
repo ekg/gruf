@@ -256,6 +256,10 @@ class MinLMTrainer:
             "bf16": {
                 "enabled": precision == "bf16"
             },
+            "torch_autocast": {
+                "enabled": precision == "bf16",
+                "dtype": "bfloat16"
+            },
             "zero_allow_untested_optimizer": True,
             "wall_clock_breakdown": False
         }
