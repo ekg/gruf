@@ -192,6 +192,7 @@ class MinLMTrainer:
                 args.offload_optimizer,
                 args.offload_parameters,
                 self.learning_rate,
+                args.gradient_clip,
                 MODEL_CONFIG["depth"]
             )
         
@@ -219,8 +220,11 @@ class MinLMTrainer:
             if "zero_optimization" in ds_config and "stage" in ds_config["zero_optimization"] and ds_config["zero_optimization"]["stage"] == 3:
                 ds_config["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = False
             
-            # Set gradient clipping for better stability with bf16
-            ds_config["gradient_clipping"] = 1.0
+            # Set gradient clipping for better stability with bf16 (if not already overridden)
+            if args.gradient_clip is None:
+                ds_config["gradient_clipping"] = 1.0
+            else:
+                ds_config["gradient_clipping"] = args.gradient_clip
                 
             if self.global_rank == 0:
                 print("Configured for BF16 training with FP32 gradient accumulation")
@@ -251,7 +255,7 @@ class MinLMTrainer:
                 has_fp32_accum = hasattr(self.model, 'accumulate_allreduce_grads_in_fp32') and self.model.accumulate_allreduce_grads_in_fp32
                 print(f"FP32 gradient accumulation enabled: {has_fp32_accum}")
     
-    def create_deepspeed_config(self, zero_stage, precision, offload_optimizer, offload_parameters, learning_rate, depth=6):
+    def create_deepspeed_config(self, zero_stage, precision, offload_optimizer, offload_parameters, learning_rate, gradient_clip=None, depth=6):
         """Create DeepSpeed configuration"""
         config = {
             # Correctly set train_batch_size as the product of all components
@@ -260,8 +264,8 @@ class MinLMTrainer:
             "gradient_accumulation_steps": self.grad_accum_steps,
             "steps_per_print": 500,  # Reduce logging frequency significantly
         
-            # Add gradient clipping to match PyTorch Lightning's default behavior
-            "gradient_clipping": 0.5,
+            # Add gradient clipping with appropriate defaults based on precision
+            "gradient_clipping": gradient_clip if gradient_clip is not None else (1.0 if precision == "bf16" else 0.5),
         
             "optimizer": {
                 "type": "Adam",  # Changed from AdamW to standard Adam to match Lightning's default
@@ -310,8 +314,9 @@ class MinLMTrainer:
             if zero_stage == 3:
                 config["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = False
             
-            # Set gradient clipping for better stability with bf16
-            config["gradient_clipping"] = 1.0
+            # Set gradient clipping for better stability with bf16 (if not already overridden)
+            if gradient_clip is None:
+                config["gradient_clipping"] = 1.0
             # Remove fp16 section to avoid confusion
             if "fp16" in config:
                 config.pop("fp16")
@@ -917,6 +922,8 @@ def main():
                         help="Offload optimizer states to CPU (reduces GPU memory)")
     parser.add_argument("--offload_parameters", action="store_true",
                         help="Offload parameters to CPU (for ZeRO-3)")
+    parser.add_argument("--gradient_clip", type=float, default=None,
+                        help="Gradient clipping value (default: 0.5 for fp32/fp16, 1.0 for bf16)")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="Local rank for distributed training (set by deepspeed launcher)")
     
@@ -1164,7 +1171,8 @@ def main():
                 "precision": args.precision,
                 "zero_stage": args.zero_stage,
                 "offload_optimizer": args.offload_optimizer,
-                "offload_parameters": args.offload_parameters
+                "offload_parameters": args.offload_parameters,
+                "gradient_clip": args.gradient_clip
             }
         }
         
@@ -1250,6 +1258,7 @@ def main():
         print(f"ZeRO Stage: {args.zero_stage}")
         print(f"Optimizer offload: {args.offload_optimizer}")
         print(f"Parameter offload: {args.offload_parameters}")
+        print(f"Gradient clipping: {args.gradient_clip if args.gradient_clip is not None else ('1.0' if args.precision == 'bf16' else '0.5')} (default for {args.precision})")
         print(f"Precision: {args.precision.upper()}")
         print(f"-----------------------------\n")
     
