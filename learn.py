@@ -1168,10 +1168,15 @@ def main():
         file_handler.setLevel(logging.INFO)
         ds_logger.addHandler(file_handler)
         
-        # Reduce console output - only show warnings and errors
+        # Reduce console output - only show warnings and errors for non-verbose mode
+        console_level = logging.INFO if args.verbose else logging.WARNING
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.WARNING)
+        console_handler.setLevel(console_level)
         ds_logger.addHandler(console_handler)
+        
+        # Add info about tensor parallelism
+        if args.tensor_parallel_size > 1:
+            ds_logger.info(f"Tensor Parallel training enabled with size: {args.tensor_parallel_size}")
         
         print(f"DeepSpeed logs will be written to: {log_file}")
         
