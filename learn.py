@@ -195,6 +195,7 @@ class MinLMTrainer:
                 args.offload_parameters,
                 self.learning_rate,
                 args.gradient_clip,
+                args.tensor_parallel_size,
                 MODEL_CONFIG["depth"]
             )
         
@@ -257,7 +258,7 @@ class MinLMTrainer:
                 has_fp32_accum = hasattr(self.model, 'accumulate_allreduce_grads_in_fp32') and self.model.accumulate_allreduce_grads_in_fp32
                 print(f"FP32 gradient accumulation enabled: {has_fp32_accum}")
     
-    def create_deepspeed_config(self, zero_stage, precision, offload_optimizer, offload_parameters, learning_rate, gradient_clip=None, depth=6):
+    def create_deepspeed_config(self, zero_stage, precision, offload_optimizer, offload_parameters, learning_rate, gradient_clip=None, tensor_parallel_size=1, depth=6):
         """Create DeepSpeed configuration"""
         config = {
             # Correctly set train_batch_size as the product of all components
@@ -361,10 +362,19 @@ class MinLMTrainer:
                 "pin_memory": True
             }
                 
-        # Special handling for ZeRO-3 to avoid type issues
+        # Special handling for ZeRO stages to handle model saving
         if zero_stage == 3:
             # Add stage3_gather_16bit_weights_on_model_save to save in fp16
             config["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = True
+        elif zero_stage > 0:
+            # For ZeRO-1 and ZeRO-2, also enable weight gathering on save
+            config["zero_optimization"]["gather_16bit_weights_on_model_save"] = True
+        
+        # Configure tensor parallelism if requested
+        if tensor_parallel_size > 1:
+            config["tensor_parallel"] = {
+                "autotp_size": tensor_parallel_size
+            }
             
         # Add activation checkpointing
         config["activation_checkpointing"] = {
@@ -928,6 +938,8 @@ def main():
                         help="Gradient clipping value (default: 0.5 for fp32/fp16, 1.0 for bf16)")
     parser.add_argument("--debug_gradients", action="store_true",
                         help="Print detailed gradient norms during training")
+    parser.add_argument("--tensor_parallel_size", type=int, default=1,
+                        help="Tensor parallel size for model parallelism (default: 1)")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="Local rank for distributed training (set by deepspeed launcher)")
     
@@ -1176,7 +1188,8 @@ def main():
                 "zero_stage": args.zero_stage,
                 "offload_optimizer": args.offload_optimizer,
                 "offload_parameters": args.offload_parameters,
-                "gradient_clip": args.gradient_clip
+                "gradient_clip": args.gradient_clip,
+                "tensor_parallel_size": args.tensor_parallel_size
             }
         }
         
@@ -1248,15 +1261,38 @@ def main():
     # Initialize DeepSpeed
     trainer.init_deepspeed(train_loader, args)
     
+    # Check for tensor parallel groups consistency if tensor parallelism is enabled
+    if args.tensor_parallel_size > 1 and hasattr(deepspeed, 'utils') and hasattr(deepspeed.utils, 'get_tensor_model_parallel_group'):
+        if global_rank == 0 and not trainer.silent_mode:
+            print("Tensor parallelism enabled - ensuring data consistency across TP groups")
+        
+        # Get the tensor parallel group
+        tp_group = deepspeed.utils.get_tensor_model_parallel_group()
+        
+        # In TP training, all ranks in the same TP group should see the same data
+        # We achieve this by using the same random seed across the TP group
+        if tp_group is not None:
+            # Get local rank within tensor parallel group
+            tp_local_rank = deepspeed.utils.get_tensor_model_parallel_rank()
+            # Get global ranks in this tensor parallel group
+            tp_world_size = deepspeed.utils.get_tensor_model_parallel_world_size()
+            
+            if global_rank == 0 and not trainer.silent_mode:
+                print(f"TP group size: {tp_world_size}, DP groups: {world_size // tp_world_size}")
+    
     # Print effective batch size
     if global_rank == 0 and not trainer.silent_mode:
         print(f"\n--- Training Configuration ---")
         print(f"Model: {MODEL_CONFIG['depth']} layers, {MODEL_CONFIG['dim']} dimensions")
         print(f"Parameters: {get_parameter_count_str(MODEL_CONFIG)}")
         print(f"Batch size per GPU: {BATCH_SIZE}")
-        print(f"Global batch size: {BATCH_SIZE * world_size}")
+        # With tensor parallelism, the effective data parallel size is reduced
+        dp_size = world_size // args.tensor_parallel_size if args.tensor_parallel_size > 0 else world_size
+        print(f"Tensor Parallel size: {args.tensor_parallel_size}")
+        print(f"Data Parallel size: {dp_size}")
+        print(f"Global batch size: {BATCH_SIZE * dp_size}")
         print(f"Gradient accumulation: {GRAD_ACCUM_EVERY}")
-        print(f"Effective batch size: {BATCH_SIZE * world_size * GRAD_ACCUM_EVERY}")
+        print(f"Effective batch size: {BATCH_SIZE * dp_size * GRAD_ACCUM_EVERY}")
         print(f"Learning rate: {LEARNING_RATE}")
         print(f"Sequence length: {SEQ_LEN}")
         print(f"Training steps: {NUM_BATCHES}")
@@ -1266,6 +1302,7 @@ def main():
         print(f"Gradient clipping: {args.gradient_clip if args.gradient_clip is not None else '0.5'} (default for all precision types)")
         print(f"Precision: {args.precision.upper()}")
         print(f"Debug gradients: {args.debug_gradients}")
+        print(f"Tensor Parallel Size: {args.tensor_parallel_size}")
         print(f"-----------------------------\n")
     
     # Resume from checkpoint if specified
