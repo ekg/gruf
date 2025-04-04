@@ -206,9 +206,16 @@ class MinLMTrainer:
             if "zero_optimization" in ds_config:
                 ds_config["zero_optimization"]["reduce_bucket_size"] = 5e8
                 ds_config["zero_optimization"]["allgather_bucket_size"] = 5e8
+                ds_config["zero_optimization"]["fp32_reduce_scatter"] = True
+                # Disable stage3_gather_16bit_weights_on_model_save for bf16
+                if "stage" in ds_config["zero_optimization"] and ds_config["zero_optimization"]["stage"] == 3:
+                    ds_config["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = False
+            
+            # Set gradient clipping for better stability with bf16
+            ds_config["gradient_clipping"] = 1.0
                 
             if self.global_rank == 0:
-                print("Configured for BF16 training with FP32 gradient accumulation")
+                print("Configured for BF16 training with FP32 gradient accumulation and reduce scatter")
         
         # Initialize DeepSpeed engine
         model_engine, optimizer, _, _ = deepspeed.initialize(
@@ -279,6 +286,12 @@ class MinLMTrainer:
                 # Critical: accumulate gradients in fp32 for bf16
                 "accumulate_grads_in_fp32": True
             }
+            # Critical: Ensure reduce scatter is done in fp32 for numerical stability
+            config["zero_optimization"]["fp32_reduce_scatter"] = True
+            # Important: Disable stage3_gather_16bit_weights_on_model_save for bf16
+            config["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = False
+            # Set gradient clipping for better stability with bf16
+            config["gradient_clipping"] = 1.0
             # Remove fp16 section to avoid confusion
             if "fp16" in config:
                 config.pop("fp16")
@@ -361,12 +374,17 @@ class MinLMTrainer:
         # Debug gradient info periodically (only for main process)
         if self.global_rank == 0 and self.global_step % 50 == 0:
             # Get gradient norm of a parameter to check training health
-            for name, param in list(self.model.named_parameters())[:3]:
+            total_norm = 0.0
+            for name, param in list(self.model.named_parameters())[:10]:
                 if param.grad is not None:
-                    grad_norm = torch.norm(param.grad)
-                    print(f"Step {self.global_step}, Parameter {name}, Grad norm: {grad_norm}, Data type: {param.dtype}")
+                    param_norm = torch.norm(param.grad.detach()).item()
+                    total_norm += param_norm ** 2
+                    print(f"Step {self.global_step}, Parameter {name}, Grad norm: {param_norm:.6f}, Data type: {param.dtype}")
                 else:
                     print(f"Step {self.global_step}, Parameter {name} has None gradient")
+            
+            total_norm = total_norm ** 0.5
+            print(f"Step {self.global_step}, Total gradient norm: {total_norm:.6f}")
         
         self.model.step()
         
