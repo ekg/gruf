@@ -195,26 +195,38 @@ class MinLMTrainer:
                 MODEL_CONFIG["depth"]
             )
         
-        # Ensure proper dtype handling for bf16
+        # CRITICAL FIX FOR BF16 + ZERO
         if args.precision == "bf16":
             # Ensure bf16 section exists and has proper settings
             ds_config.setdefault("bf16", {})
             ds_config["bf16"]["enabled"] = True
             ds_config["bf16"]["accumulate_grads_in_fp32"] = True
             
-            # Ensure proper bucket sizes for bf16
-            if "zero_optimization" in ds_config:
-                ds_config["zero_optimization"]["reduce_bucket_size"] = 5e8
-                ds_config["zero_optimization"]["allgather_bucket_size"] = 5e8
-                # Disable stage3_gather_16bit_weights_on_model_save for bf16
-                if "stage" in ds_config["zero_optimization"] and ds_config["zero_optimization"]["stage"] == 3:
-                    ds_config["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = False
+            # Critical setting from Domino code
+            setattr(self.model, 'accumulate_allreduce_grads_in_fp32', True)
+            
+            # Force all parameters to have this attribute
+            for param in self.model.parameters():
+                setattr(param, 'accumulate_grads_in_fp32', True)
+            
+            # Configure ZeRO-1 specific options
+            if args.zero_stage == 1:
+                ds_config.setdefault("zero_optimization", {})
+                ds_config["zero_optimization"]["fp32_reduce_scatter"] = True
+                ds_config["zero_optimization"]["accumulate_allreduce_grads_in_fp32"] = True
+                ds_config["zero_optimization"]["reduce_bucket_size"] = 2e8
+                ds_config["zero_optimization"]["allgather_bucket_size"] = 2e8
+            
+            # Disable stage3_gather_16bit_weights_on_model_save for bf16
+            if "zero_optimization" in ds_config and "stage" in ds_config["zero_optimization"] and ds_config["zero_optimization"]["stage"] == 3:
+                ds_config["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = False
             
             # Set gradient clipping for better stability with bf16
             ds_config["gradient_clipping"] = 1.0
                 
             if self.global_rank == 0:
                 print("Configured for BF16 training with FP32 gradient accumulation")
+                print(f"accumulate_allreduce_grads_in_fp32: {hasattr(self.model, 'accumulate_allreduce_grads_in_fp32')}")
         
         # Initialize DeepSpeed engine
         model_engine, optimizer, _, _ = deepspeed.initialize(
@@ -235,6 +247,11 @@ class MinLMTrainer:
             # Debug: print info about model's dtype
             for name, param in list(self.model.named_parameters())[:3]:  # Just the first few
                 print(f"Parameter {name} dtype: {param.dtype}")
+            
+            # Debug BF16 settings
+            if args.precision == "bf16":
+                has_fp32_accum = hasattr(self.model, 'accumulate_allreduce_grads_in_fp32') and self.model.accumulate_allreduce_grads_in_fp32
+                print(f"FP32 gradient accumulation enabled: {has_fp32_accum}")
     
     def create_deepspeed_config(self, zero_stage, precision, offload_optimizer, offload_parameters, learning_rate, depth=6):
         """Create DeepSpeed configuration"""
@@ -285,8 +302,19 @@ class MinLMTrainer:
                 # Critical: accumulate gradients in fp32 for bf16
                 "accumulate_grads_in_fp32": True
             }
+            
+            # Critical: Add parameters for ZeRO-1 with bf16
+            if zero_stage == 1:
+                config["zero_optimization"]["fp32_reduce_scatter"] = True
+                config["zero_optimization"]["accumulate_allreduce_grads_in_fp32"] = True
+                # For ZeRO-1, you need smaller buckets to avoid OOM
+                config["zero_optimization"]["reduce_bucket_size"] = 2e8
+                config["zero_optimization"]["allgather_bucket_size"] = 2e8
+            
             # Important: Disable stage3_gather_16bit_weights_on_model_save for bf16
-            config["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = False
+            if zero_stage == 3:
+                config["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = False
+            
             # Set gradient clipping for better stability with bf16
             config["gradient_clipping"] = 1.0
             # Remove fp16 section to avoid confusion
