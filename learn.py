@@ -131,7 +131,8 @@ class MinLMTrainer:
         checkpoint_dir=None,
         world_size=1,
         global_rank=0,
-        silent_mode=True
+        silent_mode=True,
+        debug_gradients=False
     ):
         self.learning_rate = learning_rate
         self.model = minLM(
@@ -160,8 +161,9 @@ class MinLMTrainer:
         self.world_size = world_size
         self.global_rank = global_rank
         
-        # Store silent mode setting
+        # Store settings
         self.silent_mode = silent_mode
+        self.debug_gradients = debug_gradients
         
         # Initialize metric tracking
         self.train_loss = 0.0
@@ -396,8 +398,8 @@ class MinLMTrainer:
         # Update step - DeepSpeed handles gradient accumulation internally
         self.model.backward(loss)
         
-        # Debug gradient info periodically (only for main process)
-        if self.global_rank == 0 and self.global_step % 50 == 0:
+        # Debug gradient info periodically (only when enabled and on main process)
+        if self.debug_gradients and self.global_rank == 0 and self.global_step % 50 == 0:
             # Get gradient norm of a parameter to check training health
             total_norm = 0.0
             for name, param in list(self.model.named_parameters())[:10]:
@@ -1234,7 +1236,8 @@ def main():
         checkpoint_dir=checkpoint_dir,
         world_size=world_size,
         global_rank=global_rank,
-        silent_mode=not args.verbose
+        silent_mode=not args.verbose,
+        debug_gradients=args.debug_gradients
     )
     
     # Store val_dataset for text generation
@@ -1260,6 +1263,7 @@ def main():
         print(f"Parameter offload: {args.offload_parameters}")
         print(f"Gradient clipping: {args.gradient_clip if args.gradient_clip is not None else '0.5'} (default for all precision types)")
         print(f"Precision: {args.precision.upper()}")
+        print(f"Debug gradients: {args.debug_gradients}")
         print(f"-----------------------------\n")
     
     # Resume from checkpoint if specified
