@@ -220,9 +220,9 @@ class MinLMTrainer:
             if "zero_optimization" in ds_config and "stage" in ds_config["zero_optimization"] and ds_config["zero_optimization"]["stage"] == 3:
                 ds_config["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = False
             
-            # Set gradient clipping for better stability with bf16 (if not already overridden)
+            # Set gradient clipping to default 0.5 (if not already overridden)
             if args.gradient_clip is None:
-                ds_config["gradient_clipping"] = 1.0
+                ds_config["gradient_clipping"] = 0.5
             else:
                 ds_config["gradient_clipping"] = args.gradient_clip
                 
@@ -264,8 +264,8 @@ class MinLMTrainer:
             "gradient_accumulation_steps": self.grad_accum_steps,
             "steps_per_print": 500,  # Reduce logging frequency significantly
         
-            # Add gradient clipping with appropriate defaults based on precision
-            "gradient_clipping": gradient_clip if gradient_clip is not None else (1.0 if precision == "bf16" else 0.5),
+            # Add gradient clipping with default value 0.5 for all precision types
+            "gradient_clipping": gradient_clip if gradient_clip is not None else 0.5,
         
             "optimizer": {
                 "type": "Adam",  # Changed from AdamW to standard Adam to match Lightning's default
@@ -314,9 +314,9 @@ class MinLMTrainer:
             if zero_stage == 3:
                 config["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = False
             
-            # Set gradient clipping for better stability with bf16 (if not already overridden)
+            # Set gradient clipping to default 0.5 (if not already overridden)
             if gradient_clip is None:
-                config["gradient_clipping"] = 1.0
+                config["gradient_clipping"] = 0.5
             # Remove fp16 section to avoid confusion
             if "fp16" in config:
                 config.pop("fp16")
@@ -1258,7 +1258,7 @@ def main():
         print(f"ZeRO Stage: {args.zero_stage}")
         print(f"Optimizer offload: {args.offload_optimizer}")
         print(f"Parameter offload: {args.offload_parameters}")
-        print(f"Gradient clipping: {args.gradient_clip if args.gradient_clip is not None else ('1.0' if args.precision == 'bf16' else '0.5')} (default for {args.precision})")
+        print(f"Gradient clipping: {args.gradient_clip if args.gradient_clip is not None else '0.5'} (default for all precision types)")
         print(f"Precision: {args.precision.upper()}")
         print(f"-----------------------------\n")
     
