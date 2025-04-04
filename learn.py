@@ -935,7 +935,7 @@ def main():
     parser.add_argument("--offload_parameters", action="store_true",
                         help="Offload parameters to CPU (for ZeRO-3)")
     parser.add_argument("--gradient_clip", type=float, default=None,
-                        help="Gradient clipping value (default: 0.5 for fp32/fp16, 1.0 for bf16)")
+                        help="Gradient clipping value (default: 0.5 for all precision types)")
     parser.add_argument("--debug_gradients", action="store_true",
                         help="Print detailed gradient norms during training")
     parser.add_argument("--tensor_parallel_size", type=int, default=1,
