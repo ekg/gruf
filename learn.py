@@ -206,7 +206,6 @@ class MinLMTrainer:
             if "zero_optimization" in ds_config:
                 ds_config["zero_optimization"]["reduce_bucket_size"] = 5e8
                 ds_config["zero_optimization"]["allgather_bucket_size"] = 5e8
-                ds_config["zero_optimization"]["fp32_reduce_scatter"] = True
                 # Disable stage3_gather_16bit_weights_on_model_save for bf16
                 if "stage" in ds_config["zero_optimization"] and ds_config["zero_optimization"]["stage"] == 3:
                     ds_config["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = False
@@ -215,7 +214,7 @@ class MinLMTrainer:
             ds_config["gradient_clipping"] = 1.0
                 
             if self.global_rank == 0:
-                print("Configured for BF16 training with FP32 gradient accumulation and reduce scatter")
+                print("Configured for BF16 training with FP32 gradient accumulation")
         
         # Initialize DeepSpeed engine
         model_engine, optimizer, _, _ = deepspeed.initialize(
@@ -286,8 +285,6 @@ class MinLMTrainer:
                 # Critical: accumulate gradients in fp32 for bf16
                 "accumulate_grads_in_fp32": True
             }
-            # Critical: Ensure reduce scatter is done in fp32 for numerical stability
-            config["zero_optimization"]["fp32_reduce_scatter"] = True
             # Important: Disable stage3_gather_16bit_weights_on_model_save for bf16
             config["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = False
             # Set gradient clipping for better stability with bf16
