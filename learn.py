@@ -212,8 +212,6 @@ class MinLMTrainer:
             # Configure ZeRO-1 specific options
             if args.zero_stage == 1:
                 ds_config.setdefault("zero_optimization", {})
-                ds_config["zero_optimization"]["fp32_reduce_scatter"] = True
-                ds_config["zero_optimization"]["accumulate_allreduce_grads_in_fp32"] = True
                 ds_config["zero_optimization"]["reduce_bucket_size"] = 2e8
                 ds_config["zero_optimization"]["allgather_bucket_size"] = 2e8
             
@@ -303,11 +301,8 @@ class MinLMTrainer:
                 "accumulate_grads_in_fp32": True
             }
             
-            # Critical: Add parameters for ZeRO-1 with bf16
+            # For ZeRO-1, you need smaller buckets to avoid OOM
             if zero_stage == 1:
-                config["zero_optimization"]["fp32_reduce_scatter"] = True
-                config["zero_optimization"]["accumulate_allreduce_grads_in_fp32"] = True
-                # For ZeRO-1, you need smaller buckets to avoid OOM
                 config["zero_optimization"]["reduce_bucket_size"] = 2e8
                 config["zero_optimization"]["allgather_bucket_size"] = 2e8
             
