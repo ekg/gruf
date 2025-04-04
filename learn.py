@@ -224,8 +224,11 @@ class MinLMTrainer:
                 ds_config["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = False
             
             # Set gradient clipping to default 0.5 (if not already overridden)
+            # Or disable it when explicitly set to 0
             if args.gradient_clip is None:
                 ds_config["gradient_clipping"] = 0.5
+            elif args.gradient_clip == 0:
+                ds_config["gradient_clipping"] = 0  # Explicitly disable gradient clipping
             else:
                 ds_config["gradient_clipping"] = args.gradient_clip
                 
@@ -268,7 +271,8 @@ class MinLMTrainer:
             "steps_per_print": 500,  # Reduce logging frequency significantly
         
             # Add gradient clipping with default value 0.5 for all precision types
-            "gradient_clipping": gradient_clip if gradient_clip is not None else 0.5,
+            # Disable gradient clipping when explicitly set to 0
+            "gradient_clipping": 0.5 if gradient_clip is None else (gradient_clip if gradient_clip > 0 else 0),
         
             "optimizer": {
                 "type": "Adam",  # Changed from AdamW to standard Adam to match Lightning's default
@@ -318,8 +322,11 @@ class MinLMTrainer:
                 config["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = False
             
             # Set gradient clipping to default 0.5 (if not already overridden)
+            # Or disable it when explicitly set to 0
             if gradient_clip is None:
                 config["gradient_clipping"] = 0.5
+            elif gradient_clip == 0:
+                config["gradient_clipping"] = 0  # Explicitly disable gradient clipping
             # Remove fp16 section to avoid confusion
             if "fp16" in config:
                 config.pop("fp16")
@@ -935,7 +942,7 @@ def main():
     parser.add_argument("--offload_parameters", action="store_true",
                         help="Offload parameters to CPU (for ZeRO-3)")
     parser.add_argument("--gradient_clip", type=float, default=None,
-                        help="Gradient clipping value (default: 0.5 for all precision types)")
+                        help="Gradient clipping value (default: 0.5 for all precision types, 0 to disable)")
     parser.add_argument("--debug_gradients", action="store_true",
                         help="Print detailed gradient norms during training")
     parser.add_argument("--tensor_parallel_size", type=int, default=1,
