@@ -16,6 +16,9 @@ from torch.utils.data import DataLoader, Dataset
 import deepspeed
 from tqdm import tqdm
 
+# Set higher precision for float32 matrix multiplication
+torch.set_float32_matmul_precision('high')
+
 # Import the minLM model
 from minGRU_pytorch.minLM import minLM
 
@@ -192,6 +195,21 @@ class MinLMTrainer:
                 MODEL_CONFIG["depth"]
             )
         
+        # Ensure proper dtype handling for bf16
+        if args.precision == "bf16":
+            # Ensure bf16 section exists and has proper settings
+            ds_config.setdefault("bf16", {})
+            ds_config["bf16"]["enabled"] = True
+            ds_config["bf16"]["accumulate_grads_in_fp32"] = True
+            
+            # Ensure proper bucket sizes for bf16
+            if "zero_optimization" in ds_config:
+                ds_config["zero_optimization"]["reduce_bucket_size"] = 5e8
+                ds_config["zero_optimization"]["allgather_bucket_size"] = 5e8
+                
+            if self.global_rank == 0:
+                print("Configured for BF16 training with FP32 gradient accumulation")
+        
         # Initialize DeepSpeed engine
         model_engine, optimizer, _, _ = deepspeed.initialize(
             model=self.model,
@@ -207,6 +225,10 @@ class MinLMTrainer:
             param_count = sum(1 for p in self.model.parameters())
             requires_grad = sum(1 for p in self.model.parameters() if p.requires_grad)
             print(f"DeepSpeed initialized with {param_count} parameters, {requires_grad} require grad")
+            
+            # Debug: print info about model's dtype
+            for name, param in list(self.model.named_parameters())[:3]:  # Just the first few
+                print(f"Parameter {name} dtype: {param.dtype}")
     
     def create_deepspeed_config(self, zero_stage, precision, offload_optimizer, offload_parameters, learning_rate, depth=6):
         """Create DeepSpeed configuration"""
@@ -242,27 +264,47 @@ class MinLMTrainer:
                 "contiguous_gradients": True,
                 "overlap_comm": True,
                 "reduce_scatter": True,
-                "reduce_bucket_size": 2e8,
-                "allgather_bucket_size": 2e8,
+                "reduce_bucket_size": 5e8,  # Increased for better bf16 performance
+                "allgather_bucket_size": 5e8,  # Increased for better bf16 performance
                 "round_robin_gradients": True
-            },
-            "fp16": {
-                "enabled": precision == "fp16",
-                "loss_scale": 0,
-                "loss_scale_window": 1000,
-                "hysteresis": 2,
-                "min_loss_scale": 1
-            },
-            "bf16": {
-                "enabled": precision == "bf16"
-            },
-            "torch_autocast": {
-                "enabled": precision == "bf16",
-                "dtype": "bfloat16"
             },
             "zero_allow_untested_optimizer": True,
             "wall_clock_breakdown": False
         }
+        
+        # Configure precision settings properly
+        if precision == "bf16":
+            config["bf16"] = {
+                "enabled": True,
+                # Critical: accumulate gradients in fp32 for bf16
+                "accumulate_grads_in_fp32": True
+            }
+            # Remove fp16 section to avoid confusion
+            if "fp16" in config:
+                config.pop("fp16")
+            # Disable torch_autocast to use DeepSpeed's native bf16
+            config["torch_autocast"] = {
+                "enabled": False
+            }
+        elif precision == "fp16":
+            config["fp16"] = {
+                "enabled": True,
+                "loss_scale": 0,
+                "loss_scale_window": 1000,
+                "hysteresis": 2,
+                "min_loss_scale": 1
+            }
+            # Remove bf16 section to avoid confusion
+            if "bf16" in config:
+                config.pop("bf16")
+        else:
+            # fp32 mode - remove both mixed precision sections
+            if "fp16" in config:
+                config.pop("fp16")
+            if "bf16" in config:
+                config.pop("bf16")
+            if "torch_autocast" in config:
+                config.pop("torch_autocast")
         
         # Add CPU offloading if requested (for ZeRO-2 and ZeRO-3)
         if zero_stage >= 2 and offload_optimizer:
@@ -315,6 +357,17 @@ class MinLMTrainer:
         
         # Update step - DeepSpeed handles gradient accumulation internally
         self.model.backward(loss)
+        
+        # Debug gradient info periodically (only for main process)
+        if self.global_rank == 0 and self.global_step % 50 == 0:
+            # Get gradient norm of a parameter to check training health
+            for name, param in list(self.model.named_parameters())[:3]:
+                if param.grad is not None:
+                    grad_norm = torch.norm(param.grad)
+                    print(f"Step {self.global_step}, Parameter {name}, Grad norm: {grad_norm}, Data type: {param.dtype}")
+                else:
+                    print(f"Step {self.global_step}, Parameter {name} has None gradient")
+        
         self.model.step()
         
         # Track loss
@@ -769,6 +822,9 @@ def main():
     global LEARNING_RATE
     global NUM_BATCHES
     
+    # Set TensorFloat32 precision mode at the beginning of training
+    torch.set_float32_matmul_precision('high')
+    
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Train a minLM model with DeepSpeed")
     parser.add_argument("--resume", type=str, default=None,
@@ -980,6 +1036,20 @@ def main():
     # Update model config with the calculated values
     MODEL_CONFIG["dim"] = dim
     MODEL_CONFIG["depth"] = depth
+    
+    # Check if BF16 is supported when requested
+    if args.precision == "bf16" and torch.cuda.is_available():
+        if global_rank == 0:
+            print("Checking BF16 support for optimal training...")
+        
+        # Check if BF16 is supported
+        if not torch.cuda.is_bf16_supported():
+            if global_rank == 0:
+                print("WARNING: BF16 is not supported on this device! Falling back to FP32.")
+            args.precision = "fp32"
+        else:
+            if global_rank == 0:
+                print("BF16 support confirmed!")
     
     # Create datasets and dataloaders
     if global_rank == 0:
