@@ -236,6 +236,14 @@ class MinLMTrainer:
                 print("Configured for BF16 training with FP32 gradient accumulation")
                 print(f"accumulate_allreduce_grads_in_fp32: {hasattr(self.model, 'accumulate_allreduce_grads_in_fp32')}")
         
+        # Log the precision config
+        if self.global_rank == 0 and not self.silent_mode:
+            print(f"\nUsing precision: {args.precision}")
+            if args.precision == "fp32":
+                print("Explicitly configured for FP32 training")
+                if "fp32" in ds_config:
+                    print(f"FP32 config: {ds_config['fp32']}")
+    
         # Initialize DeepSpeed engine
         model_engine, optimizer, _, _ = deepspeed.initialize(
             model=self.model,
@@ -353,6 +361,15 @@ class MinLMTrainer:
                 config.pop("bf16")
             if "torch_autocast" in config:
                 config.pop("torch_autocast")
+            
+            # Explicitly configure for fp32
+            config["fp32"] = {
+                "enabled": True
+            }
+        
+            # Ensure we're not using tensor parallelism configs that might default to fp16
+            if "tensor_parallel" in config:
+                config["tensor_parallel"]["tp_dtype"] = "fp32"
         
         # Add CPU offloading if requested (for ZeRO-2 and ZeRO-3)
         if zero_stage >= 2 and offload_optimizer:
