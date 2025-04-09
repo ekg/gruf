@@ -269,6 +269,72 @@ class MinLMTrainer:
                 has_fp32_accum = hasattr(self.model, 'accumulate_allreduce_grads_in_fp32') and self.model.accumulate_allreduce_grads_in_fp32
                 print(f"FP32 gradient accumulation enabled: {has_fp32_accum}")
     
+    def _create_scheduler_config(self, scheduler_type, max_lr, min_lr, warmup_steps, 
+                                total_steps, decay_rate, cycle_first_step_size, 
+                                decay_step_size, decay_lr_rate):
+        """Create scheduler configuration based on the selected type"""
+        if scheduler_type == "warmup":
+            return {
+                "type": "WarmupLR",
+                "params": {
+                    "warmup_min_lr": min_lr,
+                    "warmup_max_lr": max_lr,
+                    "warmup_num_steps": warmup_steps
+                }
+            }
+        elif scheduler_type == "warmup_decay":
+            return {
+                "type": "WarmupDecayLR",
+                "params": {
+                    "warmup_min_lr": min_lr,
+                    "warmup_max_lr": max_lr,
+                    "warmup_num_steps": warmup_steps,
+                    "total_num_steps": total_steps,
+                    "decay_rate": decay_rate  # Final LR = max_lr * decay_rate
+                }
+            }
+        elif scheduler_type == "one_cycle":
+            return {
+                "type": "OneCycle",
+                "params": {
+                    "cycle_min_lr": min_lr,
+                    "cycle_max_lr": max_lr,
+                    "cycle_first_step_size": cycle_first_step_size,
+                    "decay_step_size": decay_step_size,
+                    "decay_lr_rate": decay_lr_rate
+                }
+            }
+        elif scheduler_type == "cosine":
+            return {
+                "type": "WarmupCosineLR",
+                "params": {
+                    "warmup_min_lr": min_lr,
+                    "warmup_max_lr": max_lr,
+                    "warmup_num_steps": warmup_steps,
+                    "total_num_steps": total_steps
+                }
+            }
+        elif scheduler_type == "constant":
+            return {
+                "type": "WarmupLR",
+                "params": {
+                    "warmup_min_lr": max_lr,  # No actual warmup, just constant LR
+                    "warmup_max_lr": max_lr,
+                    "warmup_num_steps": 1
+                }
+            }
+        else:
+            # Default to WarmupLR if an invalid type is specified
+            print(f"WARNING: Unknown scheduler type '{scheduler_type}', using default WarmupLR")
+            return {
+                "type": "WarmupLR",
+                "params": {
+                    "warmup_min_lr": min_lr,
+                    "warmup_max_lr": max_lr,
+                    "warmup_num_steps": warmup_steps
+                }
+            }
+            
     def create_deepspeed_config(self, zero_stage, precision, offload_optimizer, offload_parameters, learning_rate, gradient_clip=None, tensor_parallel_size=1, depth=6):
         """Create DeepSpeed configuration"""
         config = {
@@ -291,14 +357,17 @@ class MinLMTrainer:
                     # Removed weight_decay to match standard Adam in Lightning
                 }
             },
-            "scheduler": {
-                "type": "WarmupLR",
-                "params": {
-                    "warmup_min_lr": 0,
-                    "warmup_max_lr": learning_rate,
-                    "warmup_num_steps": 1000
-                }
-            },
+            "scheduler": self._create_scheduler_config(
+                args.lr_scheduler,
+                learning_rate,
+                args.min_lr,
+                args.warmup_steps,
+                NUM_BATCHES,
+                args.decay_rate,
+                args.cycle_first_step_size,
+                args.decay_step_size,
+                args.decay_lr_rate
+            ),
             "zero_optimization": {
                 "stage": zero_stage,
                 "contiguous_gradients": True,
@@ -470,6 +539,12 @@ class MinLMTrainer:
         
         # Track step
         self.global_step += 1
+        
+        # Log learning rate occasionally
+        if self.global_rank == 0 and self.global_step % 100 == 0:
+            current_lr = self.optimizer.param_groups[0]['lr']
+            if not self.silent_mode:
+                print(f"Step {self.global_step}: Current LR = {current_lr:.6f}")
         
         return loss_val
         
@@ -655,7 +730,7 @@ class MinLMTrainer:
                 header = [
                     "step", "time", "tokens_processed", 
                     "tokens_per_sec", "train_loss", "val_loss", "bpb",
-                    "learning_rate", "batch_size", "grad_accum"
+                    "current_lr", "batch_size", "grad_accum"
                 ]
                 f.write('\t'.join(header) + '\n')
         
@@ -769,6 +844,9 @@ class MinLMTrainer:
                 global_tokens = self.global_tokens.item()
                 tokens_per_sec = global_tokens / elapsed if elapsed > 0 else 0
                 
+                # Get current learning rate
+                current_lr = self.optimizer.param_groups[0]['lr']
+                
                 # Prepare values
                 values = [
                     str(self.global_step),
@@ -778,7 +856,7 @@ class MinLMTrainer:
                     f"{self.train_loss:.6f}",
                     str(self.val_loss if is_validation else "NA"),
                     str(self.val_bpb if is_validation else "NA"),
-                    str(self.learning_rate),
+                    f"{current_lr:.8f}",  # Use actual current LR, not initial LR
                     str(BATCH_SIZE),
                     str(self.grad_accum_steps)
                 ]
@@ -940,6 +1018,23 @@ def main():
                         help=f"Total training steps (default: {TRAINING_CONFIG['num_batches']}). Can use k suffix.")
     parser.add_argument("--output", type=str, default=None,
                         help="Directory to save checkpoints (default: auto-generated name)")
+    
+    # Learning rate scheduler parameters
+    parser.add_argument("--lr_scheduler", type=str, default="warmup",
+                        choices=["warmup", "warmup_decay", "one_cycle", "cosine", "constant"],
+                        help="Learning rate scheduler type (default: warmup)")
+    parser.add_argument("--warmup_steps", type=int, default=1000,
+                        help="Number of warmup steps (default: 1000)")
+    parser.add_argument("--min_lr", type=float, default=0.0,
+                        help="Minimum learning rate for schedulers (default: 0.0)")
+    parser.add_argument("--decay_rate", type=float, default=0.01,
+                        help="Final LR = max_lr * decay_rate (for warmup_decay, default: 0.01)")
+    parser.add_argument("--cycle_first_step_size", type=int, default=2000,
+                        help="First cycle step size for OneCycle scheduler (default: 2000)")
+    parser.add_argument("--decay_step_size", type=int, default=2000,
+                        help="Decay step size for OneCycle scheduler (default: 2000)")
+    parser.add_argument("--decay_lr_rate", type=float, default=0.9,
+                        help="Decay rate per step for OneCycle scheduler (default: 0.9)")
     # Precision options
     precision_group = parser.add_mutually_exclusive_group()
     precision_group.add_argument("--bf16", dest="precision", action="store_const", const="bf16", default="bf16",
@@ -1218,7 +1313,11 @@ def main():
                 "offload_optimizer": args.offload_optimizer,
                 "offload_parameters": args.offload_parameters,
                 "gradient_clip": args.gradient_clip,
-                "tensor_parallel_size": args.tensor_parallel_size
+                "tensor_parallel_size": args.tensor_parallel_size,
+                "lr_scheduler": args.lr_scheduler,
+                "warmup_steps": args.warmup_steps,
+                "min_lr": args.min_lr,
+                "decay_rate": args.decay_rate
             }
         }
         
@@ -1231,7 +1330,7 @@ def main():
             header = [
                 "step", "time", "tokens_processed", 
                 "tokens_per_sec", "train_loss", "val_loss", "bpb",
-                "learning_rate", "batch_size", "grad_accum"
+                "current_lr", "batch_size", "grad_accum"
             ]
             f.write('\t'.join(header) + '\n')
     else:
@@ -1323,6 +1422,8 @@ def main():
         print(f"Gradient accumulation: {GRAD_ACCUM_EVERY}")
         print(f"Effective batch size: {BATCH_SIZE * dp_size * GRAD_ACCUM_EVERY}")
         print(f"Learning rate: {LEARNING_RATE}")
+        print(f"LR Scheduler: {args.lr_scheduler}")
+        print(f"Warmup steps: {args.warmup_steps}")
         print(f"Sequence length: {SEQ_LEN}")
         print(f"Training steps: {NUM_BATCHES}")
         print(f"ZeRO Stage: {args.zero_stage}")
