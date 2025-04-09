@@ -196,7 +196,8 @@ class MinLMTrainer:
                 self.learning_rate,
                 args.gradient_clip,
                 args.tensor_parallel_size,
-                MODEL_CONFIG["depth"]
+                MODEL_CONFIG["depth"],
+                args
             )
         
         # CRITICAL FIX FOR BF16 + ZERO
@@ -335,7 +336,7 @@ class MinLMTrainer:
                 }
             }
             
-    def create_deepspeed_config(self, zero_stage, precision, offload_optimizer, offload_parameters, learning_rate, gradient_clip=None, tensor_parallel_size=1, depth=6):
+    def create_deepspeed_config(self, zero_stage, precision, offload_optimizer, offload_parameters, learning_rate, gradient_clip=None, tensor_parallel_size=1, depth=6, args=None):
         """Create DeepSpeed configuration"""
         config = {
             # Correctly set train_batch_size as the product of all components
