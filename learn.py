@@ -338,10 +338,11 @@ class MinLMTrainer:
             return {
                 "type": "WarmupCosineLR",
                 "params": {
-                    "initial_lr": min_lr,
-                    "max_lr": max_lr,
+                    "warmup_min_ratio": min_lr / max_lr,  # Ratio of min to max LR during warmup
                     "warmup_num_steps": warmup_steps,
-                    "total_num_steps": total_steps
+                    "total_num_steps": total_steps,
+                    "cos_min_ratio": min_lr / max_lr,  # Final min ratio for cosine schedule
+                    "warmup_type": "linear"
                 }
             }
         elif scheduler_type == "constant":
