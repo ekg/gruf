@@ -338,8 +338,8 @@ class MinLMTrainer:
             return {
                 "type": "WarmupCosineLR",
                 "params": {
-                    "warmup_min_lr": min_lr,
-                    "warmup_max_lr": max_lr,
+                    "initial_lr": min_lr,
+                    "max_lr": max_lr,
                     "warmup_num_steps": warmup_steps,
                     "total_num_steps": total_steps
                 }
