@@ -81,8 +81,8 @@ python generate.py --model checkpoints/best.pt --temperature 0.7 --top_k 0.95
 # Generate longer text samples
 python generate.py --model checkpoints/best.pt --generation_length 1024
 
-# Use memory-efficient generation for large models
-python generate.py --model checkpoints/best.pt --memory_efficient
+# Generate text in smaller chunks for larger models
+python generate.py --model checkpoints/best.pt --chunk_length 32
 ```
 
 ## Citation
