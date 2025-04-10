@@ -13,7 +13,14 @@ import mmap
 import datetime
 import json
 import shutil
-from matplotlib import pyplot as plt
+
+# Make matplotlib optional
+try:
+    from matplotlib import pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    print("Warning: matplotlib not available. Plotting features will be disabled.")
 from torch.utils.data import DataLoader, Dataset
 import deepspeed
 from tqdm import tqdm
@@ -1644,33 +1651,44 @@ def main():
             print(f"\nLearning rate finder results saved to: {results_path}")
             print(f"Suggested learning rate: {suggested_lr:.8f}")
             
-            # Create the plot
-            try:
-                plt.figure(figsize=(10, 6))
-                plt.plot(log_lrs, losses)
-                plt.xlabel("log10(Learning Rate)")
-                plt.ylabel("Loss")
-                plt.title("Learning Rate Finder Results")
-                plt.grid(True)
-                
-                # Mark the suggested learning rate
+            # Create the plot if matplotlib is available
+            if MATPLOTLIB_AVAILABLE:
                 try:
-                    # Find the index that's closest to the suggested lr * 10 (pre-division for safety)
-                    suggested_log = math.log10(suggested_lr * 10)
-                    closest_idx = min(range(len(log_lrs)), key=lambda i: abs(log_lrs[i] - suggested_log))
+                    plt.figure(figsize=(10, 6))
+                    plt.plot(log_lrs, losses)
+                    plt.xlabel("log10(Learning Rate)")
+                    plt.ylabel("Loss")
+                    plt.title("Learning Rate Finder Results")
+                    plt.grid(True)
                     
-                    # Mark both the min gradient point and the suggested (safer) learning rate
-                    plt.axvline(x=log_lrs[closest_idx], color='r', linestyle='--', label='Min Gradient LR')
-                    plt.axvline(x=math.log10(suggested_lr), color='g', linestyle='--', label='Suggested LR')
-                    plt.legend()
+                    # Mark the suggested learning rate
+                    try:
+                        # Find the index that's closest to the suggested lr * 10 (pre-division for safety)
+                        suggested_log = math.log10(suggested_lr * 10)
+                        closest_idx = min(range(len(log_lrs)), key=lambda i: abs(log_lrs[i] - suggested_log))
+                        
+                        # Mark both the min gradient point and the suggested (safer) learning rate
+                        plt.axvline(x=log_lrs[closest_idx], color='r', linestyle='--', label='Min Gradient LR')
+                        plt.axvline(x=math.log10(suggested_lr), color='g', linestyle='--', label='Suggested LR')
+                        plt.legend()
+                    except Exception as e:
+                        print(f"Error marking suggested learning rate on plot: {e}")
+                    
+                    plot_path = os.path.join(checkpoint_dir, "lr_finder_plot.png")
+                    plt.savefig(plot_path)
+                    print(f"Plot saved to: {plot_path}")
                 except Exception as e:
-                    print(f"Error marking suggested learning rate on plot: {e}")
-                
-                plot_path = os.path.join(checkpoint_dir, "lr_finder_plot.png")
-                plt.savefig(plot_path)
-                print(f"Plot saved to: {plot_path}")
-            except Exception as e:
-                print(f"Error creating plot: {e}")
+                    print(f"Error creating plot: {e}")
+            else:
+                print("Matplotlib not available - skipping plot generation")
+                # Print tabular data as a simple visualization
+                print("\nLearning Rate Finder Results (text format):")
+                print("-" * 50)
+                print("| {:^15} | {:^15} |".format("Log LR", "Loss"))
+                print("-" * 50)
+                for i in range(0, len(log_lrs), max(1, len(log_lrs)//10)):  # Print ~10 rows
+                    print("| {:^15.4f} | {:^15.4f} |".format(log_lrs[i], losses[i]))
+                print("-" * 50)
             
             # Update the learning rate based on finder results
             if suggested_lr > 0:
