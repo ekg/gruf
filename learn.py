@@ -283,6 +283,26 @@ class MinLMTrainer:
                                 total_steps, decay_rate, cycle_first_step_size, 
                                 decay_step_size, decay_lr_rate):
         """Create scheduler configuration based on the selected type"""
+        # Set default values if None
+        warmup_steps = warmup_steps or max(100, int(total_steps * 0.06))  # Default to 6% of total steps
+        min_lr = min_lr if min_lr is not None else max_lr * 0.01  # Default to 1% of max_lr
+        decay_rate = decay_rate if decay_rate is not None else min_lr / max_lr
+        cycle_first_step_size = cycle_first_step_size or warmup_steps
+        decay_step_size = decay_step_size or (total_steps - warmup_steps)
+        decay_lr_rate = decay_lr_rate if decay_lr_rate is not None else 0.9
+        
+        if scheduler_type == "auto":
+            # Choose best scheduler based on training length
+            if total_steps < 1000:
+                scheduler_type = "warmup"
+            elif total_steps > 10000:
+                scheduler_type = "cosine"
+            else:
+                scheduler_type = "warmup_decay"
+            
+            if self.global_rank == 0 and not self.silent_mode:
+                print(f"Auto-selected scheduler type: {scheduler_type}")
+        
         if scheduler_type == "warmup":
             return {
                 "type": "WarmupLR",
@@ -1010,6 +1030,80 @@ class MinLMTrainer:
             if self.global_rank == 0 and not self.silent_mode:
                 print("Could not determine optimal learning rate from curve. Using default.")
             return self.learning_rate
+            
+    def calculate_optimal_lr_schedule(self, total_steps, max_lr, min_lr=None, model_dim=None, model_depth=None):
+        """
+        Calculate optimal learning rate schedule parameters based on model size and training steps.
+        
+        Args:
+            total_steps: Total number of training steps
+            max_lr: Maximum learning rate (from LR finder)
+            min_lr: Minimum final learning rate (optional)
+            model_dim: Model dimension (optional)
+            model_depth: Model depth (optional)
+            
+        Returns:
+            dict: Dictionary containing scheduler configuration
+        """
+        # Use model size to determine sensible defaults if available
+        model_params = 0
+        if model_dim is not None and model_depth is not None:
+            # Calculate an estimate of model params
+            model_params = model_dim * model_dim * model_depth * 4
+        
+        # Calculate min_lr if not provided
+        if min_lr is None:
+            # Scale down based on model size - larger models need higher final LR
+            if model_params > 100_000_000:  # >100M params
+                min_lr = max_lr * 0.05
+            elif model_params > 10_000_000:  # >10M params
+                min_lr = max_lr * 0.03
+            else:
+                min_lr = max_lr * 0.01  # Small models can go to 1% of max
+        
+        # Calculate warmup steps based on training length and model size
+        # Larger models and longer training runs benefit from longer warmup
+        warmup_pct = 0.06  # Default 6% for warmup
+        
+        # Adjust based on model size
+        if model_params > 100_000_000:  # >100M params
+            warmup_pct = 0.10  # 10% for large models
+        elif model_params > 10_000_000:  # >10M params
+            warmup_pct = 0.08  # 8% for medium models
+            
+        # Calculate actual steps
+        warmup_steps = max(100, int(total_steps * warmup_pct))
+        
+        # For small/short trainings, cap warmup at 20% of total training
+        if warmup_steps > total_steps * 0.2:
+            warmup_steps = int(total_steps * 0.2)
+            
+        # Determine best scheduler based on training length
+        scheduler_type = "warmup_decay"  # Default
+        
+        # For very short training runs, simple warmup might be enough
+        if total_steps < 1000:
+            scheduler_type = "warmup"
+        # For longer runs, cosine is often better
+        elif total_steps > 10000:
+            scheduler_type = "cosine"
+        
+        # For one_cycle params (if that scheduler is chosen)
+        cycle_first_step_size = warmup_steps
+        decay_step_size = total_steps - warmup_steps
+        decay_lr_rate = 0.9
+        
+        return {
+            "scheduler_type": scheduler_type,
+            "warmup_steps": warmup_steps,
+            "warmup_pct": warmup_pct,
+            "min_lr": min_lr,
+            "max_lr": max_lr,
+            "cycle_first_step_size": cycle_first_step_size,
+            "decay_step_size": decay_step_size,
+            "decay_lr_rate": decay_lr_rate,
+            "decay_rate": min_lr / max_lr  # For warmup_decay
+        }
     
     def _log_metrics(self, is_validation=False):
         """Log metrics to TSV file"""
@@ -1200,21 +1294,23 @@ def main():
                         help="Directory to save checkpoints (default: auto-generated name)")
     
     # Learning rate scheduler parameters
-    parser.add_argument("--lr_scheduler", type=str, default="warmup",
-                        choices=["warmup", "warmup_decay", "one_cycle", "cosine", "constant"],
-                        help="Learning rate scheduler type (default: warmup)")
-    parser.add_argument("--warmup_steps", type=int, default=1000,
-                        help="Number of warmup steps (default: 1000)")
-    parser.add_argument("--min_lr", type=float, default=0.0,
-                        help="Minimum learning rate for schedulers (default: 0.0)")
-    parser.add_argument("--decay_rate", type=float, default=0.01,
-                        help="Final LR = max_lr * decay_rate (for warmup_decay, default: 0.01)")
-    parser.add_argument("--cycle_first_step_size", type=int, default=2000,
-                        help="First cycle step size for OneCycle scheduler (default: 2000)")
-    parser.add_argument("--decay_step_size", type=int, default=2000,
-                        help="Decay step size for OneCycle scheduler (default: 2000)")
-    parser.add_argument("--decay_lr_rate", type=float, default=0.9,
-                        help="Decay rate per step for OneCycle scheduler (default: 0.9)")
+    parser.add_argument("--lr_scheduler", type=str, default="auto",
+                        choices=["auto", "warmup", "warmup_decay", "one_cycle", "cosine", "constant"],
+                        help="Learning rate scheduler type (default: auto - chooses based on LR finder)")
+    parser.add_argument("--warmup_steps", type=int, default=None,
+                        help="Number of warmup steps (default: auto-calculated based on total steps)")
+    parser.add_argument("--warmup_pct", type=float, default=None,
+                        help="Percentage of training for warmup phase (default: auto-calculated)")
+    parser.add_argument("--min_lr", type=float, default=None,
+                        help="Minimum learning rate for schedulers (default: auto-calculated from LR finder)")
+    parser.add_argument("--decay_rate", type=float, default=None,
+                        help="Final LR = max_lr * decay_rate (for warmup_decay, default: auto-calculated)")
+    parser.add_argument("--cycle_first_step_size", type=int, default=None,
+                        help="First cycle step size for OneCycle scheduler (default: auto-calculated)")
+    parser.add_argument("--decay_step_size", type=int, default=None,
+                        help="Decay step size for OneCycle scheduler (default: auto-calculated)")
+    parser.add_argument("--decay_lr_rate", type=float, default=None,
+                        help="Decay rate per step for OneCycle scheduler (default: auto-calculated)")
     
     # Learning rate finder parameters
     parser.add_argument("--find_lr", action="store_true",
@@ -1613,7 +1709,15 @@ def main():
         print(f"Effective batch size: {BATCH_SIZE * dp_size * GRAD_ACCUM_EVERY}")
         print(f"Learning rate: {LEARNING_RATE}")
         print(f"LR Scheduler: {args.lr_scheduler}")
-        print(f"Warmup steps: {args.warmup_steps}")
+        
+        # Calculate warmup percentage for display
+        warmup_pct = (args.warmup_steps / NUM_BATCHES) * 100 if args.warmup_steps else 0
+        min_lr_pct = (args.min_lr / LEARNING_RATE) * 100 if args.min_lr is not None else 0
+        
+        print(f"Warmup steps: {args.warmup_steps} ({warmup_pct:.1f}% of training)")
+        if args.lr_scheduler in ['warmup_decay', 'cosine', 'one_cycle']:
+            print(f"Min LR: {args.min_lr if args.min_lr is not None else (LEARNING_RATE * 0.01):.6f} "
+                  f"({min_lr_pct:.1f}% of max)")
         print(f"Sequence length: {SEQ_LEN}")
         print(f"Training steps: {NUM_BATCHES}")
         print(f"ZeRO Stage: {args.zero_stage}")
@@ -1696,6 +1800,40 @@ def main():
                 LEARNING_RATE = suggested_lr
                 # Update the trainer's learning rate
                 trainer.learning_rate = suggested_lr
+                
+                # Calculate optimal learning rate schedule if using auto mode
+                if args.lr_scheduler == "auto":
+                    schedule_params = trainer.calculate_optimal_lr_schedule(
+                        total_steps=NUM_BATCHES,
+                        max_lr=suggested_lr,
+                        min_lr=args.min_lr,
+                        model_dim=MODEL_CONFIG["dim"],
+                        model_depth=MODEL_CONFIG["depth"]
+                    )
+                    
+                    # Use calculated parameters but allow command-line overrides
+                    if args.warmup_steps is None:
+                        args.warmup_steps = schedule_params["warmup_steps"]
+                    if args.min_lr is None:
+                        args.min_lr = schedule_params["min_lr"]
+                    if args.decay_rate is None:
+                        args.decay_rate = schedule_params["decay_rate"]
+                    if args.cycle_first_step_size is None:
+                        args.cycle_first_step_size = schedule_params["cycle_first_step_size"]
+                    if args.decay_step_size is None:
+                        args.decay_step_size = schedule_params["decay_step_size"]
+                    if args.decay_lr_rate is None:
+                        args.decay_lr_rate = schedule_params["decay_lr_rate"]
+                    
+                    # Set scheduler type if using auto
+                    if args.lr_scheduler == "auto":
+                        args.lr_scheduler = schedule_params["scheduler_type"]
+                    
+                    print(f"\nAutomatic LR schedule configuration:")
+                    print(f"  Scheduler type: {args.lr_scheduler}")
+                    print(f"  Warmup steps: {args.warmup_steps} ({(args.warmup_steps/NUM_BATCHES)*100:.1f}% of training)")
+                    print(f"  Max LR: {suggested_lr:.6f}")
+                    print(f"  Min LR: {args.min_lr:.6f} ({(args.min_lr/suggested_lr)*100:.1f}% of max)")
     
     # Resume from checkpoint if specified
     if args.resume:
