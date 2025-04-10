@@ -153,11 +153,10 @@ def chunked_generation(
     temperature: float = 1.0,
     filter_thres: float = 0.9,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
-    callback=None,
-    use_kv_cache: bool = True
+    callback=None
 ):
     """
-    Generate text in chunks, efficiently using KV-cache when available.
+    Generate text in chunks using RNN hidden states.
     
     Args:
         model: The minLM model
@@ -168,7 +167,6 @@ def chunked_generation(
         filter_thres: Threshold for top-k filtering (higher = more diverse)
         device: Device to run generation on
         callback: Optional callback function to report progress
-        use_kv_cache: Whether to use KV caching for faster generation if model supports it
     
     Returns:
         Generated tokens
@@ -185,16 +183,10 @@ def chunked_generation(
     # Start with no hidden state
     prev_hiddens = None
     
-    # Process the prompt efficiently
+    # Process the prompt efficiently to get initial hidden state
     with torch.no_grad():
-        # Process the entire prompt at once if it fits in memory
-        # This is much faster than processing one token at a time
-        if hasattr(model, 'can_cache') and model.can_cache and use_kv_cache:
-            # Process the prompt to get initial KV cache
-            _, prev_hiddens = model(out, return_prev_hiddens=True)
-        else:
-            # For models without caching, no need to do anything special here
-            pass
+        # Process the entire prompt at once to get the initial hidden state
+        _, prev_hiddens = model(out, return_prev_hiddens=True)
     
     # Timing variables
     start_time = time.time()
@@ -209,63 +201,38 @@ def chunked_generation(
             # Generate tokens efficiently in batches
             batch_size = min(chunk_length, remaining_tokens)
             
-            if hasattr(model, 'can_cache') and model.can_cache and use_kv_cache:
-                # With KV cache, we only need to process the most recent token
-                for _ in range(batch_size):
-                    # Get logits and updated KV cache
-                    logits, next_prev_hiddens = model(
-                        out[:, -1:],  # Only need the last token
-                        return_prev_hiddens=True, 
-                        prev_hiddens=prev_hiddens
-                    )
-                    
-                    # Get logits for the generated token
-                    logits = logits[:, -1]
-                    
-                    # Update KV cache
-                    prev_hiddens = next_prev_hiddens
-                    
-                    # Apply top-k filtering and sample
-                    filtered_logits = top_k(logits, thres=filter_thres)
-                    sample = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)
-                    
-                    # Ensure sample is Long before concatenation
-                    sample_long = sample.long()
-                    # Append the new token to the output
-                    out = torch.cat((out, sample_long), dim=-1)
-                    
-                    tokens_generated += 1
-                    
-                    # Update progress regularly
-                    if tokens_generated % 5 == 0 and callback:
-                        progress = tokens_generated / generation_length
-                        elapsed = time.time() - start_time
-                        tokens_per_sec = tokens_generated / elapsed if elapsed > 0 else 0
-                        callback(progress, tokens_per_sec)
-            else:
-                # Without KV cache, we process multiple tokens at once
-                # Generate tokens for this chunk
-                for _ in range(batch_size):
-                    # Get logits for the sequence
-                    logits, next_prev_hiddens = model(
-                        out, 
-                        return_prev_hiddens=True,
-                        prev_hiddens=prev_hiddens
-                    )
-                    
-                    # Get logits for the last token
-                    logits = logits[:, -1]
-                    
-                    # Apply top-k filtering and sample
-                    filtered_logits = top_k(logits, thres=filter_thres)
-                    sample = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)
-                    
-                    # Ensure sample is Long before concatenation
-                    sample_long = sample.long() 
-                    # Append the new token to the output
-                    out = torch.cat((out, sample_long), dim=-1)
-                    
-                    tokens_generated += 1
+            # Generate tokens one at a time, efficiently maintaining RNN state
+            for _ in range(batch_size):
+                # Get logits and updated hidden state
+                logits, next_prev_hiddens = model(
+                    out[:, -1:],  # Only need the last token with RNN state
+                    return_prev_hiddens=True, 
+                    prev_hiddens=prev_hiddens
+                )
+                
+                # Get logits for the generated token
+                logits = logits[:, -1]
+                
+                # Update hidden state for next iteration
+                prev_hiddens = next_prev_hiddens
+                
+                # Apply top-k filtering and sample
+                filtered_logits = top_k(logits, thres=filter_thres)
+                sample = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)
+                
+                # Ensure sample is Long before concatenation
+                sample_long = sample.long()
+                # Append the new token to the output
+                out = torch.cat((out, sample_long), dim=-1)
+                
+                tokens_generated += 1
+                
+                # Update progress regularly
+                if tokens_generated % 5 == 0 and callback:
+                    progress = tokens_generated / generation_length
+                    elapsed = time.time() - start_time
+                    tokens_per_sec = tokens_generated / elapsed if elapsed > 0 else 0
+                    callback(progress, tokens_per_sec)
             
             # Update remaining tokens
             remaining_tokens -= batch_size
@@ -365,7 +332,6 @@ def main():
     parser.add_argument("--top_k", type=float, default=0.9, help="Threshold for top-k filtering (default: 0.9)")
     parser.add_argument("--chunk_length", type=str, default="64", help="Process sequence in chunks of this length (default: 64). Can use k/m/g suffix.")
     parser.add_argument("--generation_length", type=str, default="512", help="Total number of tokens to generate (default: 512). Can use k/m/g suffix.")
-    parser.add_argument("--no_kv_cache", action="store_true", help="Disable KV caching for generation (slower but uses less memory)")
     
     # Input parameters
     parser.add_argument("--primer_file", type=str, default=None, help="File containing primer text (optional)")
@@ -474,7 +440,6 @@ def main():
     
     print(f"\nGenerating {generation_length} tokens in chunks of {chunk_length}...")
     print(f"Temperature: {args.temperature}, Top-k threshold: {args.top_k}")
-    print(f"Using KV cache: {'No' if args.no_kv_cache else 'Yes'}")
     
     # Memory optimization
     if args.memory_efficient:
@@ -494,8 +459,7 @@ def main():
             args.temperature,
             args.top_k,
             device,
-            progress_callback,
-            use_kv_cache=not args.no_kv_cache
+            progress_callback
         )
         
     # Clear cache after generation

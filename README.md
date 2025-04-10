@@ -5,7 +5,7 @@ PyTorch implementation of the minGRU architecture from the paper [Were RNNs All 
 ## Features
 
 - Efficient training with DeepSpeed integration via `learn.py`
-- Text generation with efficient KV-caching via `generate.py`
+- Text generation with efficient RNN state tracking via `generate.py`
 - Support for CPU offloading and mixed precision training
 - Support for configurable model sizes via dimension and depth parameters
 
@@ -82,7 +82,7 @@ python generate.py --model checkpoints/best.pt --temperature 0.7 --top_k 0.95
 python generate.py --model checkpoints/best.pt --generation_length 1024
 
 # Use memory-efficient generation for large models
-python generate.py --model checkpoints/best.pt --memory_efficient --no_kv_cache
+python generate.py --model checkpoints/best.pt --memory_efficient
 ```
 
 ## Citation
