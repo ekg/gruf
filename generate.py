@@ -59,7 +59,7 @@ def load_model(checkpoint_path, config_path=None, use_bf16=False, use_fp16=False
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')  # First load to CPU to avoid OOM
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)  # First load to CPU to avoid OOM
     
     # Load config if provided, otherwise use defaults from MODEL_CONFIG
     if config_path and os.path.exists(config_path):
