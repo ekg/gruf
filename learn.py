@@ -12,6 +12,8 @@ import torch
 import mmap
 import datetime
 import json
+import shutil
+from matplotlib import pyplot as plt
 from torch.utils.data import DataLoader, Dataset
 import deepspeed
 from tqdm import tqdm
@@ -832,6 +834,176 @@ class MinLMTrainer:
             # Log final metrics
             self._log_metrics(True)
     
+    def find_learning_rate(self, train_dataloader, min_lr=1e-8, max_lr=10, num_iter=100, beta=0.98, show_progress=True):
+        """
+        Run the learning rate finder to determine the optimal learning rate.
+        
+        Args:
+            train_dataloader: DataLoader for training data
+            min_lr: Starting learning rate
+            max_lr: Maximum learning rate to try
+            num_iter: Number of iterations to run
+            beta: Smoothing factor for loss (0.0 to 1.0)
+            show_progress: Whether to show progress bar
+            
+        Returns:
+            log_lrs: List of log10 of learning rates
+            losses: List of smoothed losses
+            suggested_lr: Suggested learning rate
+        """
+        if self.global_rank == 0 and not self.silent_mode:
+            print(f"Running LR finder from {min_lr} to {max_lr} over {num_iter} iterations")
+        
+        # Initialize loss tracking
+        losses = []
+        log_lrs = []
+        best_loss = float('inf')
+        avg_loss = 0.0
+        
+        # Calculate the multiplication factor for LR
+        mult_factor = (max_lr / min_lr) ** (1 / num_iter)
+        
+        # Save initial model parameters and optimizer state
+        # For DeepSpeed, we need to save checkpoint first
+        temp_dir = os.path.join(self.checkpoint_dir, "lr_finder_temp") if self.checkpoint_dir else "lr_finder_temp"
+        if self.global_rank == 0:
+            os.makedirs(temp_dir, exist_ok=True)
+        
+        # Save the initial model state
+        if hasattr(self.model, 'save_checkpoint'):
+            self.model.save_checkpoint(temp_dir, tag="init")
+        
+        # Set initial learning rate
+        lr = min_lr
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+        
+        # Create a progress bar if needed
+        pbar = None
+        if self.global_rank == 0 and show_progress:
+            from tqdm import tqdm
+            pbar = tqdm(total=num_iter, desc="Finding optimal learning rate")
+        
+        # Get an iterator for the dataloader
+        train_iter = iter(train_dataloader)
+        
+        # Run iterations with increasing learning rate
+        for i in range(num_iter):
+            # Get the next batch (resetting iterator if needed)
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_dataloader)
+                batch = next(train_iter)
+            
+            # Ensure batch is Long type and on the correct device
+            batch = batch.long().to(self.model.device)
+            
+            # Forward pass and compute loss
+            self.model.train()
+            loss = self.model(batch, return_loss=True)
+            
+            # Compute smoothed loss
+            if torch.is_tensor(loss):
+                current_loss = loss.item()
+            else:
+                current_loss = loss
+                
+            avg_loss = beta * avg_loss + (1 - beta) * current_loss
+            smoothed_loss = avg_loss / (1 - beta ** (i + 1))
+            
+            # Record best loss
+            if smoothed_loss < best_loss:
+                best_loss = smoothed_loss
+            
+            # Stop if loss is exploding
+            if i > 0 and smoothed_loss > 4 * best_loss:
+                if self.global_rank == 0 and not self.silent_mode:
+                    print(f"\nLoss exploded at learning rate {lr:.8f}. Stopping.")
+                break
+            
+            # Record values
+            losses.append(smoothed_loss)
+            log_lrs.append(math.log10(lr))
+            
+            # Backward pass and optimizer step
+            self.model.backward(loss)
+            self.model.step()
+            
+            # Increase learning rate for next iteration
+            lr *= mult_factor
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
+            
+            # Update progress bar
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix({"loss": f"{smoothed_loss:.4f}", "lr": f"{lr:.8f}"})
+        
+        if pbar is not None:
+            pbar.close()
+        
+        # Analyze results to suggest a learning rate
+        suggested_lr = self._analyze_lr_find_results(log_lrs, losses)
+        
+        # Restore the original model state
+        if hasattr(self.model, 'load_checkpoint'):
+            self.model.load_checkpoint(temp_dir, tag="init")
+        
+        # Clean up temp directory
+        if self.global_rank == 0 and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        
+        return log_lrs, losses, suggested_lr
+
+    def _analyze_lr_find_results(self, log_lrs, losses):
+        """
+        Analyze the learning rate finder results to suggest an optimal learning rate.
+        
+        Args:
+            log_lrs: List of log10 of learning rates
+            losses: List of smoothed losses
+            
+        Returns:
+            suggested_lr: The suggested learning rate
+        """
+        if len(log_lrs) <= 1 or len(losses) <= 1:
+            if self.global_rank == 0 and not self.silent_mode:
+                print("Not enough data points to suggest a learning rate.")
+            return self.learning_rate  # Return the default value
+        
+        # Convert to numpy for analysis
+        log_lrs = np.array(log_lrs)
+        losses = np.array(losses)
+        
+        # Compute gradient
+        # We need at least 2 points to compute a gradient
+        derivatives = (losses[1:] - losses[:-1]) / (log_lrs[1:] - log_lrs[:-1])
+        
+        # Find the point with steepest negative gradient (if it exists)
+        try:
+            # Get the index of minimum gradient (steepest descent)
+            min_grad_idx = np.argmin(derivatives)
+            
+            # The corresponding learning rate is our suggested value
+            # We convert back from log scale
+            suggested_lr = 10 ** log_lrs[min_grad_idx]
+            
+            # For safety, we typically pick a value slightly lower than the minimum
+            # A common practice is to divide by 10
+            safe_lr = suggested_lr / 10
+            
+            if self.global_rank == 0 and not self.silent_mode:
+                print(f"Minimum gradient at LR: {suggested_lr:.8f}")
+                print(f"Suggested safe LR: {safe_lr:.8f}")
+                
+            return safe_lr
+        except (ValueError, IndexError):
+            # If analysis fails, return the starting learning rate
+            if self.global_rank == 0 and not self.silent_mode:
+                print("Could not determine optimal learning rate from curve. Using default.")
+            return self.learning_rate
+    
     def _log_metrics(self, is_validation=False):
         """Log metrics to TSV file"""
         if not self.checkpoint_dir or self.global_rank != 0:
@@ -1036,6 +1208,16 @@ def main():
                         help="Decay step size for OneCycle scheduler (default: 2000)")
     parser.add_argument("--decay_lr_rate", type=float, default=0.9,
                         help="Decay rate per step for OneCycle scheduler (default: 0.9)")
+    
+    # Learning rate finder parameters
+    parser.add_argument("--find_lr", action="store_true",
+                        help="Run the learning rate finder before training")
+    parser.add_argument("--min_find_lr", type=float, default=1e-8,
+                        help="Minimum learning rate for LR finder (default: 1e-8)")
+    parser.add_argument("--max_find_lr", type=float, default=1.0,
+                        help="Maximum learning rate for LR finder (default: 1.0)")
+    parser.add_argument("--num_lr_find_iter", type=int, default=100,
+                        help="Number of iterations for LR finder (default: 100)")
     # Precision options
     precision_group = parser.add_mutually_exclusive_group()
     precision_group.add_argument("--bf16", dest="precision", action="store_const", const="bf16", default="bf16",
@@ -1435,6 +1617,67 @@ def main():
         print(f"Debug gradients: {args.debug_gradients}")
         print(f"Tensor Parallel Size: {args.tensor_parallel_size}")
         print(f"-----------------------------\n")
+    
+    # If LR finder is enabled, run it before training
+    if args.find_lr:
+        if global_rank == 0:
+            print("\nRunning learning rate finder...")
+        
+        # Run the learning rate finder
+        log_lrs, losses, suggested_lr = trainer.find_learning_rate(
+            train_loader,
+            min_lr=args.min_find_lr,
+            max_lr=args.max_find_lr,
+            num_iter=args.num_lr_find_iter,
+            show_progress=(global_rank == 0)
+        )
+        
+        # Save the results to a file
+        if global_rank == 0:
+            # Save results as CSV
+            results_path = os.path.join(checkpoint_dir, "lr_finder_results.csv")
+            with open(results_path, 'w') as f:
+                f.write("log_lr,loss\n")
+                for lr, loss in zip(log_lrs, losses):
+                    f.write(f"{lr},{loss}\n")
+            
+            print(f"\nLearning rate finder results saved to: {results_path}")
+            print(f"Suggested learning rate: {suggested_lr:.8f}")
+            
+            # Create the plot
+            try:
+                plt.figure(figsize=(10, 6))
+                plt.plot(log_lrs, losses)
+                plt.xlabel("log10(Learning Rate)")
+                plt.ylabel("Loss")
+                plt.title("Learning Rate Finder Results")
+                plt.grid(True)
+                
+                # Mark the suggested learning rate
+                try:
+                    # Find the index that's closest to the suggested lr * 10 (pre-division for safety)
+                    suggested_log = math.log10(suggested_lr * 10)
+                    closest_idx = min(range(len(log_lrs)), key=lambda i: abs(log_lrs[i] - suggested_log))
+                    
+                    # Mark both the min gradient point and the suggested (safer) learning rate
+                    plt.axvline(x=log_lrs[closest_idx], color='r', linestyle='--', label='Min Gradient LR')
+                    plt.axvline(x=math.log10(suggested_lr), color='g', linestyle='--', label='Suggested LR')
+                    plt.legend()
+                except Exception as e:
+                    print(f"Error marking suggested learning rate on plot: {e}")
+                
+                plot_path = os.path.join(checkpoint_dir, "lr_finder_plot.png")
+                plt.savefig(plot_path)
+                print(f"Plot saved to: {plot_path}")
+            except Exception as e:
+                print(f"Error creating plot: {e}")
+            
+            # Update the learning rate based on finder results
+            if suggested_lr > 0:
+                print(f"Updating learning rate from {LEARNING_RATE} to {suggested_lr}")
+                LEARNING_RATE = suggested_lr
+                # Update the trainer's learning rate
+                trainer.learning_rate = suggested_lr
     
     # Resume from checkpoint if specified
     if args.resume:
