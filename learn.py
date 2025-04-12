@@ -393,7 +393,7 @@ class MinLMTrainer:
                 learning_rate,
                 args.min_lr,
                 args.warmup_steps,
-                NUM_BATCHES,
+                NUM_BATCHES * self.grad_accum_steps,  # FIXED: Account for gradient accumulation
                 args.decay_rate,
                 args.cycle_first_step_size,
                 args.decay_step_size,
