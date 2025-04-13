@@ -299,6 +299,8 @@ class MinLMTrainer:
             print(f"  Warmup steps: {warmup_steps} ({(warmup_steps/total_steps)*100:.1f}%)")
             print(f"  Max LR: {max_lr}")
             print(f"  Min LR: {min_lr}")
+            if scheduler_type == "warmup_decay":
+                print(f"  Final LR after decay: {min_lr}")
         
         if scheduler_type == "auto":
             # Choose best scheduler based on training length
@@ -328,8 +330,8 @@ class MinLMTrainer:
                     "warmup_min_lr": min_lr,
                     "warmup_max_lr": max_lr,
                     "warmup_num_steps": warmup_steps,
-                    "total_num_steps": total_steps,
-                    "decay_rate": decay_rate  # Final LR = max_lr * decay_rate
+                    "total_num_steps": total_steps
+                    # Removed decay_rate parameter as it's not supported by DeepSpeed's WarmupDecayLR
                 }
             }
         elif scheduler_type == "one_cycle":
