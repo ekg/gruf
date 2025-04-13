@@ -291,6 +291,15 @@ class MinLMTrainer:
         decay_step_size = decay_step_size or (total_steps - warmup_steps)
         decay_lr_rate = decay_lr_rate if decay_lr_rate is not None else 0.9
         
+        # Print scheduler configuration info to help debug
+        if self.global_rank == 0 and not self.silent_mode:
+            print(f"\nScheduler configuration:")
+            print(f"  Type: {scheduler_type}")
+            print(f"  Total scheduler steps: {total_steps}")
+            print(f"  Warmup steps: {warmup_steps} ({(warmup_steps/total_steps)*100:.1f}%)")
+            print(f"  Max LR: {max_lr}")
+            print(f"  Min LR: {min_lr}")
+        
         if scheduler_type == "auto":
             # Choose best scheduler based on training length
             if total_steps < 1000:
@@ -335,14 +344,17 @@ class MinLMTrainer:
                 }
             }
         elif scheduler_type == "cosine":
+            # DeepSpeed's WarmupCosineLR implementation is reverse-engineered from the logs
+            # The key issue is that it keeps increasing LR during the entire warmup phase
+            # and only starts decreasing after warmup_num_steps
             return {
-                "type": "WarmupCosineLR",
+                "type": "WarmupDecayLR",  # Using WarmupDecayLR instead of WarmupCosineLR
                 "params": {
-                    "warmup_min_ratio": min_lr / max_lr,  # Ratio of min to max LR during warmup
+                    "warmup_min_lr": 0,  # Start from 0
+                    "warmup_max_lr": max_lr,  # Peak LR
                     "warmup_num_steps": warmup_steps,
                     "total_num_steps": total_steps,
-                    "cos_min_ratio": min_lr / max_lr,  # Final min ratio for cosine schedule
-                    "warmup_type": "linear"
+                    "decay_rate": min_lr / max_lr  # End at min_lr
                 }
             }
         elif scheduler_type == "constant":
@@ -388,12 +400,14 @@ class MinLMTrainer:
                     # Removed weight_decay to match standard Adam in Lightning
                 }
             },
+            # CRITICAL FIX: DeepSpeed counts steps AFTER gradient accumulation
+            # So we should NOT multiply by grad_accum_steps here
             "scheduler": self._create_scheduler_config(
                 args.lr_scheduler,
                 learning_rate,
                 args.min_lr,
                 args.warmup_steps,
-                NUM_BATCHES * self.grad_accum_steps,  # FIXED: Account for gradient accumulation
+                NUM_BATCHES,  # DeepSpeed already accounts for gradient accumulation
                 args.decay_rate,
                 args.cycle_first_step_size,
                 args.decay_step_size,
@@ -1814,7 +1828,14 @@ def main():
                     
                     # Use calculated parameters but allow command-line overrides
                     if args.warmup_steps is None:
+                        # WARNING: warmup_steps is in OPTIMIZER steps, not batch steps
+                        # In DeepSpeed, 1 optimizer step = grad_accum_steps batch steps
                         args.warmup_steps = schedule_params["warmup_steps"]
+                        
+                        # Make sure it's not too high - cap at 10% of total steps
+                        if args.warmup_steps > NUM_BATCHES * 0.1:
+                            args.warmup_steps = int(NUM_BATCHES * 0.1)
+                            print(f"Capping warmup_steps at 10% of total: {args.warmup_steps}")
                     if args.min_lr is None:
                         args.min_lr = schedule_params["min_lr"]
                     if args.decay_rate is None:
