@@ -352,7 +352,7 @@ class MinLMTrainer:
                 update_interval=args.greedylr_update_interval,
                 reset=0,
                 verbose=(self.global_rank == 0 and not self.silent_mode),
-                debug=args.greedylr_debug
+                debug=args.greedylr_debug and self.global_rank == 0
             )
         
         # Print device info if main process

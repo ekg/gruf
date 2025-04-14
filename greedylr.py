@@ -30,6 +30,11 @@ class GreedyLR:
                  cooldown=0, warmup=0, min_lr=0, max_lr=10.0, smooth=True, 
                  window=50, smoothing_factor=None, update_interval=1,
                  reset=0, verbose=False, debug=False):
+        # Check if we're in a distributed environment
+        self.distributed = torch.distributed.is_initialized()
+        self.global_rank = torch.distributed.get_rank() if self.distributed else 0
+        self.world_size = torch.distributed.get_world_size() if self.distributed else 1
+        self.is_main_process = self.global_rank == 0
         self.optimizer = optimizer
         self.factor = factor
         self.patience = patience
@@ -126,15 +131,27 @@ class GreedyLR:
         
         if metrics is None:
             return current_lr
+        
+        # In distributed training, we need to aggregate losses from all processes
+        if self.distributed:
+            # Convert metrics to tensor for all_reduce
+            metrics_tensor = torch.tensor([metrics], device="cuda" if torch.cuda.is_available() else "cpu")
+            # Sum metrics across all processes
+            torch.distributed.all_reduce(metrics_tensor, op=torch.distributed.ReduceOp.SUM)
+            # Average the metrics
+            metrics = metrics_tensor.item() / self.world_size
+            
+            if self.debug and self.is_main_process:
+                print(f"GreedyLR: Aggregated loss from {self.world_size} processes: {metrics:.6f}")
             
         # Track the raw loss
-        if self.debug:
+        if self.debug and self.is_main_process:
             print(f"GreedyLR raw loss: {metrics:.6f}, current LR: {current_lr:.8f}")
             # Check if DeepSpeed's optimizer is properly connected
             if hasattr(self.optimizer, '_parameter_names'):
                 print(f"Connected to DeepSpeed ZeroOptimizer with {len(self.optimizer.param_groups)} param groups")
             
-        # Calculate smoothed loss
+        # Calculate smoothed loss - only on main process to ensure consistency
         if self.smooth:
             if self.smoothing_factor is not None:
                 # Use exponential moving average (EMA)
@@ -144,7 +161,7 @@ class GreedyLR:
                 else:
                     self.ema_loss = beta * self.ema_loss + (1 - beta) * metrics
                 current_loss = self.ema_loss
-                if self.debug:
+                if self.debug and self.is_main_process:
                     print(f"GreedyLR EMA loss: {current_loss:.6f}")
             else:
                 # Use window-based average
@@ -152,7 +169,7 @@ class GreedyLR:
                 if len(self.loss_window) > self.window:
                     self.loss_window.pop(0)
                 current_loss = sum(self.loss_window) / len(self.loss_window)
-                if self.debug:
+                if self.debug and self.is_main_process:
                     print(f"GreedyLR window average loss: {current_loss:.6f} (window size: {len(self.loss_window)})")
         else:
             current_loss = metrics
@@ -161,111 +178,110 @@ class GreedyLR:
         self.steps_since_last_update += 1
         
         # Only consider updating the learning rate at specified intervals
+        # AND only have the main process make the decision to avoid conflicts
         if self.steps_since_last_update >= self.update_interval:
-            # Check if loss is better or worse
-            # Using a relative threshold that scales with the loss
-            rel_threshold = self.threshold * current_loss if self.threshold > 0 else 0
-            if current_loss < self.best_loss - rel_threshold:
-                # Loss has improved
-                improvement = self.best_loss - current_loss
-                self.best_loss = current_loss
-                self.num_good_epochs += 1
-                # Don't reset bad epochs to 0, gradually reduce instead
-                self.num_bad_epochs = max(0, self.num_bad_epochs - 1)
-                if self.debug:
-                    print(f"GreedyLR: Loss improved by {improvement:.6f}, good_steps={self.num_good_epochs}, bad_steps={self.num_bad_epochs}")
-            else:
-                # Loss has not improved
-                # Don't reset good epochs to 0, gradually reduce instead
-                self.num_good_epochs = max(0, self.num_good_epochs - 1)
-                self.num_bad_epochs += 1
-                if self.debug:
-                    print(f"GreedyLR: Loss didn't improve, good_steps={self.num_good_epochs}, bad_steps={self.num_bad_epochs}")
-                
-                # Add plateau detection - if loss has been within a small range for a while
-                if self.smooth and len(self.loss_window) >= 20:  # Need enough samples to detect plateau
-                    recent_losses = self.loss_window[-20:]
-                    loss_range = max(recent_losses) - min(recent_losses)
-                    # If losses are within a small range (plateau) for 20 steps
-                    if loss_range < (self.threshold * 5) and self.num_bad_epochs > self.patience // 2:
-                        if self.debug:
-                            print(f"GreedyLR: Detected plateau with loss range {loss_range:.6f}, forcing exploration")
-                        # Force increase by setting good_epochs higher
-                        self.num_good_epochs = self.patience + 1
-                        self.num_bad_epochs = 0
+            # Only perform the decision logic on the main process
+            should_update_lr = False
+            new_lr = current_lr
             
-            # Handle cooldown
-            if self.cooldown_counter > 0:
-                self.cooldown_counter -= 1
-                self.num_good_epochs = 0
-                if self.debug:
-                    print(f"GreedyLR: In cooldown, {self.cooldown_counter} steps remaining")
-            
-            # Handle warmup
-            if self.warmup_counter > 0:
-                self.warmup_counter -= 1
-                self.num_bad_epochs = 0
-                if self.debug:
-                    print(f"GreedyLR: In warmup, {self.warmup_counter} steps remaining")
-            
-            # Adjust learning rate based on performance
-            if self.num_good_epochs > self.patience:
-                # Increase learning rate
-                old_lr = current_lr
-                new_lr = min(current_lr / self.factor, self.max_lrs)
-                
-                if new_lr > old_lr:  # Only update if it's actually increasing
-                    if self.verbose or self.debug:
-                        print(f'GreedyLR increasing learning rate from {old_lr:.6f} to {new_lr:.6f}')
+            if not self.distributed or self.is_main_process:
+                # Check if loss is better or worse
+                # Using a relative threshold that scales with the loss
+                rel_threshold = self.threshold * current_loss if self.threshold > 0 else 0
+                if current_loss < self.best_loss - rel_threshold:
+                    # Loss has improved
+                    improvement = self.best_loss - current_loss
+                    self.best_loss = current_loss
+                    self.num_good_epochs += 1
+                    # Don't reset bad epochs to 0, gradually reduce instead
+                    self.num_bad_epochs = max(0, self.num_bad_epochs - 1)
+                    if self.debug:
+                        print(f"GreedyLR: Loss improved by {improvement:.6f}, good_steps={self.num_good_epochs}, bad_steps={self.num_bad_epochs}")
+                else:
+                    # Loss has not improved
+                    # Don't reset good epochs to 0, gradually reduce instead
+                    self.num_good_epochs = max(0, self.num_good_epochs - 1)
+                    self.num_bad_epochs += 1
+                    if self.debug:
+                        print(f"GreedyLR: Loss didn't improve, good_steps={self.num_good_epochs}, bad_steps={self.num_bad_epochs}")
                     
-                    # Force update through the optimizer directly - use multiple approaches
-                    for param_group in param_groups:
-                        # Try both direct assignment and setattr
-                        param_group['lr'] = new_lr
-                        try:
-                            setattr(param_group, 'lr', new_lr)
-                        except (AttributeError, TypeError):
-                            pass
-                        
-                    # Verify the change was applied
-                    actual_lr = param_groups[0]['lr']
-                    if actual_lr != new_lr and (self.verbose or self.debug):
-                        print(f"Warning: Failed to update LR! Expected {new_lr:.8f} but got {actual_lr:.8f}")
-                        print("Attempting to update again with different method...")
-                        # Try one more method - find the underlying optimizer
-                        try:
-                            # Access the internal optimizer if this is a DeepSpeed optimizer wrapper
-                            if hasattr(self.optimizer, 'optimizer'):
-                                print("Detected DeepSpeed optimizer wrapper, accessing internal optimizer")
-                                internal_optimizer = self.optimizer.optimizer
-                                for group in internal_optimizer.param_groups:
-                                    group['lr'] = new_lr
-                        except Exception as e:
-                            print(f"Error updating internal optimizer: {e}")
-                    
-                    self.cooldown_counter = self.cooldown
+                    # Add plateau detection - if loss has been within a small range for a while
+                    if self.smooth and len(self.loss_window) >= 20:  # Need enough samples to detect plateau
+                        recent_losses = self.loss_window[-20:]
+                        loss_range = max(recent_losses) - min(recent_losses)
+                        # If losses are within a small range (plateau) for 20 steps
+                        if loss_range < (self.threshold * 5) and self.num_bad_epochs > self.patience // 2:
+                            if self.debug:
+                                print(f"GreedyLR: Detected plateau with loss range {loss_range:.6f}, forcing exploration")
+                            # Force increase by setting good_epochs higher
+                            self.num_good_epochs = self.patience + 1
+                            self.num_bad_epochs = 0
+                
+                # Handle cooldown
+                if self.cooldown_counter > 0:
+                    self.cooldown_counter -= 1
                     self.num_good_epochs = 0
-                    self.best_loss = float('inf')  # Reset best loss after LR change
+                    if self.debug:
+                        print(f"GreedyLR: In cooldown, {self.cooldown_counter} steps remaining")
                 
-            elif self.num_bad_epochs > self.patience:
-                # Decrease learning rate
-                old_lr = current_lr
-                new_lr = max(current_lr * self.factor, self.min_lrs)
+                # Handle warmup
+                if self.warmup_counter > 0:
+                    self.warmup_counter -= 1
+                    self.num_bad_epochs = 0
+                    if self.debug:
+                        print(f"GreedyLR: In warmup, {self.warmup_counter} steps remaining")
                 
-                if new_lr < old_lr:  # Only update if it's actually decreasing
-                    if self.verbose or self.debug:
-                        print(f'GreedyLR reducing learning rate from {old_lr:.6f} to {new_lr:.6f}')
+                # Adjust learning rate based on performance
+                if self.num_good_epochs > self.patience:
+                    # Increase learning rate
+                    old_lr = current_lr
+                    new_lr = min(current_lr / self.factor, self.max_lrs)
                     
-                    # Force update through the optimizer directly - use multiple approaches
-                    for param_group in param_groups:
-                        # Try both direct assignment and setattr
-                        param_group['lr'] = new_lr
-                        try:
-                            setattr(param_group, 'lr', new_lr)
-                        except (AttributeError, TypeError):
-                            pass
+                    if new_lr > old_lr:  # Only update if it's actually increasing
+                        should_update_lr = True
+                        if self.verbose or self.debug:
+                            print(f'GreedyLR increasing learning rate from {old_lr:.6f} to {new_lr:.6f}')
                         
-                    # Verify the change was applied
+                        self.cooldown_counter = self.cooldown
+                        self.num_good_epochs = 0
+                        self.best_loss = float('inf')  # Reset best loss after LR change
+                    
+                elif self.num_bad_epochs > self.patience:
+                    # Decrease learning rate
+                    old_lr = current_lr
+                    new_lr = max(current_lr * self.factor, self.min_lrs)
+                    
+                    if new_lr < old_lr:  # Only update if it's actually decreasing
+                        should_update_lr = True
+                        if self.verbose or self.debug:
+                            print(f'GreedyLR reducing learning rate from {old_lr:.6f} to {new_lr:.6f}')
+                        
+                        self.warmup_counter = self.warmup
+                        self.num_bad_epochs = 0
+                        self.best_loss = float('inf')  # Reset best loss after LR change
+            
+            # Synchronize decision across all processes in distributed setting
+            if self.distributed:
+                # Create tensors for broadcasting
+                update_tensor = torch.tensor([1 if should_update_lr else 0], device="cuda" if torch.cuda.is_available() else "cpu")
+                lr_tensor = torch.tensor([new_lr], device="cuda" if torch.cuda.is_available() else "cpu")
+                
+                # Broadcast decision and new LR from rank 0 to all processes
+                torch.distributed.broadcast(update_tensor, 0)
+                torch.distributed.broadcast(lr_tensor, 0)
+                
+                # Extract values from tensors
+                should_update_lr = update_tensor.item() == 1
+                new_lr = lr_tensor.item()
+            
+            # Apply the learning rate change on all processes if needed
+            if should_update_lr:
+                # Force update through the optimizer directly
+                for param_group in param_groups:
+                    param_group['lr'] = new_lr
+                
+                # Verify the change was applied on main process
+                if not self.distributed or self.is_main_process:
                     actual_lr = param_groups[0]['lr']
                     if actual_lr != new_lr and (self.verbose or self.debug):
                         print(f"Warning: Failed to update LR! Expected {new_lr:.8f} but got {actual_lr:.8f}")
@@ -280,10 +296,6 @@ class GreedyLR:
                                     group['lr'] = new_lr
                         except Exception as e:
                             print(f"Error updating internal optimizer: {e}")
-                    
-                    self.warmup_counter = self.warmup
-                    self.num_bad_epochs = 0
-                    self.best_loss = float('inf')  # Reset best loss after LR change
             
             # Reset step counter after evaluation
             self.steps_since_last_update = 0
