@@ -188,6 +188,8 @@ class MinLMTrainer:
 
     def init_deepspeed(self, train_dataloader, args):
         """Initialize DeepSpeed engine"""
+        # Store the greedylr_debug flag for later use
+        self.greedylr_debug = args.greedylr_debug if hasattr(args, 'greedylr_debug') else False
         # Create DeepSpeed config
         if args.deepspeed_config and os.path.exists(args.deepspeed_config):
             # Load config from file if provided
@@ -690,8 +692,8 @@ class MinLMTrainer:
             # Check LR after update
             after_lr = self.optimizer.param_groups[0]['lr']
             
-            # Log LR changes (only when they actually happen)
-            if after_lr != before_lr and self.global_rank == 0:
+            # Log LR changes only when debugging is enabled
+            if after_lr != before_lr and self.global_rank == 0 and args.greedylr_debug:
                 print(f"\nStep {self.global_step}: GreedyLR changed learning rate from {before_lr:.8f} to {after_lr:.8f}")
         
         # Update tokens processed count
