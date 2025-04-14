@@ -115,6 +115,12 @@ class GreedyLR:
     
     def step(self, metrics=None, epoch=None):
         """Execute a step of the scheduler with optional metrics."""
+        # First verify we can access the optimizer and its param_groups
+        if not hasattr(self.optimizer, 'param_groups') or len(self.optimizer.param_groups) == 0:
+            if self.debug or self.verbose:
+                print(f"Warning: Cannot access optimizer parameters in GreedyLR")
+            return [self.base_lrs[0]]  # Return original LR
+            
         param_groups = self.optimizer.param_groups
         current_lr = param_groups[0]['lr']
         
@@ -196,14 +202,30 @@ class GreedyLR:
                     if self.verbose or self.debug:
                         print(f'GreedyLR increasing learning rate from {old_lr:.6f} to {new_lr:.6f}')
                     
-                    # Force update through the optimizer directly
+                    # Force update through the optimizer directly - use multiple approaches
                     for param_group in param_groups:
+                        # Try both direct assignment and setattr
                         param_group['lr'] = new_lr
+                        try:
+                            setattr(param_group, 'lr', new_lr)
+                        except (AttributeError, TypeError):
+                            pass
                         
                     # Verify the change was applied
                     actual_lr = param_groups[0]['lr']
                     if actual_lr != new_lr and (self.verbose or self.debug):
                         print(f"Warning: Failed to update LR! Expected {new_lr:.8f} but got {actual_lr:.8f}")
+                        print("Attempting to update again with different method...")
+                        # Try one more method - find the underlying optimizer
+                        try:
+                            # Access the internal optimizer if this is a DeepSpeed optimizer wrapper
+                            if hasattr(self.optimizer, 'optimizer'):
+                                print("Detected DeepSpeed optimizer wrapper, accessing internal optimizer")
+                                internal_optimizer = self.optimizer.optimizer
+                                for group in internal_optimizer.param_groups:
+                                    group['lr'] = new_lr
+                        except Exception as e:
+                            print(f"Error updating internal optimizer: {e}")
                     
                     self.cooldown_counter = self.cooldown
                     self.num_good_epochs = 0
@@ -218,8 +240,30 @@ class GreedyLR:
                     if self.verbose or self.debug:
                         print(f'GreedyLR reducing learning rate from {old_lr:.6f} to {new_lr:.6f}')
                     
+                    # Force update through the optimizer directly - use multiple approaches
                     for param_group in param_groups:
+                        # Try both direct assignment and setattr
                         param_group['lr'] = new_lr
+                        try:
+                            setattr(param_group, 'lr', new_lr)
+                        except (AttributeError, TypeError):
+                            pass
+                        
+                    # Verify the change was applied
+                    actual_lr = param_groups[0]['lr']
+                    if actual_lr != new_lr and (self.verbose or self.debug):
+                        print(f"Warning: Failed to update LR! Expected {new_lr:.8f} but got {actual_lr:.8f}")
+                        print("Attempting to update again with different method...")
+                        # Try one more method - find the underlying optimizer
+                        try:
+                            # Access the internal optimizer if this is a DeepSpeed optimizer wrapper
+                            if hasattr(self.optimizer, 'optimizer'):
+                                print("Detected DeepSpeed optimizer wrapper, accessing internal optimizer")
+                                internal_optimizer = self.optimizer.optimizer
+                                for group in internal_optimizer.param_groups:
+                                    group['lr'] = new_lr
+                        except Exception as e:
+                            print(f"Error updating internal optimizer: {e}")
                     
                     self.warmup_counter = self.warmup
                     self.num_bad_epochs = 0

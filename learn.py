@@ -260,9 +260,37 @@ class MinLMTrainer:
             model_parameters=self.model.parameters(),
             config=ds_config
         )
-        
+    
         self.model = model_engine
         self.optimizer = optimizer
+    
+        # Completely disable DeepSpeed's scheduler
+        if hasattr(self.model, 'lr_scheduler'):
+            self.model.lr_scheduler = None
+            if self.global_rank == 0 and not self.silent_mode:
+                print("Completely disabled DeepSpeed's native scheduler")
+    
+        # Monkey patch the optimizer step method to preserve our learning rates
+        if args.lr_scheduler == "greedylr":
+            if self.global_rank == 0 and not self.silent_mode:
+                print("Monkey patching optimizer step method to preserve custom learning rates")
+        
+            # Store the original optimizer step method
+            original_step = self.optimizer.step
+        
+            # Define a custom step method that preserves learning rates
+            def custom_step(*args, **kwargs):
+                # Store current learning rates before the step
+                current_lrs = [group['lr'] for group in self.optimizer.param_groups]
+                # Call the original step method
+                result = original_step(*args, **kwargs)
+                # Restore the learning rates after the step
+                for i, lr in enumerate(current_lrs):
+                    self.optimizer.param_groups[i]['lr'] = lr
+                return result
+        
+            # Replace the optimizer's step method with our custom version
+            self.optimizer.step = custom_step
         
         # Create GreedyLR scheduler if requested
         self.lr_scheduler = None
