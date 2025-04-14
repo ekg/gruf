@@ -276,8 +276,14 @@ class MinLMTrainer:
                 print(f"  Factor: {args.greedylr_factor}")
                 print(f"  Patience: {args.greedylr_patience}")
                 print(f"  Window size: {args.greedylr_window}")
+                print(f"  Update interval: {args.greedylr_update_interval} steps")
+                if args.greedylr_ema is not None:
+                    print(f"  Smoothing: EMA with beta={args.greedylr_ema}")
+                else:
+                    print(f"  Smoothing: Window averaging (size={args.greedylr_window})")
                 print(f"  Min LR: {min_lr}")
                 print(f"  Max LR: {self.learning_rate}")
+                print(f"  Debug output: {args.greedylr_debug}")
             
             self.lr_scheduler = GreedyLR(
                 optimizer=self.optimizer,
@@ -290,8 +296,11 @@ class MinLMTrainer:
                 max_lr=self.learning_rate,
                 smooth=True,
                 window=args.greedylr_window,
+                smoothing_factor=args.greedylr_ema,
+                update_interval=args.greedylr_update_interval,
                 reset=0,
-                verbose=(self.global_rank == 0 and not self.silent_mode)
+                verbose=(self.global_rank == 0 and not self.silent_mode),
+                debug=args.greedylr_debug
             )
         
         # Print device info if main process
@@ -1357,6 +1366,12 @@ def main():
                         help="Number of steps with no improvement before changing learning rate in GreedyLR (default: 10)")
     parser.add_argument("--greedylr_window", type=int, default=50,
                         help="Window size for smoothing loss values in GreedyLR (default: 50)")
+    parser.add_argument("--greedylr_update_interval", type=int, default=5,
+                        help="Number of steps between LR update evaluations in GreedyLR (default: 5)")
+    parser.add_argument("--greedylr_ema", type=float, default=None,
+                        help="Use EMA smoothing with this beta factor instead of window averaging (default: None)")
+    parser.add_argument("--greedylr_debug", action="store_true",
+                        help="Enable detailed debugging output from GreedyLR scheduler")
     parser.add_argument("--warmup_steps", type=int, default=None,
                         help="Number of warmup steps (default: auto-calculated based on total steps)")
     parser.add_argument("--warmup_pct", type=float, default=None,
