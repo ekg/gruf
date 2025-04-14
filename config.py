@@ -8,9 +8,9 @@ TRAINING_CONFIG = {
     "batch_size": 2,
     "grad_accum_every": 8,
     "learning_rate": 1e-3,
-    "validate_every": 128,
-    "prime_length": 128,
-    "generate_every": 128,
+    "validate_every": 100,
+    "prime_length": 100,
+    "generate_every": 100,
     "generate_length": 512,
     "seq_len": 1024 * 8,
 }
