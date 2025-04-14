@@ -141,7 +141,8 @@ class MinLMTrainer:
         world_size=1,
         global_rank=0,
         silent_mode=True,
-        debug_gradients=False
+        debug_gradients=False,
+        checkpoint_every=100
     ):
         self.learning_rate = learning_rate
         self.model = minLM(
@@ -173,6 +174,7 @@ class MinLMTrainer:
         # Store settings
         self.silent_mode = silent_mode
         self.debug_gradients = debug_gradients
+        self.checkpoint_every = checkpoint_every
         
         # Initialize metric tracking
         self.train_loss = 0.0
@@ -945,8 +947,8 @@ class MinLMTrainer:
                 if self.global_rank == 0 and step % 10 == 0:
                     self._log_metrics(False)
                     
-                # Save periodic checkpoint every 1000 steps for safety
-                if self.global_rank == 0 and step > 0 and step % 1000 == 0:
+                # Save periodic checkpoint based on configured interval
+                if self.global_rank == 0 and step > 0 and step % self.checkpoint_every == 0:
                     self.save_checkpoint({"periodic": True}, is_periodic=True)
                     if not self.silent_mode:
                         print(f"Saved periodic checkpoint at step {step}")
@@ -1447,6 +1449,8 @@ def main():
     # Model architecture arguments
     parser.add_argument("--dim", type=str, default=None,
                         help="Model hidden dimension (default: 512). Can use k/m/g suffix.")
+    parser.add_argument("--checkpoint_every", type=int, default=100,
+                        help="Save checkpoint every N steps (default: 100)")
     parser.add_argument("--depth", type=int, default=None,
                         help="Number of model layers (default: 6).")
     parser.add_argument("--embedding_dim", type=int, default=None,
@@ -1854,7 +1858,8 @@ def main():
         world_size=world_size,
         global_rank=global_rank,
         silent_mode=not args.verbose,
-        debug_gradients=args.debug_gradients
+        debug_gradients=args.debug_gradients,
+        checkpoint_every=args.checkpoint_every
     )
     
     # Store val_dataset for text generation
