@@ -285,21 +285,22 @@ class MinLMTrainer:
                 print(f"  Max LR: {self.learning_rate}")
                 print(f"  Debug output: {args.greedylr_debug}")
             
-                # CRITICAL: Verify the scheduler config is not present in DeepSpeed
-                print("\nIMPORTANT: Checking DeepSpeed scheduler configuration:")
-                if hasattr(self.model, 'optimizer') and hasattr(self.model.optimizer, 'scheduler'):
-                    print(f"  WARNING: DeepSpeed has its own scheduler. This may conflict with GreedyLR.")
+            # CRITICAL: Verify and disable the scheduler in DeepSpeed (for all ranks)
+            if hasattr(self.model, 'optimizer') and hasattr(self.model.optimizer, 'scheduler'):
+                if self.global_rank == 0 and not self.silent_mode:
+                    print("\nIMPORTANT: DeepSpeed scheduler detected, disabling it for GreedyLR compatibility")
                     print(f"  DeepSpeed scheduler type: {type(self.model.optimizer.scheduler).__name__}")
                 
-                    # Attempt to disable DeepSpeed's scheduler
-                    try:
-                        print("  Attempting to disable DeepSpeed's built-in scheduler...")
-                        self.model.optimizer.scheduler = None
+                # Must disable on all ranks, not just rank 0
+                try:
+                    self.model.optimizer.scheduler = None
+                    if self.global_rank == 0 and not self.silent_mode:
                         print("  DeepSpeed scheduler successfully disabled.")
-                    except Exception as e:
+                except Exception as e:
+                    if self.global_rank == 0 and not self.silent_mode:
                         print(f"  Failed to disable DeepSpeed scheduler: {e}")
-                else:
-                    print("  No DeepSpeed scheduler detected. GreedyLR should work correctly.")
+            elif self.global_rank == 0 and not self.silent_mode:
+                print("\nIMPORTANT: No DeepSpeed scheduler detected. GreedyLR should work correctly.")
         
             self.lr_scheduler = GreedyLR(
                 optimizer=self.optimizer,
@@ -457,8 +458,15 @@ class MinLMTrainer:
                     # Removed weight_decay to match standard Adam in Lightning
                 }
             },
-            # If using GreedyLR, don't use a DeepSpeed scheduler at all
-            "scheduler": None if args.lr_scheduler == "greedylr" else self._create_scheduler_config(
+            # If using GreedyLR, provide a dummy scheduler that doesn't change the LR
+            "scheduler": {
+                "type": "WarmupLR",
+                "params": {
+                    "warmup_min_lr": learning_rate,  # No actual warmup, just constant LR
+                    "warmup_max_lr": learning_rate,
+                    "warmup_num_steps": 1
+                }
+            } if args.lr_scheduler == "greedylr" else self._create_scheduler_config(
                 args.lr_scheduler,
                 learning_rate,
                 args.min_lr,
@@ -625,6 +633,12 @@ class MinLMTrainer:
         
         # Update our custom GreedyLR scheduler if it exists
         if hasattr(self, 'lr_scheduler') and self.lr_scheduler is not None:
+            # Ensure DeepSpeed's scheduler is still disabled
+            if hasattr(self.model, 'optimizer') and hasattr(self.model.optimizer, 'scheduler') and self.model.optimizer.scheduler is not None:
+                self.model.optimizer.scheduler = None
+                if self.global_rank == 0 and self.global_step % 50 == 0 and not self.silent_mode:
+                    print(f"Re-disabled DeepSpeed scheduler at step {self.global_step}")
+            
             # Check LR before update
             before_lr = self.optimizer.param_groups[0]['lr']
             
@@ -637,11 +651,6 @@ class MinLMTrainer:
             # Log LR changes (only when they actually happen)
             if after_lr != before_lr and self.global_rank == 0:
                 print(f"\nStep {self.global_step}: GreedyLR changed learning rate from {before_lr:.8f} to {after_lr:.8f}")
-                
-            # Periodically check if DeepSpeed is overriding our LR changes
-            if self.global_step % 50 == 0 and self.global_rank == 0:
-                if hasattr(self.model, 'optimizer') and hasattr(self.model.optimizer, 'scheduler') and self.model.optimizer.scheduler is not None:
-                    print(f"Warning: DeepSpeed still has an active scheduler at step {self.global_step}")
         
         # Update tokens processed count
         tokens_in_batch = batch.numel()

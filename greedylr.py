@@ -197,16 +197,10 @@ class GreedyLR:
                         print(f'GreedyLR increasing learning rate from {old_lr:.6f} to {new_lr:.6f}')
                     
                     # Force update through the optimizer directly
-                    # Force update through the optimizer directly
                     for param_group in param_groups:
                         param_group['lr'] = new_lr
                         
-                    # Also verify the change was applied
-                    actual_lr = param_groups[0]['lr']
-                    if actual_lr != new_lr and (self.verbose or self.debug):
-                        print(f"Warning: Failed to update LR! Expected {new_lr:.8f} but got {actual_lr:.8f}")
-                        
-                    # Also verify the change was applied
+                    # Verify the change was applied
                     actual_lr = param_groups[0]['lr']
                     if actual_lr != new_lr and (self.verbose or self.debug):
                         print(f"Warning: Failed to update LR! Expected {new_lr:.8f} but got {actual_lr:.8f}")
