@@ -1912,6 +1912,13 @@ def main():
                 # Update the trainer's learning rate
                 trainer.learning_rate = suggested_lr
                 
+                # Actually update the optimizer's learning rate directly
+                for param_group in trainer.optimizer.param_groups:
+                    param_group['lr'] = suggested_lr
+                
+                # Verify the updated LR
+                print(f"Verified optimizer learning rate: {trainer.optimizer.param_groups[0]['lr']}")
+                
                 # Calculate optimal learning rate schedule if using auto mode
                 if args.lr_scheduler == "auto":
                     schedule_params = trainer.calculate_optimal_lr_schedule(
