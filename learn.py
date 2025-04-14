@@ -343,11 +343,13 @@ class MinLMTrainer:
             # Set max learning rate (use command line value if provided, otherwise use initial learning rate)
             max_lr = args.max_lr if args.max_lr is not None else self.learning_rate
             
-            # Get warmup steps for GreedyLR
-            warmup_steps = args.warmup_steps if args.warmup_steps is not None else 0
+            # Get warmup steps for GreedyLR (prioritize greedylr_warmup if specified)
+            warmup_steps = args.greedylr_warmup if args.greedylr_warmup is not None else args.warmup_steps
+            if warmup_steps is None:
+                warmup_steps = 0
         
             if self.global_rank == 0 and not self.silent_mode and warmup_steps > 0:
-                print(f"  Warmup: {warmup_steps} steps from {min_lr} to {self.learning_rate}")
+                print(f"  Warmup: {warmup_steps} steps from {min_lr} to {max_lr}")
             
             self.lr_scheduler = GreedyLR(
                 optimizer=self.optimizer,
@@ -1010,7 +1012,11 @@ class MinLMTrainer:
                     # Add GreedyLR concise status if available
                     lr_info = f"LR: {current_lr:.6f}"
                     if hasattr(self, 'lr_scheduler') and self.lr_scheduler is not None and hasattr(self.lr_scheduler, 'status_symbol'):
-                        lr_info = f"LR: {current_lr:.6f} {self.lr_scheduler.status_symbol} {self.lr_scheduler.status_info}"
+                        if hasattr(self.lr_scheduler, 'in_warmup') and self.lr_scheduler.in_warmup:
+                            warmup_info = f"Warmup {self.lr_scheduler.warmup_counter}/{self.lr_scheduler.warmup}"
+                            lr_info = f"LR: {current_lr:.6f} ↗ {warmup_info}"
+                        else:
+                            lr_info = f"LR: {current_lr:.6f} {self.lr_scheduler.status_symbol} {self.lr_scheduler.status_info}"
                             
                     pbar.set_description(f"Loss: {loss:.4f} | {lr_info} | {val_info}{tokens_per_sec:.2f} tok/s")
                     pbar.update(1)

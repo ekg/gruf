@@ -61,6 +61,7 @@ class GreedyLR:
         self.loss_window = []
         self.ema_loss = None
         self.steps_since_last_update = 0
+        self.in_warmup = warmup > 0  # Track whether we're in warmup phase
         
         if factor >= 1.0 or factor <= 0:
             raise ValueError('Factor should be between 0 and 1')
@@ -156,7 +157,7 @@ class GreedyLR:
         current_lr = param_groups[0]['lr']
         
         # Handle warmup phase first - this takes precedence over other adjustments
-        if self.warmup > 0 and self.warmup_counter < self.warmup:
+        if self.in_warmup and self.warmup_counter < self.warmup:
             # Calculate the percentage of warmup completed
             warmup_percent = self.warmup_counter / self.warmup
             # Start from min_lrs and linearly increase to base_lrs
@@ -167,9 +168,19 @@ class GreedyLR:
             # Increment warmup counter
             self.warmup_counter += 1
             
-            if self.debug and self.is_main_process:
+            # Update status information during warmup
+            self.status_symbol = "↗"  # Up arrow for warmup phase
+            self.status_info = f"Warmup {self.warmup_counter}/{self.warmup}"
+            
+            if self.verbose or (self.debug and self.is_main_process):
                 print(f"GreedyLR: In warmup phase ({self.warmup_counter}/{self.warmup}), "
                       f"LR set to {param_groups[0]['lr']:.6f}")
+            
+            # Check if we've completed warmup
+            if self.warmup_counter >= self.warmup:
+                self.in_warmup = False
+                if self.verbose or (self.debug and self.is_main_process):
+                    print(f"GreedyLR: Warmup completed. Transitioning to normal operation with LR={param_groups[0]['lr']:.6f}")
             
             # During warmup, we don't perform other LR adjustments
             return self.get_lr()
