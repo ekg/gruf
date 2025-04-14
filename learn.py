@@ -653,7 +653,21 @@ class MinLMTrainer:
             total_norm = total_norm ** 0.5
             print(f"Step {self.global_step}, Total gradient norm: {total_norm:.6f}")
         
+        # Store current learning rates before DeepSpeed's step()
+        current_lrs = None
+        if hasattr(self, 'lr_scheduler') and self.lr_scheduler is not None:
+            current_lrs = [group['lr'] for group in self.optimizer.param_groups]
+        
         self.model.step()
+        
+        # Ensure our learning rates weren't changed by DeepSpeed's step
+        if hasattr(self, 'lr_scheduler') and self.lr_scheduler is not None and current_lrs is not None:
+            for i, lr in enumerate(current_lrs):
+                if self.optimizer.param_groups[i]['lr'] != lr:
+                    # If DeepSpeed changed our LR, restore it
+                    self.optimizer.param_groups[i]['lr'] = lr
+                    if self.global_rank == 0 and not self.silent_mode:
+                        print(f"Restored LR from {self.optimizer.param_groups[i]['lr']} to {lr}")
         
         # Track loss
         loss_val = loss.detach().float().item()
