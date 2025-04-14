@@ -53,6 +53,7 @@ class GreedyLR:
         self.cooldown_counter = 0
         self.warmup_counter = 0
         self.best_loss = float('inf')
+        self.best_raw_loss = float('inf')  # Track best raw loss separately
         self.loss_window = []
         self.ema_loss = None
         self.steps_since_last_update = 0
@@ -80,6 +81,7 @@ class GreedyLR:
             'cooldown': self.cooldown,
             'warmup': self.warmup, 
             'best_loss': self.best_loss,
+            'best_raw_loss': self.best_raw_loss,
             'num_bad_epochs': self.num_bad_epochs,
             'num_good_epochs': self.num_good_epochs,
             'cooldown_counter': self.cooldown_counter,
@@ -99,6 +101,7 @@ class GreedyLR:
         self.cooldown = state_dict['cooldown']
         self.warmup = state_dict['warmup']
         self.best_loss = state_dict['best_loss']
+        self.best_raw_loss = state_dict.get('best_raw_loss', state_dict['best_loss'])  # Backward compatibility
         self.num_bad_epochs = state_dict['num_bad_epochs']
         self.num_good_epochs = state_dict['num_good_epochs']
         self.cooldown_counter = state_dict['cooldown_counter']
@@ -186,31 +189,50 @@ class GreedyLR:
             
             if not self.distributed or self.is_main_process:
                 # Check if loss is better or worse
-                # Using a relative threshold that scales with the loss
-                rel_threshold = self.threshold * current_loss if self.threshold > 0 else 0
+                # Using relative thresholds that scale with the respective loss values
+                raw_rel_threshold = self.threshold * metrics if self.threshold > 0 else 0
+                ema_rel_threshold = self.threshold * current_loss if self.threshold > 0 else 0
                 
-                # Track both the raw loss and the EMA loss to be more responsive
-                raw_loss_improved = metrics < self.best_loss - rel_threshold
-                ema_loss_improved = current_loss < self.best_loss - rel_threshold
+                # Compare raw loss to best raw loss, and EMA loss to best EMA loss
+                raw_loss_improved = metrics < (self.best_raw_loss - raw_rel_threshold)
+                ema_loss_improved = current_loss < (self.best_loss - ema_rel_threshold)
                 
                 if raw_loss_improved or ema_loss_improved:
-                    # Loss has improved - consider improvement on either raw or EMA
-                    # But update best_loss based on EMA for stability
-                    improvement = self.best_loss - min(metrics, current_loss)
-                    self.best_loss = current_loss  # Still use smoothed loss for best_loss
+                    # Loss has improved on either raw or EMA metric
+                    raw_improvement = self.best_raw_loss - metrics if raw_loss_improved else 0
+                    ema_improvement = self.best_loss - current_loss if ema_loss_improved else 0
+                    
+                    # Update both best loss trackers
+                    if raw_loss_improved:
+                        self.best_raw_loss = metrics
+                    if ema_loss_improved:
+                        self.best_loss = current_loss
+                        
                     self.num_good_epochs += 1
                     # Don't reset bad epochs to 0, gradually reduce instead
                     self.num_bad_epochs = max(0, self.num_bad_epochs - 1)
+                    
                     if self.debug:
-                        improvement_type = "raw" if raw_loss_improved else "EMA"
-                        print(f"GreedyLR: {improvement_type} loss improved by {improvement:.6f}, raw={metrics:.6f}, EMA={current_loss:.6f}, good_steps={self.num_good_epochs}, bad_steps={self.num_bad_epochs}")
+                        if raw_loss_improved and ema_loss_improved:
+                            improvement_type = "both raw and EMA"
+                        elif raw_loss_improved:
+                            improvement_type = "raw"
+                        else:
+                            improvement_type = "EMA"
+                        
+                        print(f"GreedyLR: {improvement_type} loss improved, raw_imp={raw_improvement:.6f}, ema_imp={ema_improvement:.6f}, "
+                              f"raw={metrics:.6f}, EMA={current_loss:.6f}, best_raw={self.best_raw_loss:.6f}, best_ema={self.best_loss:.6f}, "
+                              f"good_steps={self.num_good_epochs}, bad_steps={self.num_bad_epochs}")
                 else:
                     # Neither raw nor EMA loss improved
                     # Don't reset good epochs to 0, gradually reduce instead
                     self.num_good_epochs = max(0, self.num_good_epochs - 1)
                     self.num_bad_epochs += 1
+                    
                     if self.debug:
-                        print(f"GreedyLR: Loss didn't improve, raw={metrics:.6f}, EMA={current_loss:.6f}, best={self.best_loss:.6f}, good_steps={self.num_good_epochs}, bad_steps={self.num_bad_epochs}")
+                        print(f"GreedyLR: Loss didn't improve, raw={metrics:.6f} vs best={self.best_raw_loss:.6f}, "
+                              f"EMA={current_loss:.6f} vs best={self.best_loss:.6f}, "
+                              f"good_steps={self.num_good_epochs}, bad_steps={self.num_bad_epochs}")
                     
                     # Add plateau detection - if loss has been within a small range for a while
                     if self.smooth and len(self.loss_window) >= 20:  # Need enough samples to detect plateau
