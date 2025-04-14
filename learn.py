@@ -340,7 +340,7 @@ class MinLMTrainer:
                 optimizer=self.optimizer,
                 factor=args.greedylr_factor,
                 patience=args.greedylr_patience,
-                threshold=1e-4,
+                threshold=args.greedylr_threshold,
                 cooldown=0,
                 warmup=0,
                 min_lr=min_lr,
@@ -1507,6 +1507,8 @@ def main():
                         help="Factor by which the learning rate will be increased/decreased in GreedyLR (default: 0.1)")
     parser.add_argument("--greedylr_patience", type=int, default=10,
                         help="Number of steps with no improvement before changing learning rate in GreedyLR (default: 10)")
+    parser.add_argument("--greedylr_threshold", type=float, default=1e-10,
+                        help="Threshold for measuring improvement in GreedyLR (default: 1e-10)")
     parser.add_argument("--greedylr_window", type=int, default=50,
                         help="Window size for smoothing loss values in GreedyLR (default: 50)")
     parser.add_argument("--greedylr_update_interval", type=int, default=5,
