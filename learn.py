@@ -952,16 +952,28 @@ class MinLMTrainer:
         # Calculate the multiplication factor for LR
         mult_factor = (max_lr / min_lr) ** (1 / num_iter)
         
+        # Record the initial learning rate
+        initial_lr = self.optimizer.param_groups[0]['lr']
+        
         # Save initial model parameters and optimizer state
         # For DeepSpeed, we need to save checkpoint first
         temp_dir = os.path.join(self.checkpoint_dir, "lr_finder_temp") if self.checkpoint_dir else "lr_finder_temp"
+        
+        # Make sure all ranks are synchronized when creating directory
         if self.global_rank == 0:
             os.makedirs(temp_dir, exist_ok=True)
         
-        # Save the initial model state
+        # Make sure all processes see the directory
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        
+        # Now all ranks can save their part of the checkpoint
         if hasattr(self.model, 'save_checkpoint'):
             self.model.save_checkpoint(temp_dir, tag="init")
-        
+            # Ensure all ranks have completed the save
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+
         # Set initial learning rate
         lr = min_lr
         for param_group in self.optimizer.param_groups:
@@ -1035,13 +1047,31 @@ class MinLMTrainer:
         # Analyze results to suggest a learning rate
         suggested_lr = self._analyze_lr_find_results(log_lrs, losses)
         
-        # Restore the original model state
+        # Make sure every rank resets to the initial state
         if hasattr(self.model, 'load_checkpoint'):
-            self.model.load_checkpoint(temp_dir, tag="init")
+            try:
+                # All ranks try to load the checkpoint
+                self.model.load_checkpoint(temp_dir, tag="init")
+            except Exception as e:
+                # If there's an error, log it but don't terminate
+                if self.global_rank == 0 and not self.silent_mode:
+                    print(f"Warning: Error when restoring model state after LR finder: {e}")
+                    print("Continuing with current model state...")
+        
+        # Restore the original learning rate
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = initial_lr
+            
+        # Make sure all ranks are done before cleanup
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
         
         # Clean up temp directory
         if self.global_rank == 0 and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception as e:
+                print(f"Warning: Could not remove temporary directory: {e}")
         
         return log_lrs, losses, suggested_lr
 
@@ -1817,6 +1847,12 @@ def main():
             num_iter=args.num_lr_find_iter,
             show_progress=(global_rank == 0)
         )
+        
+        # For distributed training, broadcast the suggested_lr from rank 0 to all ranks
+        if world_size > 1:
+            suggested_lr_tensor = torch.tensor([suggested_lr], dtype=torch.float32, device=f"cuda:{local_rank}")
+            torch.distributed.broadcast(suggested_lr_tensor, 0)
+            suggested_lr = suggested_lr_tensor.item()
         
         # Save the results to a file
         if global_rank == 0:
