@@ -997,7 +997,13 @@ class MinLMTrainer:
                     tokens_per_sec = self.global_tokens.item() / elapsed if elapsed > 0 else 0
                     val_info = f"Val: {self.val_loss:.4f} BPB: {self.val_bpb:.4f} | " if self.val_loss > 0 else ""
                     current_lr = self.optimizer.param_groups[0]['lr']
-                    pbar.set_description(f"Loss: {loss:.4f} | LR: {current_lr:.6f} | {val_info}{tokens_per_sec:.2f} tok/s")
+                        
+                    # Add GreedyLR concise status if available
+                    lr_info = f"LR: {current_lr:.6f}"
+                    if hasattr(self, 'lr_scheduler') and self.lr_scheduler is not None and hasattr(self.lr_scheduler, 'status_symbol'):
+                        lr_info = f"LR: {current_lr:.6f} {self.lr_scheduler.status_symbol} {self.lr_scheduler.status_info}"
+                            
+                    pbar.set_description(f"Loss: {loss:.4f} | {lr_info} | {val_info}{tokens_per_sec:.2f} tok/s")
                     pbar.update(1)
                 
                 # Log progress

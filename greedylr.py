@@ -35,6 +35,10 @@ class GreedyLR:
         self.global_rank = torch.distributed.get_rank() if self.distributed else 0
         self.world_size = torch.distributed.get_world_size() if self.distributed else 1
         self.is_main_process = self.global_rank == 0
+        
+        # Status information for progress bar
+        self.status_symbol = "•"  # Default neutral symbol
+        self.status_info = "+0/-0"  # Default counter status
         self.optimizer = optimizer
         self.factor = factor
         self.patience = patience
@@ -90,7 +94,9 @@ class GreedyLR:
             'loss_window': self.loss_window,
             'ema_loss': self.ema_loss,
             'steps_since_last_update': self.steps_since_last_update,
-            'update_interval': self.update_interval
+            'update_interval': self.update_interval,
+            'status_symbol': self.status_symbol,
+            'status_info': self.status_info
         }
 
     def load_state_dict(self, state_dict):
@@ -116,6 +122,14 @@ class GreedyLR:
             self.steps_since_last_update = state_dict['steps_since_last_update']
         if 'update_interval' in state_dict:
             self.update_interval = state_dict['update_interval']
+        if 'status_symbol' in state_dict:
+            self.status_symbol = state_dict['status_symbol']
+        else:
+            self.status_symbol = "•"  # Default neutral symbol
+        if 'status_info' in state_dict:
+            self.status_info = state_dict['status_info']
+        else:
+            self.status_info = f"+{self.num_good_epochs}/-{self.num_bad_epochs}"
     
     def get_lr(self):
         """Get current learning rate."""
@@ -212,14 +226,21 @@ class GreedyLR:
                     # Don't reset bad epochs to 0, gradually reduce instead
                     self.num_bad_epochs = max(0, self.num_bad_epochs - 1)
                     
+                    # Set status info for concise display
+                    if raw_loss_improved and ema_loss_improved:
+                        improvement_type = "both raw and EMA"
+                        self.status_symbol = "✓✓"  # Double check for both improved
+                    elif raw_loss_improved:
+                        improvement_type = "raw"
+                        self.status_symbol = "✓"   # Check for raw improved
+                    else:
+                        improvement_type = "EMA"
+                        self.status_symbol = "✓"   # Check for EMA improved
+                    
+                    # Store stats for concise display
+                    self.status_info = f"+{self.num_good_epochs}/-{self.num_bad_epochs}"
+                    
                     if self.debug:
-                        if raw_loss_improved and ema_loss_improved:
-                            improvement_type = "both raw and EMA"
-                        elif raw_loss_improved:
-                            improvement_type = "raw"
-                        else:
-                            improvement_type = "EMA"
-                        
                         print(f"GreedyLR: {improvement_type} loss improved, raw_imp={raw_improvement:.6f}, ema_imp={ema_improvement:.6f}, "
                               f"raw={metrics:.6f}, EMA={current_loss:.6f}, best_raw={self.best_raw_loss:.6f}, best_ema={self.best_loss:.6f}, "
                               f"good_steps={self.num_good_epochs}, bad_steps={self.num_bad_epochs}")
@@ -228,6 +249,10 @@ class GreedyLR:
                     # Don't reset good epochs to 0, gradually reduce instead
                     self.num_good_epochs = max(0, self.num_good_epochs - 1)
                     self.num_bad_epochs += 1
+                    
+                    # Set status info for concise display
+                    self.status_symbol = "✗"  # X for no improvement
+                    self.status_info = f"+{self.num_good_epochs}/-{self.num_bad_epochs}"
                     
                     if self.debug:
                         print(f"GreedyLR: Loss didn't improve, raw={metrics:.6f} vs best={self.best_raw_loss:.6f}, "
