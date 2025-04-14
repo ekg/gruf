@@ -264,6 +264,36 @@ class MinLMTrainer:
         self.model = model_engine
         self.optimizer = optimizer
         
+        # Create GreedyLR scheduler if requested
+        self.lr_scheduler = None
+        if args.lr_scheduler == "greedylr":
+            from greedylr import GreedyLR
+            
+            min_lr = args.min_lr if args.min_lr is not None else self.learning_rate * 0.01
+            
+            if self.global_rank == 0 and not self.silent_mode:
+                print(f"\nInitializing GreedyLR scheduler:")
+                print(f"  Factor: {args.greedylr_factor}")
+                print(f"  Patience: {args.greedylr_patience}")
+                print(f"  Window size: {args.greedylr_window}")
+                print(f"  Min LR: {min_lr}")
+                print(f"  Max LR: {self.learning_rate}")
+            
+            self.lr_scheduler = GreedyLR(
+                optimizer=self.optimizer,
+                factor=args.greedylr_factor,
+                patience=args.greedylr_patience,
+                threshold=1e-4,
+                cooldown=0,
+                warmup=0,
+                min_lr=min_lr,
+                max_lr=self.learning_rate,
+                smooth=True,
+                window=args.greedylr_window,
+                reset=0,
+                verbose=(self.global_rank == 0 and not self.silent_mode)
+            )
+        
         # Print device info if main process
         if self.global_rank == 0:
             param_count = sum(1 for p in self.model.parameters())
@@ -404,8 +434,9 @@ class MinLMTrainer:
             },
             # CRITICAL FIX: DeepSpeed counts steps AFTER gradient accumulation
             # So we should NOT multiply by grad_accum_steps here
+            # If using GreedyLR, we'll need to create it manually after DeepSpeed initialization
             "scheduler": self._create_scheduler_config(
-                args.lr_scheduler,
+                args.lr_scheduler if args.lr_scheduler != "greedylr" else "constant",
                 learning_rate,
                 args.min_lr,
                 args.warmup_steps,
@@ -568,6 +599,10 @@ class MinLMTrainer:
         # Track loss
         loss_val = loss.detach().float().item()
         self.train_loss = loss_val
+        
+        # Update our custom GreedyLR scheduler if it exists
+        if hasattr(self, 'lr_scheduler') and self.lr_scheduler is not None:
+            self.lr_scheduler.step(metrics=loss_val, epoch=self.global_step)
         
         # Update tokens processed count
         tokens_in_batch = batch.numel()
@@ -810,7 +845,8 @@ class MinLMTrainer:
                     elapsed = time.time() - self.start_time
                     tokens_per_sec = self.global_tokens.item() / elapsed if elapsed > 0 else 0
                     val_info = f"Val: {self.val_loss:.4f} BPB: {self.val_bpb:.4f} | " if self.val_loss > 0 else ""
-                    pbar.set_description(f"Loss: {loss:.4f} | {val_info}{tokens_per_sec:.2f} tok/s")
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    pbar.set_description(f"Loss: {loss:.4f} | LR: {current_lr:.6f} | {val_info}{tokens_per_sec:.2f} tok/s")
                     pbar.update(1)
                 
                 # Log progress
@@ -1312,8 +1348,15 @@ def main():
     
     # Learning rate scheduler parameters
     parser.add_argument("--lr_scheduler", type=str, default="auto",
-                        choices=["auto", "warmup", "warmup_decay", "one_cycle", "cosine", "constant"],
+                        choices=["auto", "warmup", "warmup_decay", "one_cycle", "cosine", "constant", "greedylr"],
                         help="Learning rate scheduler type (default: auto - chooses based on LR finder)")
+    # GreedyLR specific arguments
+    parser.add_argument("--greedylr_factor", type=float, default=0.1,
+                        help="Factor by which the learning rate will be increased/decreased in GreedyLR (default: 0.1)")
+    parser.add_argument("--greedylr_patience", type=int, default=10,
+                        help="Number of steps with no improvement before changing learning rate in GreedyLR (default: 10)")
+    parser.add_argument("--greedylr_window", type=int, default=50,
+                        help="Window size for smoothing loss values in GreedyLR (default: 50)")
     parser.add_argument("--warmup_steps", type=int, default=None,
                         help="Number of warmup steps (default: auto-calculated based on total steps)")
     parser.add_argument("--warmup_pct", type=float, default=None,
