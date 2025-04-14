@@ -72,6 +72,15 @@ class GreedyLR:
         param_groups = optimizer.param_groups
         self.base_lrs = [group['lr'] for group in param_groups]
         
+        # Set the starting LR to min_lr if warmup is enabled
+        if warmup > 0:
+            for param_group in param_groups:
+                param_group['lr'] = min_lr
+            
+            if self.debug and self.is_main_process:
+                print(f"GreedyLR warmup enabled: Starting from LR={min_lr}, "
+                      f"warming up to {self.base_lrs[0]} over {warmup} steps")
+        
         if self.debug:
             print(f"GreedyLR initialized with: factor={factor}, patience={patience}, "
                   f"update_interval={update_interval}, current_lr={self.base_lrs[0]}")
@@ -145,6 +154,25 @@ class GreedyLR:
             
         param_groups = self.optimizer.param_groups
         current_lr = param_groups[0]['lr']
+        
+        # Handle warmup phase first - this takes precedence over other adjustments
+        if self.warmup > 0 and self.warmup_counter < self.warmup:
+            # Calculate the percentage of warmup completed
+            warmup_percent = self.warmup_counter / self.warmup
+            # Start from min_lrs and linearly increase to base_lrs
+            for i, param_group in enumerate(param_groups):
+                # Linear warmup from min_lrs to base_lrs
+                param_group['lr'] = self.min_lrs + warmup_percent * (self.base_lrs[i] - self.min_lrs)
+                
+            # Increment warmup counter
+            self.warmup_counter += 1
+            
+            if self.debug and self.is_main_process:
+                print(f"GreedyLR: In warmup phase ({self.warmup_counter}/{self.warmup}), "
+                      f"LR set to {param_groups[0]['lr']:.6f}")
+            
+            # During warmup, we don't perform other LR adjustments
+            return self.get_lr()
         
         if metrics is None:
             return current_lr

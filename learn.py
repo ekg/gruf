@@ -306,6 +306,9 @@ class MinLMTrainer:
         
             min_lr = args.min_lr if args.min_lr is not None else self.learning_rate * 0.01
         
+            # Use greedylr_warmup if specified, otherwise fall back to general warmup_steps
+            warmup_steps = args.greedylr_warmup if args.greedylr_warmup is not None else args.warmup_steps
+        
             if self.global_rank == 0 and not self.silent_mode:
                 print(f"\nInitializing GreedyLR scheduler:")
                 print(f"  Factor: {args.greedylr_factor}")
@@ -340,13 +343,19 @@ class MinLMTrainer:
             # Set max learning rate (use command line value if provided, otherwise use initial learning rate)
             max_lr = args.max_lr if args.max_lr is not None else self.learning_rate
             
+            # Get warmup steps for GreedyLR
+            warmup_steps = args.warmup_steps if args.warmup_steps is not None else 0
+        
+            if self.global_rank == 0 and not self.silent_mode and warmup_steps > 0:
+                print(f"  Warmup: {warmup_steps} steps from {min_lr} to {self.learning_rate}")
+            
             self.lr_scheduler = GreedyLR(
                 optimizer=self.optimizer,
                 factor=args.greedylr_factor,
                 patience=args.greedylr_patience,
                 threshold=args.greedylr_threshold,
                 cooldown=0,
-                warmup=0,
+                warmup=warmup_steps,
                 min_lr=min_lr,
                 max_lr=max_lr,
                 smooth=True,
@@ -1560,6 +1569,8 @@ def main():
                         help="Number of steps between LR update evaluations in GreedyLR (default: 5)")
     parser.add_argument("--greedylr_ema", type=float, default=None,
                         help="Use EMA smoothing with this beta factor instead of window averaging (default: None)")
+    parser.add_argument("--greedylr_warmup", type=int, default=None,
+                        help="Number of steps for linear warmup in GreedyLR (default: uses --warmup_steps if set)")
     parser.add_argument("--greedylr_debug", action="store_true",
                         help="Enable detailed debugging output from GreedyLR scheduler")
     parser.add_argument("--warmup_steps", type=int, default=None,
