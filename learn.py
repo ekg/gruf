@@ -350,6 +350,13 @@ class MinLMTrainer:
         
             if self.global_rank == 0 and not self.silent_mode and warmup_steps > 0:
                 print(f"  Warmup: {warmup_steps} steps from {min_lr} to {max_lr}")
+                
+                # For warmup to work correctly, we need to set initial LR to min_lr
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = min_lr
+                    
+                if not self.silent_mode:
+                    print(f"  Initial LR set to {min_lr} for warmup")
             
             self.lr_scheduler = GreedyLR(
                 optimizer=self.optimizer,
