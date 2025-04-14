@@ -268,9 +268,9 @@ class MinLMTrainer:
         self.lr_scheduler = None
         if args.lr_scheduler == "greedylr":
             from greedylr import GreedyLR
-            
+        
             min_lr = args.min_lr if args.min_lr is not None else self.learning_rate * 0.01
-            
+        
             if self.global_rank == 0 and not self.silent_mode:
                 print(f"\nInitializing GreedyLR scheduler:")
                 print(f"  Factor: {args.greedylr_factor}")
@@ -285,6 +285,22 @@ class MinLMTrainer:
                 print(f"  Max LR: {self.learning_rate}")
                 print(f"  Debug output: {args.greedylr_debug}")
             
+                # CRITICAL: Verify the scheduler config is not present in DeepSpeed
+                print("\nIMPORTANT: Checking DeepSpeed scheduler configuration:")
+                if hasattr(self.model, 'optimizer') and hasattr(self.model.optimizer, 'scheduler'):
+                    print(f"  WARNING: DeepSpeed has its own scheduler. This may conflict with GreedyLR.")
+                    print(f"  DeepSpeed scheduler type: {type(self.model.optimizer.scheduler).__name__}")
+                
+                    # Attempt to disable DeepSpeed's scheduler
+                    try:
+                        print("  Attempting to disable DeepSpeed's built-in scheduler...")
+                        self.model.optimizer.scheduler = None
+                        print("  DeepSpeed scheduler successfully disabled.")
+                    except Exception as e:
+                        print(f"  Failed to disable DeepSpeed scheduler: {e}")
+                else:
+                    print("  No DeepSpeed scheduler detected. GreedyLR should work correctly.")
+        
             self.lr_scheduler = GreedyLR(
                 optimizer=self.optimizer,
                 factor=args.greedylr_factor,
@@ -441,15 +457,13 @@ class MinLMTrainer:
                     # Removed weight_decay to match standard Adam in Lightning
                 }
             },
-            # CRITICAL FIX: DeepSpeed counts steps AFTER gradient accumulation
-            # So we should NOT multiply by grad_accum_steps here
-            # If using GreedyLR, we'll need to create it manually after DeepSpeed initialization
-            "scheduler": self._create_scheduler_config(
-                args.lr_scheduler if args.lr_scheduler != "greedylr" else "constant",
+            # If using GreedyLR, don't use a DeepSpeed scheduler at all
+            "scheduler": None if args.lr_scheduler == "greedylr" else self._create_scheduler_config(
+                args.lr_scheduler,
                 learning_rate,
                 args.min_lr,
                 args.warmup_steps,
-                NUM_BATCHES,  # DeepSpeed already accounts for gradient accumulation
+                NUM_BATCHES,  # DeepSpeed already accounts for gradient accumulation 
                 args.decay_rate,
                 args.cycle_first_step_size,
                 args.decay_step_size,
@@ -611,7 +625,23 @@ class MinLMTrainer:
         
         # Update our custom GreedyLR scheduler if it exists
         if hasattr(self, 'lr_scheduler') and self.lr_scheduler is not None:
+            # Check LR before update
+            before_lr = self.optimizer.param_groups[0]['lr']
+            
+            # Update scheduler
             self.lr_scheduler.step(metrics=loss_val, epoch=self.global_step)
+            
+            # Check LR after update
+            after_lr = self.optimizer.param_groups[0]['lr']
+            
+            # Log LR changes (only when they actually happen)
+            if after_lr != before_lr and self.global_rank == 0:
+                print(f"\nStep {self.global_step}: GreedyLR changed learning rate from {before_lr:.8f} to {after_lr:.8f}")
+                
+            # Periodically check if DeepSpeed is overriding our LR changes
+            if self.global_step % 50 == 0 and self.global_rank == 0:
+                if hasattr(self.model, 'optimizer') and hasattr(self.model.optimizer, 'scheduler') and self.model.optimizer.scheduler is not None:
+                    print(f"Warning: DeepSpeed still has an active scheduler at step {self.global_step}")
         
         # Update tokens processed count
         tokens_in_batch = batch.numel()

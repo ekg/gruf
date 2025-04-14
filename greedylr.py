@@ -123,7 +123,10 @@ class GreedyLR:
             
         # Track the raw loss
         if self.debug:
-            print(f"GreedyLR raw loss: {metrics:.6f}")
+            print(f"GreedyLR raw loss: {metrics:.6f}, current LR: {current_lr:.8f}")
+            # Check if DeepSpeed's optimizer is properly connected
+            if hasattr(self.optimizer, '_parameter_names'):
+                print(f"Connected to DeepSpeed ZeroOptimizer with {len(self.optimizer.param_groups)} param groups")
             
         # Calculate smoothed loss
         if self.smooth:
@@ -193,8 +196,20 @@ class GreedyLR:
                     if self.verbose or self.debug:
                         print(f'GreedyLR increasing learning rate from {old_lr:.6f} to {new_lr:.6f}')
                     
+                    # Force update through the optimizer directly
+                    # Force update through the optimizer directly
                     for param_group in param_groups:
                         param_group['lr'] = new_lr
+                        
+                    # Also verify the change was applied
+                    actual_lr = param_groups[0]['lr']
+                    if actual_lr != new_lr and (self.verbose or self.debug):
+                        print(f"Warning: Failed to update LR! Expected {new_lr:.8f} but got {actual_lr:.8f}")
+                        
+                    # Also verify the change was applied
+                    actual_lr = param_groups[0]['lr']
+                    if actual_lr != new_lr and (self.verbose or self.debug):
+                        print(f"Warning: Failed to update LR! Expected {new_lr:.8f} but got {actual_lr:.8f}")
                     
                     self.cooldown_counter = self.cooldown
                     self.num_good_epochs = 0
