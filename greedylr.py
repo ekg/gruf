@@ -26,7 +26,7 @@ class GreedyLR:
         debug (bool): If True, prints extended debugging information. Default: False
     """
     
-    def __init__(self, optimizer, factor=0.1, patience=10, threshold=1e-4, 
+    def __init__(self, optimizer, factor=0.1, patience=10, threshold=1e-10, 
                  cooldown=0, warmup=0, min_lr=0, max_lr=10.0, smooth=True, 
                  window=50, smoothing_factor=None, update_interval=1,
                  reset=0, verbose=False, debug=False):
@@ -163,7 +163,9 @@ class GreedyLR:
         # Only consider updating the learning rate at specified intervals
         if self.steps_since_last_update >= self.update_interval:
             # Check if loss is better or worse
-            if current_loss < self.best_loss - self.threshold:
+            # Using a relative threshold that scales with the loss
+            rel_threshold = self.threshold * current_loss if self.threshold > 0 else 0
+            if current_loss < self.best_loss - rel_threshold:
                 # Loss has improved
                 improvement = self.best_loss - current_loss
                 self.best_loss = current_loss
