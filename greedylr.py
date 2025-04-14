@@ -170,15 +170,29 @@ class GreedyLR:
                 improvement = self.best_loss - current_loss
                 self.best_loss = current_loss
                 self.num_good_epochs += 1
-                self.num_bad_epochs = 0
+                # Don't reset bad epochs to 0, gradually reduce instead
+                self.num_bad_epochs = max(0, self.num_bad_epochs - 1)
                 if self.debug:
-                    print(f"GreedyLR: Loss improved by {improvement:.6f}, good_steps={self.num_good_epochs}")
+                    print(f"GreedyLR: Loss improved by {improvement:.6f}, good_steps={self.num_good_epochs}, bad_steps={self.num_bad_epochs}")
             else:
                 # Loss has not improved
-                self.num_good_epochs = 0
+                # Don't reset good epochs to 0, gradually reduce instead
+                self.num_good_epochs = max(0, self.num_good_epochs - 1)
                 self.num_bad_epochs += 1
                 if self.debug:
-                    print(f"GreedyLR: Loss didn't improve, bad_steps={self.num_bad_epochs}")
+                    print(f"GreedyLR: Loss didn't improve, good_steps={self.num_good_epochs}, bad_steps={self.num_bad_epochs}")
+                
+                # Add plateau detection - if loss has been within a small range for a while
+                if self.smooth and len(self.loss_window) >= 20:  # Need enough samples to detect plateau
+                    recent_losses = self.loss_window[-20:]
+                    loss_range = max(recent_losses) - min(recent_losses)
+                    # If losses are within a small range (plateau) for 20 steps
+                    if loss_range < (self.threshold * 5) and self.num_bad_epochs > self.patience // 2:
+                        if self.debug:
+                            print(f"GreedyLR: Detected plateau with loss range {loss_range:.6f}, forcing exploration")
+                        # Force increase by setting good_epochs higher
+                        self.num_good_epochs = self.patience + 1
+                        self.num_bad_epochs = 0
             
             # Handle cooldown
             if self.cooldown_counter > 0:
