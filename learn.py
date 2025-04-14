@@ -142,7 +142,8 @@ class MinLMTrainer:
         global_rank=0,
         silent_mode=True,
         debug_gradients=False,
-        checkpoint_every=100
+        checkpoint_every=100,
+        permanent_save_interval=5000
     ):
         self.learning_rate = learning_rate
         self.model = minLM(
@@ -175,6 +176,7 @@ class MinLMTrainer:
         self.silent_mode = silent_mode
         self.debug_gradients = debug_gradients
         self.checkpoint_every = checkpoint_every
+        self.permanent_save_interval = permanent_save_interval
         
         # Initialize metric tracking
         self.train_loss = 0.0
@@ -821,7 +823,7 @@ class MinLMTrainer:
         
         return self.global_step
     
-    def save_checkpoint(self, additional_info=None, is_periodic=False):
+    def save_checkpoint(self, additional_info=None, is_periodic=False, is_permanent=False):
         """Save a checkpoint of the model"""
         if not self.checkpoint_dir or self.global_rank != 0:
             return
@@ -845,14 +847,23 @@ class MinLMTrainer:
         val_loss_str = f"{self.val_loss:.4f}" if self.val_loss is not None else "NA"
         bpb_str = f"{self.val_bpb:.4f}" if self.val_bpb is not None else "NA"
         
+        # Add a "permanent" prefix for checkpoints we want to keep indefinitely
+        prefix = "permanent-" if is_permanent else ""
+        
         # Save checkpoint with informative name
-        filename = f"minlm-step-{self.global_step}-loss-{val_loss_str}-bpb-{bpb_str}.pt"
+        filename = f"{prefix}minlm-step-{self.global_step}-loss-{val_loss_str}-bpb-{bpb_str}.pt"
         checkpoint_path = os.path.join(self.checkpoint_dir, filename)
         torch.save(checkpoint, checkpoint_path)
         
         # Save latest checkpoint (for resuming)
         latest_path = os.path.join(self.checkpoint_dir, "latest.pt")
         torch.save(checkpoint, latest_path)
+        
+        # For permanent checkpoints, we don't need additional processing
+        if is_permanent:
+            if not self.silent_mode:
+                print(f"Saved permanent checkpoint at step {self.global_step}")
+            return checkpoint_path
         
         # Track best checkpoints (top k)
         if not is_periodic and self.val_loss is not None:
@@ -882,7 +893,9 @@ class MinLMTrainer:
                 
                 # Delete the checkpoints that didn't make the cut
                 for path, _ in to_remove:
-                    if os.path.exists(path) and "best" not in path and "latest" not in path:
+                    # Don't delete permanent checkpoints or special ones
+                    if (os.path.exists(path) and "best" not in path and "latest" not in path 
+                            and "permanent-" not in os.path.basename(path)):
                         try:
                             os.remove(path)
                             if not self.silent_mode:
@@ -912,6 +925,11 @@ class MinLMTrainer:
         
         # Initial validation
         if self.global_rank == 0:
+            # Save permanent checkpoint at step 0
+            self.save_checkpoint({"initial": True}, is_periodic=False, is_permanent=True)
+            if not self.silent_mode:
+                print(f"Saved permanent initial checkpoint at step {self.global_step}")
+                
             val_results = self.validate(val_dataloader, max_batches=val_batches)
             self._log_metrics(True)
         
@@ -952,6 +970,12 @@ class MinLMTrainer:
                     self.save_checkpoint({"periodic": True}, is_periodic=True)
                     if not self.silent_mode:
                         print(f"Saved periodic checkpoint at step {step}")
+                
+                # Save permanent checkpoint every permanent_save_interval steps
+                if self.global_rank == 0 and step > 0 and step % self.permanent_save_interval == 0:
+                    self.save_checkpoint({"permanent": True}, is_periodic=False, is_permanent=True)
+                    if not self.silent_mode:
+                        print(f"Saved permanent checkpoint at step {step}")
                 
                 # Validate periodically
                 if step > 0 and step % validate_every == 0:
@@ -1451,6 +1475,8 @@ def main():
                         help="Model hidden dimension (default: 512). Can use k/m/g suffix.")
     parser.add_argument("--checkpoint_every", type=int, default=100,
                         help="Save checkpoint every N steps (default: 100)")
+    parser.add_argument("--permanent_save_interval", type=int, default=5000,
+                        help="Save permanent checkpoints every N steps (default: 5000)")
     parser.add_argument("--depth", type=int, default=None,
                         help="Number of model layers (default: 6).")
     parser.add_argument("--embedding_dim", type=int, default=None,
@@ -1859,7 +1885,8 @@ def main():
         global_rank=global_rank,
         silent_mode=not args.verbose,
         debug_gradients=args.debug_gradients,
-        checkpoint_every=args.checkpoint_every
+        checkpoint_every=args.checkpoint_every,
+        permanent_save_interval=args.permanent_save_interval
     )
     
     # Store val_dataset for text generation
