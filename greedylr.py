@@ -1,27 +1,27 @@
 import torch
-from torch.optim.lr_scheduler import _LRScheduler
 
-class GreedyLR(_LRScheduler):
-    """Implementation of Zeroth Order GreedyLR scheduler
+class GreedyLR:
+    """Implementation of Zeroth Order GreedyLR scheduler compatible with DeepSpeed ZeroOptimizer
     
     Args:
-        optimizer (Optimizer): Wrapped optimizer.
+        optimizer: The DeepSpeed optimizer (ZeroOptimizer)
         factor (float): Factor by which the learning rate will be increased/decreased. Default: 0.1
-        patience (int): Number of epochs with no improvement after which learning rate will be changed. Default: 10
+        patience (int): Number of steps with no improvement after which learning rate will be changed. Default: 10
         threshold (float): Threshold for measuring the improvement. Default: 1e-4
-        cooldown (int): Number of epochs to wait before resuming normal operation. Default: 0
-        warmup (int): Number of epochs to linearly increase learning rate from 0. Default: 0
-        min_lr (float or list): A scalar or a list of scalars. A lower bound on the learning rate. Default: 0
-        max_lr (float or list): A scalar or a list of scalars. An upper bound on the learning rate. Default: 10.0
+        cooldown (int): Number of steps to wait before resuming normal operation. Default: 0
+        warmup (int): Number of steps to linearly increase learning rate from 0. Default: 0
+        min_lr (float): A scalar. A lower bound on the learning rate. Default: 0
+        max_lr (float): A scalar. An upper bound on the learning rate. Default: 10.0
         smooth (bool): Whether to use exponential moving average for loss. Default: True
         window (int): Window size for smoothing loss values. Default: 50
-        reset (int): Number of epochs after which to reset scheduler. Default: 0
+        reset (int): Number of steps after which to reset scheduler. Default: 0
         verbose (bool): If True, prints a message to stdout for each update. Default: False
     """
     
     def __init__(self, optimizer, factor=0.1, patience=10, threshold=1e-4, 
                  cooldown=0, warmup=0, min_lr=0, max_lr=10.0, smooth=True, 
                  window=50, reset=0, verbose=False):
+        self.optimizer = optimizer
         self.factor = factor
         self.patience = patience
         self.threshold = threshold
@@ -44,13 +44,50 @@ class GreedyLR(_LRScheduler):
         self.min_lrs = min_lr
         self.max_lrs = max_lr
         
-        super(GreedyLR, self).__init__(optimizer)
+        # Store initial learning rate as base_lr
+        param_groups = optimizer.param_groups
+        self.base_lrs = [group['lr'] for group in param_groups]
+    
+    def state_dict(self):
+        """Returns the state of the scheduler as a dict."""
+        return {
+            'factor': self.factor,
+            'patience': self.patience,
+            'threshold': self.threshold,
+            'cooldown': self.cooldown,
+            'warmup': self.warmup, 
+            'best_loss': self.best_loss,
+            'num_bad_epochs': self.num_bad_epochs,
+            'num_good_epochs': self.num_good_epochs,
+            'cooldown_counter': self.cooldown_counter,
+            'warmup_counter': self.warmup_counter,
+            'base_lrs': self.base_lrs,
+            'loss_window': self.loss_window
+        }
+
+    def load_state_dict(self, state_dict):
+        """Loads the schedulers state."""
+        self.factor = state_dict['factor']
+        self.patience = state_dict['patience']
+        self.threshold = state_dict['threshold']
+        self.cooldown = state_dict['cooldown']
+        self.warmup = state_dict['warmup']
+        self.best_loss = state_dict['best_loss']
+        self.num_bad_epochs = state_dict['num_bad_epochs']
+        self.num_good_epochs = state_dict['num_good_epochs']
+        self.cooldown_counter = state_dict['cooldown_counter']
+        self.warmup_counter = state_dict['warmup_counter']
+        self.base_lrs = state_dict['base_lrs']
+        self.loss_window = state_dict['loss_window']
     
     def get_lr(self):
+        """Get current learning rate."""
         return [group['lr'] for group in self.optimizer.param_groups]
     
     def step(self, metrics=None, epoch=None):
-        current_lr = self.get_lr()[0]
+        """Execute a step of the scheduler with optional metrics."""
+        param_groups = self.optimizer.param_groups
+        current_lr = param_groups[0]['lr']
         
         if metrics is None:
             return current_lr
@@ -92,7 +129,7 @@ class GreedyLR(_LRScheduler):
             if self.verbose:
                 print(f'GreedyLR increasing learning rate to {new_lr:.6f}')
             
-            for i, param_group in enumerate(self.optimizer.param_groups):
+            for param_group in param_groups:
                 param_group['lr'] = new_lr
             
             self.cooldown_counter = self.cooldown
@@ -104,7 +141,7 @@ class GreedyLR(_LRScheduler):
             if self.verbose:
                 print(f'GreedyLR reducing learning rate to {new_lr:.6f}')
             
-            for i, param_group in enumerate(self.optimizer.param_groups):
+            for param_group in param_groups:
                 param_group['lr'] = new_lr
             
             self.warmup_counter = self.warmup
@@ -122,7 +159,7 @@ class GreedyLR(_LRScheduler):
             self.loss_window = []
             
             # Reset learning rate to initial value
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = self.base_lrs[0]
+            for i, param_group in enumerate(param_groups):
+                param_group['lr'] = self.base_lrs[i]
         
         return self.get_lr()
