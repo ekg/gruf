@@ -693,7 +693,7 @@ class MinLMTrainer:
             after_lr = self.optimizer.param_groups[0]['lr']
             
             # Log LR changes only when debugging is enabled
-            if after_lr != before_lr and self.global_rank == 0 and args.greedylr_debug:
+            if after_lr != before_lr and self.global_rank == 0 and self.greedylr_debug:
                 print(f"\nStep {self.global_step}: GreedyLR changed learning rate from {before_lr:.8f} to {after_lr:.8f}")
         
         # Update tokens processed count
