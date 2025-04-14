@@ -188,6 +188,7 @@ class MinLMTrainer:
         self.best_val_loss = float('inf')
         self.best_val_bpb = float('inf')
         self.best_checkpoints = []  # List of (path, val_loss) tuples to track top_k checkpoints
+        self.recent_checkpoints = []  # List of recent checkpoint paths
         self.save_top_k = 3  # Number of best checkpoints to keep
 
     def init_deepspeed(self, train_dataloader, args):
@@ -847,8 +848,16 @@ class MinLMTrainer:
         val_loss_str = f"{self.val_loss:.4f}" if self.val_loss is not None else "NA"
         bpb_str = f"{self.val_bpb:.4f}" if self.val_bpb is not None else "NA"
         
-        # Add a "permanent" prefix for checkpoints we want to keep indefinitely
-        prefix = "permanent-" if is_permanent else ""
+        # Check if this should be a milestone checkpoint (every 10k steps)
+        is_milestone = self.global_step % 10000 == 0 and self.global_step > 0
+        
+        # Add appropriate prefix for different types of checkpoints
+        if is_permanent:
+            prefix = "permanent-"
+        elif is_milestone:
+            prefix = "milestone-"
+        else:
+            prefix = ""
         
         # Save checkpoint with informative name
         filename = f"{prefix}minlm-step-{self.global_step}-loss-{val_loss_str}-bpb-{bpb_str}.pt"
@@ -859,10 +868,36 @@ class MinLMTrainer:
         latest_path = os.path.join(self.checkpoint_dir, "latest.pt")
         torch.save(checkpoint, latest_path)
         
-        # For permanent checkpoints, we don't need additional processing
-        if is_permanent:
+        # Initialize recent_checkpoints list if it doesn't exist
+        if not hasattr(self, 'recent_checkpoints'):
+            self.recent_checkpoints = []
+        
+        # Add to recent checkpoints list if this is a regular checkpoint
+        if not is_permanent and not is_milestone:
+            self.recent_checkpoints.append(checkpoint_path)
+            # Keep only the 5 most recent regular checkpoints
+            if len(self.recent_checkpoints) > 5:
+                old_checkpoints = self.recent_checkpoints[:-5]  # Get checkpoints beyond the 5 most recent
+                self.recent_checkpoints = self.recent_checkpoints[-5:]  # Keep only 5 most recent
+                
+                # Delete old regular checkpoints
+                for path in old_checkpoints:
+                    if (os.path.exists(path) and "best" not in path and "latest" not in path 
+                            and "permanent-" not in os.path.basename(path)
+                            and "milestone-" not in os.path.basename(path)):
+                        try:
+                            os.remove(path)
+                            if not self.silent_mode:
+                                print(f"Removed old checkpoint {os.path.basename(path)}")
+                        except OSError as e:
+                            if not self.silent_mode:
+                                print(f"Error removing checkpoint: {e}")
+        
+        # For permanent/milestone checkpoints, just log and return
+        if is_permanent or is_milestone:
             if not self.silent_mode:
-                print(f"Saved permanent checkpoint at step {self.global_step}")
+                checkpoint_type = "permanent" if is_permanent else "milestone"
+                print(f"Saved {checkpoint_type} checkpoint at step {self.global_step}")
             return checkpoint_path
         
         # Track best checkpoints (top k)
@@ -893,9 +928,10 @@ class MinLMTrainer:
                 
                 # Delete the checkpoints that didn't make the cut
                 for path, _ in to_remove:
-                    # Don't delete permanent checkpoints or special ones
+                    # Don't delete permanent checkpoints, milestone checkpoints, or special ones
                     if (os.path.exists(path) and "best" not in path and "latest" not in path 
-                            and "permanent-" not in os.path.basename(path)):
+                            and "permanent-" not in os.path.basename(path)
+                            and "milestone-" not in os.path.basename(path)):
                         try:
                             os.remove(path)
                             if not self.silent_mode:
