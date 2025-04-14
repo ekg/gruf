@@ -337,6 +337,9 @@ class MinLMTrainer:
             elif self.global_rank == 0 and not self.silent_mode:
                 print("\nIMPORTANT: No DeepSpeed scheduler detected. GreedyLR should work correctly.")
         
+            # Set max learning rate (use command line value if provided, otherwise use initial learning rate)
+            max_lr = args.max_lr if args.max_lr is not None else self.learning_rate
+            
             self.lr_scheduler = GreedyLR(
                 optimizer=self.optimizer,
                 factor=args.greedylr_factor,
@@ -345,7 +348,7 @@ class MinLMTrainer:
                 cooldown=0,
                 warmup=0,
                 min_lr=min_lr,
-                max_lr=self.learning_rate,
+                max_lr=max_lr,
                 smooth=True,
                 window=args.greedylr_window,
                 smoothing_factor=args.greedylr_ema,
@@ -1559,6 +1562,8 @@ def main():
                         help="Percentage of training for warmup phase (default: auto-calculated)")
     parser.add_argument("--min_lr", type=float, default=None,
                         help="Minimum learning rate for schedulers (default: auto-calculated from LR finder)")
+    parser.add_argument("--max_lr", type=float, default=None,
+                        help="Maximum learning rate for GreedyLR scheduler (default: same as initial learning rate)")
     parser.add_argument("--decay_rate", type=float, default=None,
                         help="Final LR = max_lr * decay_rate (for warmup_decay, default: auto-calculated)")
     parser.add_argument("--cycle_first_step_size", type=int, default=None,
