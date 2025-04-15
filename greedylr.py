@@ -64,6 +64,11 @@ class GreedyLR:
         self.steps_since_last_update = 0
         self.in_warmup = warmup > 0  # Track whether we're in warmup phase
         
+        # For distributed training, ensure warmup_counter starts as a float
+        # This allows fractional increments when multiple processes are running
+        if self.distributed and warmup > 0:
+            self.warmup_counter = 0.0
+        
         if factor >= 1.0 or factor <= 0:
             raise ValueError('Factor should be between 0 and 1')
             
@@ -180,8 +185,14 @@ class GreedyLR:
                 # Linear warmup from min_lrs to base_lrs
                 param_group['lr'] = self.min_lrs + warmup_percent * (self.base_lrs[i] - self.min_lrs)
                 
-            # Increment warmup counter
-            self.warmup_counter += 1
+            # Increment warmup counter (accounting for distributed training)
+            if self.distributed:
+                # In distributed training, we need to increment counter only once globally
+                # Only increment by 1/world_size on each process so they collectively add 1
+                self.warmup_counter += (1 / self.world_size)
+            else:
+                # Single-process training
+                self.warmup_counter += 1
             
             # Update status information during warmup
             self.status_symbol = "↗"  # Up arrow for warmup phase
