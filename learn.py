@@ -118,7 +118,17 @@ class TextSamplerDataset(Dataset):
         return self.samples_per_epoch
 
     def __getitem__(self, index):
-        # Random sampling from anywhere in the data
+        # Check if the dataset size is sufficient for the requested sequence length
+        if self.data.size(0) <= self.seq_len:
+            # Dataset is too small, return the full dataset padded if needed
+            full_seq = self.data.clone().long()
+            # If we need padding, add zeros at the end
+            if full_seq.size(0) < self.seq_len + 1:
+                padding = torch.zeros(self.seq_len + 1 - full_seq.size(0), dtype=torch.long)
+                full_seq = torch.cat([full_seq, padding])
+            return full_seq[:self.seq_len + 1]
+        
+        # Normal case: Random sampling from anywhere in the data
         rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
         # Always ensure we return a Long tensor
         full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
