@@ -12,3 +12,5 @@ dependencies:
 - torchvision
 - pip:
   - git+https://github.com/deepspeedai/DeepSpeed.git@3c1817f38fc46aba3a2d5b0b10e56c33aca11a22#egg=deepspeed
+  - git+https://github.com/facebookresearch/schedule_free.git
+  - tqdm
