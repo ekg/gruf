@@ -565,10 +565,7 @@ class MinLMTrainer:
         
         # With Schedule-Free, we don't need manual LR updates - it handles adaptivity internally
         
-        # Debug: Print optimizer learning rate occasionally for Schedule-Free
-        if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None and self.global_rank == 0 and self.global_step % 50 == 0:
-            current_lr = self.optimizer.param_groups[0]['lr']
-            print(f"Step {self.global_step}: Schedule-Free current LR = {current_lr}")
+        # Schedule-Free optimizer handles learning rate internally
         
         # Update tokens processed count
         tokens_in_batch = batch.numel()
