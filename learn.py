@@ -219,20 +219,17 @@ class MinLMTrainer:
             
         # Create custom optimizer if using Schedule-Free
         if args.schedulefree:
-            # Create Schedule-Free optimizer
+            # Create Schedule-Free optimizer (no warmup needed)
             optimizer = AdamWScheduleFree(
                 self.model.parameters(),
                 lr=self.learning_rate,
                 betas=(args.sf_beta, 0.999),
-                weight_decay=args.sf_weight_decay,
-                warmup_steps=args.warmup_steps or 0
+                weight_decay=args.sf_weight_decay
             )
             # Keep reference to the Schedule-Free optimizer for train/eval mode
             self.sf_optimizer = optimizer
             if self.global_rank == 0 and not self.silent_mode:
                 print(f"Using Schedule-Free optimizer with beta={args.sf_beta}, weight_decay={args.sf_weight_decay}")
-                if args.warmup_steps:
-                    print(f"Schedule-Free warmup: {args.warmup_steps} steps")
                     
             # Need to flag that we're using Schedule-Free to avoid scheduler conflicts
             self.using_schedulefree = True
@@ -1416,11 +1413,9 @@ def main():
     parser.add_argument("--output", type=str, default=None,
                         help="Directory to save checkpoints (default: auto-generated name)")
     
-    # Warmup parameter
+    # Warmup parameter (only used for non-ScheduleFree optimizers)
     parser.add_argument("--warmup_steps", type=int, default=0,
-                        help="Number of warmup steps (default: 0)")
-    parser.add_argument("--warmup_steps", type=int, default=None,
-                        help="Number of warmup steps (default: auto-calculated based on total steps)")
+                        help="Number of warmup steps (default: 0, not used with ScheduleFree)")
     # Note: Removed complex scheduler parameters that aren't needed for Schedule-Free
     
     # Learning rate finder parameters
@@ -1832,8 +1827,7 @@ def main():
         
         if args.schedulefree:
             print(f"Optimizer: Schedule-Free (beta={args.sf_beta}, weight_decay={args.sf_weight_decay})")
-            if args.warmup_steps:
-                print(f"Schedule-Free warmup: {args.warmup_steps} steps")
+            print(f"Note: Schedule-Free handles adaptation internally (no warmup needed)")
         else:
             print(f"Optimizer: Adam with simple warmup")
             if args.warmup_steps:
