@@ -1392,8 +1392,8 @@ def main():
                         help="Run the learning rate finder before training")
     parser.add_argument("--min_find_lr", type=float, default=1e-8,
                         help="Minimum learning rate for LR finder (default: 1e-8)")
-    parser.add_argument("--max_find_lr", type=float, default=1.0,
-                        help="Maximum learning rate for LR finder (default: 1.0)")
+    parser.add_argument("--max_find_lr", type=float, default=0.01,
+                        help="Maximum learning rate for LR finder (default: 0.01)")
     parser.add_argument("--num_lr_find_iter", type=int, default=100,
                         help="Number of iterations for LR finder (default: 100)")
                         
