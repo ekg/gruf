@@ -228,6 +228,8 @@ class MinLMTrainer:
             )
             # Keep reference to the Schedule-Free optimizer for train/eval mode
             self.sf_optimizer = optimizer
+            # Save the ScheduleFree optimizer for mode switching
+            self.using_schedulefree = True
             if self.global_rank == 0 and not self.silent_mode:
                 print(f"Using Schedule-Free optimizer with beta={args.sf_beta}, weight_decay={args.sf_weight_decay}")
                     
@@ -485,9 +487,8 @@ class MinLMTrainer:
             if self.global_rank == 0:
                 print(f"Starting tokens/s timing at step {self.global_step}")
                 
-        # Set Schedule-Free optimizer to train mode if using it
-        if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
-            self.sf_optimizer.train()
+        # Note: We no longer set sf_optimizer.train() here
+        # ScheduleFree optimizer should be in train mode for the entire training loop
         
         # Ensure batch is a Long tensor before forward pass
         if batch.dtype != torch.long:
@@ -583,10 +584,8 @@ class MinLMTrainer:
     def validate(self, dataloader, max_batches=None):
         """Run validation on the entire validation dataset"""
         self.model.eval()
-        
-        # Set Schedule-Free optimizer to eval mode if using it
-        if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
-            self.sf_optimizer.eval()
+        # Note: We don't set sf_optimizer.eval() here anymore
+        # The ScheduleFree mode is set by the caller
             
         val_losses = []
         val_bpbs = []
@@ -610,10 +609,8 @@ class MinLMTrainer:
         self.val_bpb = avg_bpb
         
         self.model.train()
-        
-        # Return Schedule-Free optimizer to train mode after validation
-        if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
-            self.sf_optimizer.train()
+        # Note: We don't set sf_optimizer.train() here anymore
+        # The ScheduleFree mode is set by the caller
             
         return {"val_loss": avg_val_loss, "bpb": avg_bpb}
     
@@ -807,6 +804,10 @@ class MinLMTrainer:
                     "current_lr", "batch_size", "grad_accum"
                 ]
                 f.write('\t'.join(header) + '\n')
+                
+        # If using ScheduleFree, put optimizer in train mode at the beginning
+        if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
+            self.sf_optimizer.train()
         
         # Initial validation
         if self.global_rank == 0:
@@ -875,6 +876,10 @@ class MinLMTrainer:
                 # Validate periodically
                 if step > 0 and step % validate_every == 0:
                     if self.global_rank == 0:
+                        # Set ScheduleFree optimizer to eval mode if using it
+                        if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
+                            self.sf_optimizer.eval()
+                        
                         val_results = self.validate(val_dataloader, max_batches=val_batches)
                         
                         # Save checkpoint with validation results
@@ -882,6 +887,10 @@ class MinLMTrainer:
                         
                         # Log metrics
                         self._log_metrics(True)
+                        
+                        # Put ScheduleFree optimizer back to train mode if using it
+                        if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
+                            self.sf_optimizer.train()
                 
                 # Generate samples periodically if not skipped
                 if generate_every > 0 and step > 0 and step % generate_every == 0 and self.global_rank == 0:
@@ -992,6 +1001,10 @@ class MinLMTrainer:
         # Get an iterator for the dataloader
         train_iter = iter(train_dataloader)
         
+        # Set ScheduleFree optimizer to train mode if using it
+        if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
+            self.sf_optimizer.train()
+            
         # Run iterations with increasing learning rate
         for i in range(num_iter):
             # Get the next batch (resetting iterator if needed)
@@ -1179,7 +1192,14 @@ class MinLMTrainer:
             print("\nGenerating sample text...")
             print(f"Prime: {decode_tokens(prime[0])}")
         
+        # Set to eval mode for generation
         self.model.eval()
+        # Set ScheduleFree optimizer to eval mode if using it
+        was_training = False
+        if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
+            was_training = True
+            self.sf_optimizer.eval()
+            
         with torch.no_grad():
             generated = base_decoding(
                 self.model, 
@@ -1188,7 +1208,12 @@ class MinLMTrainer:
                 temperature=0.8, 
                 filter_thres=0.9
             )
+            
+        # Restore previous modes
         self.model.train()
+        # Return to train mode if we were training before
+        if was_training and hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
+            self.sf_optimizer.train()
         
         if not self.silent_mode:
             print(f"Generated: {decode_tokens(generated[0])}")
@@ -1861,8 +1886,12 @@ def main():
         # Load checkpoint
         step_offset = trainer.load_checkpoint(args.resume)
         
-        # If using Schedule-Free, put it in the right mode after loading checkpoint
+        # Make sure we're setting the correct optimizer mode before continuing
         if args.schedulefree and hasattr(trainer, 'sf_optimizer') and trainer.sf_optimizer is not None:
+            # Print state to help debug
+            if global_rank == 0:
+                print("Ensuring ScheduleFree optimizer is in correct mode after resume")
+            # Explicitly ensure we're in train mode
             trainer.sf_optimizer.train()
         
         # Adjust remaining steps to account for already completed training
