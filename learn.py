@@ -332,85 +332,10 @@ class MinLMTrainer:
             # Replace the optimizer's step method with our custom version
             self.optimizer.step = custom_step
         
-        # Create GreedyLR scheduler if requested and not using Schedule-Free
+        # No custom LR scheduler needed with Schedule-Free
         self.lr_scheduler = None
-        if self.using_schedulefree:
-            if self.global_rank == 0 and not self.silent_mode:
-                print("Schedule-Free optimizer is active - disabling other LR schedulers")
-        elif args.lr_scheduler == "greedylr":
-            from greedylr import GreedyLR
-        
-            min_lr = args.min_lr if args.min_lr is not None else self.learning_rate * 0.01
-        
-            # Use greedylr_warmup if specified, otherwise fall back to general warmup_steps
-            warmup_steps = args.greedylr_warmup if args.greedylr_warmup is not None else args.warmup_steps
-        
-            if self.global_rank == 0 and not self.silent_mode:
-                print(f"\nInitializing GreedyLR scheduler:")
-                print(f"  Factor: {args.greedylr_factor}")
-                print(f"  Patience: {args.greedylr_patience}")
-                print(f"  Window size: {args.greedylr_window}")
-                print(f"  Update interval: {args.greedylr_update_interval} steps")
-                if args.greedylr_ema is not None:
-                    print(f"  Smoothing: EMA with beta={args.greedylr_ema}")
-                else:
-                    print(f"  Smoothing: Window averaging (size={args.greedylr_window})")
-                print(f"  Min LR: {min_lr}")
-                print(f"  Max LR: {self.learning_rate}")
-                print(f"  Debug output: {args.greedylr_debug}")
-            
-            # CRITICAL: Verify and disable the scheduler in DeepSpeed (for all ranks)
-            if hasattr(self.model, 'optimizer') and hasattr(self.model.optimizer, 'scheduler'):
-                if self.global_rank == 0 and not self.silent_mode:
-                    print("\nIMPORTANT: DeepSpeed scheduler detected, disabling it for GreedyLR compatibility")
-                    print(f"  DeepSpeed scheduler type: {type(self.model.optimizer.scheduler).__name__}")
-                
-                # Must disable on all ranks, not just rank 0
-                try:
-                    self.model.optimizer.scheduler = None
-                    if self.global_rank == 0 and not self.silent_mode:
-                        print("  DeepSpeed scheduler successfully disabled.")
-                except Exception as e:
-                    if self.global_rank == 0 and not self.silent_mode:
-                        print(f"  Failed to disable DeepSpeed scheduler: {e}")
-            elif self.global_rank == 0 and not self.silent_mode:
-                print("\nIMPORTANT: No DeepSpeed scheduler detected. GreedyLR should work correctly.")
-        
-            # Set max learning rate (use command line value if provided, otherwise use initial learning rate)
-            max_lr = args.max_lr if args.max_lr is not None else self.learning_rate
-            
-            # Get warmup steps for GreedyLR (prioritize greedylr_warmup if specified)
-            warmup_steps = args.greedylr_warmup if args.greedylr_warmup is not None else args.warmup_steps
-            if warmup_steps is None:
-                warmup_steps = 0
-        
-            if self.global_rank == 0 and not self.silent_mode and warmup_steps > 0:
-                print(f"  Warmup: {warmup_steps} steps from {min_lr} to {max_lr}")
-                
-                # For warmup to work correctly, we need to set initial LR to min_lr
-                for param_group in self.optimizer.param_groups:
-                    param_group['lr'] = min_lr
-                    
-                if not self.silent_mode:
-                    print(f"  Initial LR set to {min_lr} for warmup")
-            
-            self.lr_scheduler = GreedyLR(
-                optimizer=self.optimizer,
-                factor=args.greedylr_factor,
-                patience=args.greedylr_patience,
-                threshold=args.greedylr_threshold,
-                cooldown=0,
-                warmup=warmup_steps,
-                min_lr=min_lr,
-                max_lr=max_lr,
-                smooth=True,
-                window=args.greedylr_window,
-                smoothing_factor=args.greedylr_ema,
-                update_interval=args.greedylr_update_interval,
-                reset=0,
-                verbose=(self.global_rank == 0 and not self.silent_mode),
-                debug=args.greedylr_debug and self.global_rank == 0
-            )
+        if self.using_schedulefree and self.global_rank == 0 and not self.silent_mode:
+            print("Schedule-Free optimizer is active - using built-in adaptive behavior instead of LR scheduler")
         
         # Print device info if main process
         if self.global_rank == 0:
@@ -427,106 +352,16 @@ class MinLMTrainer:
                 has_fp32_accum = hasattr(self.model, 'accumulate_allreduce_grads_in_fp32') and self.model.accumulate_allreduce_grads_in_fp32
                 print(f"FP32 gradient accumulation enabled: {has_fp32_accum}")
     
-    def _create_scheduler_config(self, scheduler_type, max_lr, min_lr, warmup_steps, 
-                                total_steps, decay_rate, cycle_first_step_size, 
-                                decay_step_size, decay_lr_rate):
-        """Create scheduler configuration based on the selected type"""
-        # Set default values if None
-        warmup_steps = warmup_steps or max(100, int(total_steps * 0.06))  # Default to 6% of total steps
-        min_lr = min_lr if min_lr is not None else max_lr * 0.01  # Default to 1% of max_lr
-        decay_rate = decay_rate if decay_rate is not None else min_lr / max_lr
-        cycle_first_step_size = cycle_first_step_size or warmup_steps
-        decay_step_size = decay_step_size or (total_steps - warmup_steps)
-        decay_lr_rate = decay_lr_rate if decay_lr_rate is not None else 0.9
-        
-        # Print scheduler configuration info to help debug
-        if self.global_rank == 0 and not self.silent_mode:
-            print(f"\nScheduler configuration:")
-            print(f"  Type: {scheduler_type}")
-            print(f"  Total scheduler steps: {total_steps}")
-            print(f"  Warmup steps: {warmup_steps} ({(warmup_steps/total_steps)*100:.1f}%)")
-            print(f"  Max LR: {max_lr}")
-            print(f"  Min LR: {min_lr}")
-            if scheduler_type == "warmup_decay":
-                print(f"  Final LR after decay: {min_lr}")
-        
-        if scheduler_type == "auto":
-            # Choose best scheduler based on training length
-            if total_steps < 1000:
-                scheduler_type = "warmup"
-            elif total_steps > 10000:
-                scheduler_type = "cosine"
-            else:
-                scheduler_type = "warmup_decay"
-            
-            if self.global_rank == 0 and not self.silent_mode:
-                print(f"Auto-selected scheduler type: {scheduler_type}")
-        
-        if scheduler_type == "warmup":
-            return {
-                "type": "WarmupLR",
-                "params": {
-                    "warmup_min_lr": min_lr,
-                    "warmup_max_lr": max_lr,
-                    "warmup_num_steps": warmup_steps
-                }
+    def _create_simple_scheduler_config(self, learning_rate, warmup_steps=0):
+        """Create a simple scheduler configuration"""
+        return {
+            "type": "WarmupLR",
+            "params": {
+                "warmup_min_lr": 0,
+                "warmup_max_lr": learning_rate,
+                "warmup_num_steps": max(1, warmup_steps)
             }
-        elif scheduler_type == "warmup_decay":
-            return {
-                "type": "WarmupDecayLR",
-                "params": {
-                    "warmup_min_lr": min_lr,
-                    "warmup_max_lr": max_lr,
-                    "warmup_num_steps": warmup_steps,
-                    "total_num_steps": total_steps
-                    # Removed decay_rate parameter as it's not supported by DeepSpeed's WarmupDecayLR
-                }
-            }
-        elif scheduler_type == "one_cycle":
-            return {
-                "type": "OneCycle",
-                "params": {
-                    "cycle_min_lr": min_lr,
-                    "cycle_max_lr": max_lr,
-                    "cycle_first_step_size": cycle_first_step_size,
-                    "decay_step_size": decay_step_size,
-                    "decay_lr_rate": decay_lr_rate
-                }
-            }
-        elif scheduler_type == "cosine":
-            # DeepSpeed's WarmupCosineLR implementation is reverse-engineered from the logs
-            # The key issue is that it keeps increasing LR during the entire warmup phase
-            # and only starts decreasing after warmup_num_steps
-            return {
-                "type": "WarmupDecayLR",  # Using WarmupDecayLR instead of WarmupCosineLR
-                "params": {
-                    "warmup_min_lr": 0,  # Start from 0
-                    "warmup_max_lr": max_lr,  # Peak LR
-                    "warmup_num_steps": warmup_steps,
-                    "total_num_steps": total_steps,
-                    "decay_rate": min_lr / max_lr  # End at min_lr
-                }
-            }
-        elif scheduler_type == "constant":
-            return {
-                "type": "WarmupLR",
-                "params": {
-                    "warmup_min_lr": max_lr,  # No actual warmup, just constant LR
-                    "warmup_max_lr": max_lr,
-                    "warmup_num_steps": 1
-                }
-            }
-        else:
-            # Default to WarmupLR if an invalid type is specified
-            print(f"WARNING: Unknown scheduler type '{scheduler_type}', using default WarmupLR")
-            return {
-                "type": "WarmupLR",
-                "params": {
-                    "warmup_min_lr": min_lr,
-                    "warmup_max_lr": max_lr,
-                    "warmup_num_steps": warmup_steps
-                }
-            }
+        }
             
     def create_deepspeed_config(self, zero_stage, precision, offload_optimizer, offload_parameters, learning_rate, gradient_clip=None, tensor_parallel_size=1, depth=6, args=None):
         """Create DeepSpeed configuration"""
@@ -547,27 +382,12 @@ class MinLMTrainer:
                     "lr": learning_rate,
                     "betas": [0.9, 0.999],
                     "eps": 1e-8
-                    # Removed weight_decay to match standard Adam in Lightning
                 }
             },
-            # If using GreedyLR, provide a dummy scheduler that doesn't change the LR
-            "scheduler": {
-                "type": "WarmupLR",
-                "params": {
-                    "warmup_min_lr": learning_rate,  # No actual warmup, just constant LR
-                    "warmup_max_lr": learning_rate,
-                    "warmup_num_steps": 1
-                }
-            } if args.lr_scheduler == "greedylr" else self._create_scheduler_config(
-                args.lr_scheduler,
+            # Simple scheduler config that just provides warmup
+            "scheduler": self._create_simple_scheduler_config(
                 learning_rate,
-                args.min_lr,
-                args.warmup_steps,
-                NUM_BATCHES,  # DeepSpeed already accounts for gradient accumulation 
-                args.decay_rate,
-                args.cycle_first_step_size,
-                args.decay_step_size,
-                args.decay_lr_rate
+                args.warmup_steps if args.warmup_steps else 0
             ),
             "zero_optimization": {
                 "stage": zero_stage,
@@ -741,26 +561,7 @@ class MinLMTrainer:
         loss_val = loss.detach().float().item()
         self.train_loss = loss_val
         
-        # Update our custom GreedyLR scheduler if it exists
-        if hasattr(self, 'lr_scheduler') and self.lr_scheduler is not None:
-            # Ensure DeepSpeed's scheduler is still disabled
-            if hasattr(self.model, 'optimizer') and hasattr(self.model.optimizer, 'scheduler') and self.model.optimizer.scheduler is not None:
-                self.model.optimizer.scheduler = None
-                if self.global_rank == 0 and self.global_step % 50 == 0 and not self.silent_mode:
-                    print(f"Re-disabled DeepSpeed scheduler at step {self.global_step}")
-            
-            # Check LR before update
-            before_lr = self.optimizer.param_groups[0]['lr']
-            
-            # Update scheduler
-            self.lr_scheduler.step(metrics=loss_val, epoch=self.global_step)
-            
-            # Check LR after update
-            after_lr = self.optimizer.param_groups[0]['lr']
-            
-            # Log LR changes only when debugging is enabled
-            if after_lr != before_lr and self.global_rank == 0 and self.greedylr_debug:
-                print(f"\nStep {self.global_step}: GreedyLR changed learning rate from {before_lr:.8f} to {after_lr:.8f}")
+        # With Schedule-Free, we don't need manual LR updates - it handles adaptivity internally
         
         # Update tokens processed count
         tokens_in_batch = batch.numel()
@@ -1615,43 +1416,12 @@ def main():
     parser.add_argument("--output", type=str, default=None,
                         help="Directory to save checkpoints (default: auto-generated name)")
     
-    # Learning rate scheduler parameters
-    parser.add_argument("--lr_scheduler", type=str, default="auto",
-                        choices=["auto", "warmup", "warmup_decay", "one_cycle", "cosine", "constant", "greedylr"],
-                        help="Learning rate scheduler type (default: auto - chooses based on LR finder)")
-    # GreedyLR specific arguments
-    parser.add_argument("--greedylr_factor", type=float, default=0.1,
-                        help="Factor by which the learning rate will be increased/decreased in GreedyLR (default: 0.1)")
-    parser.add_argument("--greedylr_patience", type=int, default=10,
-                        help="Number of steps with no improvement before changing learning rate in GreedyLR (default: 10)")
-    parser.add_argument("--greedylr_threshold", type=float, default=1e-10,
-                        help="Threshold for measuring improvement in GreedyLR (default: 1e-10)")
-    parser.add_argument("--greedylr_window", type=int, default=50,
-                        help="Window size for smoothing loss values in GreedyLR (default: 50)")
-    parser.add_argument("--greedylr_update_interval", type=int, default=5,
-                        help="Number of steps between LR update evaluations in GreedyLR (default: 5)")
-    parser.add_argument("--greedylr_ema", type=float, default=None,
-                        help="Use EMA smoothing with this beta factor instead of window averaging (default: None)")
-    parser.add_argument("--greedylr_warmup", type=int, default=None,
-                        help="Number of steps for linear warmup in GreedyLR (default: uses --warmup_steps if set)")
-    parser.add_argument("--greedylr_debug", action="store_true",
-                        help="Enable detailed debugging output from GreedyLR scheduler")
+    # Warmup parameter
+    parser.add_argument("--warmup_steps", type=int, default=0,
+                        help="Number of warmup steps (default: 0)")
     parser.add_argument("--warmup_steps", type=int, default=None,
                         help="Number of warmup steps (default: auto-calculated based on total steps)")
-    parser.add_argument("--warmup_pct", type=float, default=None,
-                        help="Percentage of training for warmup phase (default: auto-calculated)")
-    parser.add_argument("--min_lr", type=float, default=None,
-                        help="Minimum learning rate for schedulers (default: auto-calculated from LR finder)")
-    parser.add_argument("--max_lr", type=float, default=None,
-                        help="Maximum learning rate for GreedyLR scheduler (default: same as initial learning rate)")
-    parser.add_argument("--decay_rate", type=float, default=None,
-                        help="Final LR = max_lr * decay_rate (for warmup_decay, default: auto-calculated)")
-    parser.add_argument("--cycle_first_step_size", type=int, default=None,
-                        help="First cycle step size for OneCycle scheduler (default: auto-calculated)")
-    parser.add_argument("--decay_step_size", type=int, default=None,
-                        help="Decay step size for OneCycle scheduler (default: auto-calculated)")
-    parser.add_argument("--decay_lr_rate", type=float, default=None,
-                        help="Decay rate per step for OneCycle scheduler (default: auto-calculated)")
+    # Note: Removed complex scheduler parameters that aren't needed for Schedule-Free
     
     # Learning rate finder parameters
     parser.add_argument("--find_lr", action="store_true",
@@ -2065,8 +1835,9 @@ def main():
             if args.warmup_steps:
                 print(f"Schedule-Free warmup: {args.warmup_steps} steps")
         else:
-            print(f"Optimizer: Adam")
-            print(f"LR Scheduler: {args.lr_scheduler}")
+            print(f"Optimizer: Adam with simple warmup")
+            if args.warmup_steps:
+                print(f"Warmup steps: {args.warmup_steps}")
         
         # Calculate warmup percentage for display
         warmup_pct = (args.warmup_steps / NUM_BATCHES) * 100 if args.warmup_steps else 0
