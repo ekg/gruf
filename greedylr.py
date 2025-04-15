@@ -230,6 +230,7 @@ class GreedyLR:
                 if self.ema_loss is None:
                     self.ema_loss = metrics  # Initialize with first value
                     self.ema_steps = 1
+                    current_loss = metrics  # Initialize current_loss for first step
                 else:
                     self.ema_loss = beta * self.ema_loss + (1 - beta) * metrics
                     self.ema_steps += 1
