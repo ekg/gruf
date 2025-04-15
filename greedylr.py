@@ -60,11 +60,16 @@ class GreedyLR:
         self.best_raw_loss = float('inf')  # Track best raw loss separately
         self.loss_window = []
         self.ema_loss = None
+        self.ema_steps = 0
         self.steps_since_last_update = 0
         self.in_warmup = warmup > 0  # Track whether we're in warmup phase
         
         if factor >= 1.0 or factor <= 0:
             raise ValueError('Factor should be between 0 and 1')
+            
+        # Recommend using a smaller factor if the current one is very close to 1
+        if factor > 0.9 and self.is_main_process and debug:
+            print(f"WARNING: GreedyLR factor of {factor} is very close to 1.0. Consider using a smaller value (0.1-0.5) for better adaptation.")
             
         self.min_lrs = min_lr
         self.max_lrs = max_lr
@@ -103,10 +108,12 @@ class GreedyLR:
             'base_lrs': self.base_lrs,
             'loss_window': self.loss_window,
             'ema_loss': self.ema_loss,
+            'ema_steps': getattr(self, 'ema_steps', 0),
             'steps_since_last_update': self.steps_since_last_update,
             'update_interval': self.update_interval,
             'status_symbol': self.status_symbol,
-            'status_info': self.status_info
+            'status_info': self.status_info,
+            'in_warmup': self.in_warmup
         }
 
     def load_state_dict(self, state_dict):
@@ -128,6 +135,10 @@ class GreedyLR:
         # Handle new fields with backward compatibility
         if 'ema_loss' in state_dict:
             self.ema_loss = state_dict['ema_loss']
+        if 'ema_steps' in state_dict:
+            self.ema_steps = state_dict['ema_steps']
+        else:
+            self.ema_steps = 0
         if 'steps_since_last_update' in state_dict:
             self.steps_since_last_update = state_dict['steps_since_last_update']
         if 'update_interval' in state_dict:
@@ -140,6 +151,10 @@ class GreedyLR:
             self.status_info = state_dict['status_info']
         else:
             self.status_info = f"+{self.num_good_epochs}/-{self.num_bad_epochs}"
+        if 'in_warmup' in state_dict:
+            self.in_warmup = state_dict['in_warmup']
+        else:
+            self.in_warmup = self.warmup_counter > 0
     
     def get_lr(self):
         """Get current learning rate."""
@@ -213,12 +228,22 @@ class GreedyLR:
                 # Use exponential moving average (EMA)
                 beta = self.smoothing_factor
                 if self.ema_loss is None:
-                    self.ema_loss = metrics
+                    self.ema_loss = metrics  # Initialize with first value
+                    self.ema_steps = 1
                 else:
                     self.ema_loss = beta * self.ema_loss + (1 - beta) * metrics
-                current_loss = self.ema_loss
-                if self.debug and self.is_main_process:
-                    print(f"GreedyLR EMA loss: {current_loss:.6f}")
+                    self.ema_steps += 1
+                    
+                    # Apply bias correction for more accurate EMA at start
+                    bias_correction = 1 - beta ** self.ema_steps
+                    if bias_correction > 0:
+                        current_loss = self.ema_loss / bias_correction
+                    else:
+                        current_loss = self.ema_loss
+                        
+                    if self.debug and self.is_main_process:
+                        print(f"GreedyLR EMA loss: {current_loss:.6f} (bias corrected from {self.ema_loss:.6f})")
+                    
             else:
                 # Use window-based average
                 self.loss_window.append(metrics)
@@ -243,8 +268,8 @@ class GreedyLR:
             if not self.distributed or self.is_main_process:
                 # Check if loss is better or worse
                 # Using relative thresholds that scale with the respective loss values
-                raw_rel_threshold = self.threshold * metrics if self.threshold > 0 else 0
-                ema_rel_threshold = self.threshold * current_loss if self.threshold > 0 else 0
+                raw_rel_threshold = self.threshold * max(metrics, 1e-10) if self.threshold > 0 else 0
+                ema_rel_threshold = self.threshold * max(current_loss, 1e-10) if self.threshold > 0 else 0
                 
                 # Compare raw loss to best raw loss, and EMA loss to best EMA loss
                 raw_loss_improved = metrics < (self.best_raw_loss - raw_rel_threshold)
@@ -269,15 +294,19 @@ class GreedyLR:
                     if raw_loss_improved and ema_loss_improved:
                         improvement_type = "both raw and EMA"
                         self.status_symbol = "✓✓"  # Double check for both improved
+                        # Include improvement magnitude in status
+                        raw_imp_pct = (self.best_raw_loss - metrics) / self.best_raw_loss * 100 if self.best_raw_loss > 0 else 0
+                        self.status_info = f"+{self.num_good_epochs}/-{self.num_bad_epochs} ({raw_imp_pct:.2f}%)"
                     elif raw_loss_improved:
                         improvement_type = "raw"
                         self.status_symbol = "✓"   # Check for raw improved
+                        raw_imp_pct = (self.best_raw_loss - metrics) / self.best_raw_loss * 100 if self.best_raw_loss > 0 else 0
+                        self.status_info = f"+{self.num_good_epochs}/-{self.num_bad_epochs} ({raw_imp_pct:.2f}%)"
                     else:
                         improvement_type = "EMA"
                         self.status_symbol = "✓"   # Check for EMA improved
-                    
-                    # Store stats for concise display
-                    self.status_info = f"+{self.num_good_epochs}/-{self.num_bad_epochs}"
+                        ema_imp_pct = (self.best_loss - current_loss) / self.best_loss * 100 if self.best_loss > 0 else 0
+                        self.status_info = f"+{self.num_good_epochs}/-{self.num_bad_epochs} ({ema_imp_pct:.2f}%)"
                     
                     if self.debug:
                         print(f"GreedyLR: {improvement_type} loss improved, raw_imp={raw_improvement:.6f}, ema_imp={ema_improvement:.6f}, "
@@ -291,7 +320,9 @@ class GreedyLR:
                     
                     # Set status info for concise display
                     self.status_symbol = "✗"  # X for no improvement
-                    self.status_info = f"+{self.num_good_epochs}/-{self.num_bad_epochs}"
+                    # Include how far from best loss in status
+                    raw_gap_pct = (metrics - self.best_raw_loss) / self.best_raw_loss * 100 if self.best_raw_loss > 0 else 0
+                    self.status_info = f"+{self.num_good_epochs}/-{self.num_bad_epochs} (+{raw_gap_pct:.2f}%)"
                     
                     if self.debug:
                         print(f"GreedyLR: Loss didn't improve, raw={metrics:.6f} vs best={self.best_raw_loss:.6f}, "
@@ -302,10 +333,13 @@ class GreedyLR:
                     if self.smooth and len(self.loss_window) >= 20:  # Need enough samples to detect plateau
                         recent_losses = self.loss_window[-20:]
                         loss_range = max(recent_losses) - min(recent_losses)
-                        # If losses are within a small range (plateau) for 20 steps
-                        if loss_range < (self.threshold * 5) and self.num_bad_epochs > self.patience // 2:
+                        # Use a relative threshold of 0.5% of current loss for plateau detection
+                        plateau_threshold = max(current_loss * 0.005, 0.0001)
+                        
+                        # If losses are within the relative range (plateau) for 20 steps
+                        if loss_range < plateau_threshold and self.num_bad_epochs > self.patience // 2:
                             if self.debug:
-                                print(f"GreedyLR: Detected plateau with loss range {loss_range:.6f}, forcing exploration")
+                                print(f"GreedyLR: Detected plateau with loss range {loss_range:.6f}/{plateau_threshold:.6f}, forcing exploration")
                             # Force increase by setting good_epochs higher
                             self.num_good_epochs = self.patience + 1
                             self.num_bad_epochs = 0
@@ -337,7 +371,9 @@ class GreedyLR:
                         
                         self.cooldown_counter = self.cooldown
                         self.num_good_epochs = 0
+                        self.num_bad_epochs = 0  # Also reset bad epochs counter
                         self.best_loss = float('inf')  # Reset best loss after LR change
+                        self.best_raw_loss = float('inf')  # Reset best raw loss too
                     
                 elif self.num_bad_epochs > self.patience:
                     # Decrease learning rate
@@ -351,7 +387,9 @@ class GreedyLR:
                         
                         self.warmup_counter = self.warmup
                         self.num_bad_epochs = 0
+                        self.num_good_epochs = 0  # Also reset good epochs counter
                         self.best_loss = float('inf')  # Reset best loss after LR change
+                        self.best_raw_loss = float('inf')  # Reset best raw loss too
             
             # Synchronize decision across all processes in distributed setting
             if self.distributed:
