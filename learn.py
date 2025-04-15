@@ -13,6 +13,7 @@ import mmap
 import datetime
 import json
 import shutil
+from schedulefree import AdamWScheduleFree  # Import the Schedule-Free optimizer
 
 # Make matplotlib optional
 try:
@@ -215,6 +216,31 @@ class MinLMTrainer:
                 MODEL_CONFIG["depth"],
                 args
             )
+            
+        # Create custom optimizer if using Schedule-Free
+        if args.schedulefree:
+            # Create Schedule-Free optimizer
+            optimizer = AdamWScheduleFree(
+                self.model.parameters(),
+                lr=self.learning_rate,
+                betas=(args.sf_beta, 0.999),
+                weight_decay=args.sf_weight_decay,
+                warmup_steps=args.warmup_steps or 0
+            )
+            # Keep reference to the Schedule-Free optimizer for train/eval mode
+            self.sf_optimizer = optimizer
+            if self.global_rank == 0 and not self.silent_mode:
+                print(f"Using Schedule-Free optimizer with beta={args.sf_beta}, weight_decay={args.sf_weight_decay}")
+                if args.warmup_steps:
+                    print(f"Schedule-Free warmup: {args.warmup_steps} steps")
+                    
+            # Need to flag that we're using Schedule-Free to avoid scheduler conflicts
+            self.using_schedulefree = True
+        else:
+            # Regular optimizer will be created by DeepSpeed
+            optimizer = None
+            self.sf_optimizer = None
+            self.using_schedulefree = False
         
         # CRITICAL FIX FOR BF16 + ZERO
         if args.precision == "bf16":
@@ -262,11 +288,18 @@ class MinLMTrainer:
                     print(f"FP32 config: {ds_config['fp32']}")
     
         # Initialize DeepSpeed engine
-        model_engine, optimizer, _, _ = deepspeed.initialize(
-            model=self.model,
-            model_parameters=self.model.parameters(),
-            config=ds_config
-        )
+        if args.schedulefree:
+            model_engine, optimizer, _, _ = deepspeed.initialize(
+                model=self.model,
+                optimizer=optimizer,  # Pass the Schedule-Free optimizer
+                config=ds_config
+            )
+        else:
+            model_engine, optimizer, _, _ = deepspeed.initialize(
+                model=self.model,
+                model_parameters=self.model.parameters(),
+                config=ds_config
+            )
     
         self.model = model_engine
         self.optimizer = optimizer
@@ -299,9 +332,12 @@ class MinLMTrainer:
             # Replace the optimizer's step method with our custom version
             self.optimizer.step = custom_step
         
-        # Create GreedyLR scheduler if requested
+        # Create GreedyLR scheduler if requested and not using Schedule-Free
         self.lr_scheduler = None
-        if args.lr_scheduler == "greedylr":
+        if self.using_schedulefree:
+            if self.global_rank == 0 and not self.silent_mode:
+                print("Schedule-Free optimizer is active - disabling other LR schedulers")
+        elif args.lr_scheduler == "greedylr":
             from greedylr import GreedyLR
         
             min_lr = args.min_lr if args.min_lr is not None else self.learning_rate * 0.01
@@ -651,6 +687,10 @@ class MinLMTrainer:
             self.start_time = time.time()
             if self.global_rank == 0:
                 print(f"Starting tokens/s timing at step {self.global_step}")
+                
+        # Set Schedule-Free optimizer to train mode if using it
+        if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
+            self.sf_optimizer.train()
         
         # Ensure batch is a Long tensor before forward pass
         if batch.dtype != torch.long:
@@ -765,6 +805,11 @@ class MinLMTrainer:
     def validate(self, dataloader, max_batches=None):
         """Run validation on the entire validation dataset"""
         self.model.eval()
+        
+        # Set Schedule-Free optimizer to eval mode if using it
+        if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
+            self.sf_optimizer.eval()
+            
         val_losses = []
         val_bpbs = []
         
@@ -787,6 +832,11 @@ class MinLMTrainer:
         self.val_bpb = avg_bpb
         
         self.model.train()
+        
+        # Return Schedule-Free optimizer to train mode after validation
+        if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
+            self.sf_optimizer.train()
+            
         return {"val_loss": avg_val_loss, "bpb": avg_bpb}
     
     def load_checkpoint(self, checkpoint_path):
@@ -1612,6 +1662,14 @@ def main():
                         help="Maximum learning rate for LR finder (default: 1.0)")
     parser.add_argument("--num_lr_find_iter", type=int, default=100,
                         help="Number of iterations for LR finder (default: 100)")
+                        
+    # Schedule-Free optimizer parameters
+    parser.add_argument("--schedulefree", action="store_true",
+                        help="Use Schedule-Free optimizer instead of standard Adam")
+    parser.add_argument("--sf_beta", type=float, default=0.9,
+                        help="Schedule-Free momentum parameter (default: 0.9)")
+    parser.add_argument("--sf_weight_decay", type=float, default=0.01,
+                        help="Weight decay value for Schedule-Free (default: 0.01)")
     # Precision options
     precision_group = parser.add_mutually_exclusive_group()
     precision_group.add_argument("--bf16", dest="precision", action="store_const", const="bf16", default="bf16",
@@ -2001,7 +2059,14 @@ def main():
         print(f"Gradient accumulation: {GRAD_ACCUM_EVERY}")
         print(f"Effective batch size: {BATCH_SIZE * dp_size * GRAD_ACCUM_EVERY}")
         print(f"Learning rate: {LEARNING_RATE}")
-        print(f"LR Scheduler: {args.lr_scheduler}")
+        
+        if args.schedulefree:
+            print(f"Optimizer: Schedule-Free (beta={args.sf_beta}, weight_decay={args.sf_weight_decay})")
+            if args.warmup_steps:
+                print(f"Schedule-Free warmup: {args.warmup_steps} steps")
+        else:
+            print(f"Optimizer: Adam")
+            print(f"LR Scheduler: {args.lr_scheduler}")
         
         # Calculate warmup percentage for display
         warmup_pct = (args.warmup_steps / NUM_BATCHES) * 100 if args.warmup_steps else 0
@@ -2152,6 +2217,10 @@ def main():
     if args.resume:
         # Load checkpoint
         step_offset = trainer.load_checkpoint(args.resume)
+        
+        # If using Schedule-Free, put it in the right mode after loading checkpoint
+        if args.schedulefree and hasattr(trainer, 'sf_optimizer') and trainer.sf_optimizer is not None:
+            trainer.sf_optimizer.train()
         
         # Adjust remaining steps to account for already completed training
         if args.steps is not None:
