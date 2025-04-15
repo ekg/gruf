@@ -307,27 +307,7 @@ class MinLMTrainer:
             if self.global_rank == 0 and not self.silent_mode:
                 print("Completely disabled DeepSpeed's native scheduler")
     
-        # Monkey patch the optimizer step method to preserve our learning rates
-        if args.lr_scheduler == "greedylr":
-            if self.global_rank == 0 and not self.silent_mode:
-                print("Monkey patching optimizer step method to preserve custom learning rates")
-        
-            # Store the original optimizer step method
-            original_step = self.optimizer.step
-        
-            # Define a custom step method that preserves learning rates
-            def custom_step(*args, **kwargs):
-                # Store current learning rates before the step
-                current_lrs = [group['lr'] for group in self.optimizer.param_groups]
-                # Call the original step method
-                result = original_step(*args, **kwargs)
-                # Restore the learning rates after the step
-                for i, lr in enumerate(current_lrs):
-                    self.optimizer.param_groups[i]['lr'] = lr
-                return result
-        
-            # Replace the optimizer's step method with our custom version
-            self.optimizer.step = custom_step
+        # We no longer need to monkey patch since we now use Schedule-Free directly
         
         # No custom LR scheduler needed with Schedule-Free
         self.lr_scheduler = None
@@ -1770,6 +1750,7 @@ def main():
         print(f"Parameter offload: {args.offload_parameters}")
         print(f"Gradient clipping: {args.gradient_clip if args.gradient_clip is not None else '0.5'} (default for all precision types)")
         print(f"Precision: {args.precision.upper()}")
+        print(f"Schedule-Free: {args.schedulefree}")
         print(f"Debug gradients: {args.debug_gradients}")
         print(f"Tensor Parallel Size: {args.tensor_parallel_size}")
         print(f"-----------------------------\n")
