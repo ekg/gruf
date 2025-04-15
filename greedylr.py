@@ -281,6 +281,10 @@ class GreedyLR:
                     raw_improvement = self.best_raw_loss - metrics if raw_loss_improved else 0
                     ema_improvement = self.best_loss - current_loss if ema_loss_improved else 0
                     
+                    # Calculate improvement percentages before updating best values
+                    raw_imp_pct = (raw_improvement / self.best_raw_loss) * 100 if self.best_raw_loss > 0 else 0
+                    ema_imp_pct = (ema_improvement / self.best_loss) * 100 if self.best_loss > 0 else 0
+                    
                     # Update both best loss trackers
                     if raw_loss_improved:
                         self.best_raw_loss = metrics
@@ -295,18 +299,15 @@ class GreedyLR:
                     if raw_loss_improved and ema_loss_improved:
                         improvement_type = "both raw and EMA"
                         self.status_symbol = "✓✓"  # Double check for both improved
-                        # Include improvement magnitude in status
-                        raw_imp_pct = (self.best_raw_loss - metrics) / self.best_raw_loss * 100 if self.best_raw_loss > 0 else 0
+                        # Use the pre-calculated improvement percentage
                         self.status_info = f"+{self.num_good_epochs}/-{self.num_bad_epochs} ({raw_imp_pct:.2f}%)"
                     elif raw_loss_improved:
                         improvement_type = "raw"
                         self.status_symbol = "✓"   # Check for raw improved
-                        raw_imp_pct = (self.best_raw_loss - metrics) / self.best_raw_loss * 100 if self.best_raw_loss > 0 else 0
                         self.status_info = f"+{self.num_good_epochs}/-{self.num_bad_epochs} ({raw_imp_pct:.2f}%)"
                     else:
                         improvement_type = "EMA"
                         self.status_symbol = "✓"   # Check for EMA improved
-                        ema_imp_pct = (self.best_loss - current_loss) / self.best_loss * 100 if self.best_loss > 0 else 0
                         self.status_info = f"+{self.num_good_epochs}/-{self.num_bad_epochs} ({ema_imp_pct:.2f}%)"
                     
                     if self.debug:
