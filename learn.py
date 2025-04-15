@@ -220,6 +220,9 @@ class MinLMTrainer:
         # Create custom optimizer if using Schedule-Free
         if args.schedulefree:
             # Create Schedule-Free optimizer (no warmup needed)
+            if self.global_rank == 0 and not self.silent_mode:
+                print(f"Initializing Schedule-Free optimizer with lr={self.learning_rate}, beta={args.sf_beta}, weight_decay={args.sf_weight_decay}")
+                
             optimizer = AdamWScheduleFree(
                 self.model.parameters(),
                 lr=self.learning_rate,
@@ -230,8 +233,12 @@ class MinLMTrainer:
             self.sf_optimizer = optimizer
             # Save the ScheduleFree optimizer for mode switching
             self.using_schedulefree = True
+            
+            # Verify optimizer's learning rate
+            actual_lr = optimizer.param_groups[0]['lr']
             if self.global_rank == 0 and not self.silent_mode:
                 print(f"Using Schedule-Free optimizer with beta={args.sf_beta}, weight_decay={args.sf_weight_decay}")
+                print(f"Schedule-Free initial LR: {actual_lr} (configured: {self.learning_rate})")
                     
             # Need to flag that we're using Schedule-Free to avoid scheduler conflicts
             self.using_schedulefree = True
@@ -288,6 +295,12 @@ class MinLMTrainer:
     
         # Initialize DeepSpeed engine
         if args.schedulefree:
+            # For Schedule-Free, explicitly disable scheduler in config
+            if "scheduler" in ds_config:
+                del ds_config["scheduler"]
+                if self.global_rank == 0 and not self.silent_mode:
+                    print("Removed scheduler from DeepSpeed config for Schedule-Free compatibility")
+                    
             model_engine, optimizer, _, _ = deepspeed.initialize(
                 model=self.model,
                 optimizer=optimizer,  # Pass the Schedule-Free optimizer
@@ -333,14 +346,20 @@ class MinLMTrainer:
     
     def _create_simple_scheduler_config(self, learning_rate, warmup_steps=0):
         """Create a simple scheduler configuration"""
-        return {
-            "type": "WarmupLR",
-            "params": {
-                "warmup_min_lr": 0,
-                "warmup_max_lr": learning_rate,
-                "warmup_num_steps": max(1, warmup_steps)
+        # Configure differently based on whether we're using Schedule-Free
+        if hasattr(self, 'using_schedulefree') and self.using_schedulefree:
+            # For Schedule-Free, return None as we don't want a scheduler
+            return None
+        else:
+            # For standard optimizers, use a simple warmup scheduler
+            return {
+                "type": "WarmupLR",
+                "params": {
+                    "warmup_min_lr": 0,
+                    "warmup_max_lr": learning_rate,
+                    "warmup_num_steps": max(1, warmup_steps)
+                }
             }
-        }
             
     def create_deepspeed_config(self, zero_stage, precision, offload_optimizer, offload_parameters, learning_rate, gradient_clip=None, tensor_parallel_size=1, depth=6, args=None):
         """Create DeepSpeed configuration"""
@@ -363,11 +382,11 @@ class MinLMTrainer:
                     "eps": 1e-8
                 }
             },
-            # Simple scheduler config that just provides warmup
-            "scheduler": self._create_simple_scheduler_config(
+            # Only add scheduler if not using Schedule-Free
+            **({"scheduler": self._create_simple_scheduler_config(
                 learning_rate,
                 args.warmup_steps if args.warmup_steps else 0
-            ),
+            )} if not (hasattr(self, 'using_schedulefree') and self.using_schedulefree) else {}),
             "zero_optimization": {
                 "stage": zero_stage,
                 "contiguous_gradients": True,
@@ -486,6 +505,11 @@ class MinLMTrainer:
             self.start_time = time.time()
             if self.global_rank == 0:
                 print(f"Starting tokens/s timing at step {self.global_step}")
+                    
+                # Debug: Print optimizer learning rate at start
+                if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    print(f"Schedule-Free initial training LR: {current_lr}")
                 
         # Note: We no longer set sf_optimizer.train() here
         # ScheduleFree optimizer should be in train mode for the entire training loop
@@ -540,6 +564,11 @@ class MinLMTrainer:
         self.train_loss = loss_val
         
         # With Schedule-Free, we don't need manual LR updates - it handles adaptivity internally
+        
+        # Debug: Print optimizer learning rate occasionally for Schedule-Free
+        if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None and self.global_rank == 0 and self.global_step % 50 == 0:
+            current_lr = self.optimizer.param_groups[0]['lr']
+            print(f"Step {self.global_step}: Schedule-Free current LR = {current_lr}")
         
         # Update tokens processed count
         tokens_in_batch = batch.numel()
