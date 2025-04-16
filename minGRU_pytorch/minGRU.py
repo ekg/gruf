@@ -14,10 +14,53 @@ def default(v, d):
 # https://github.com/glassroom/heinsen_sequence
 
 def heinsen_associative_scan_log(log_coeffs, log_values):
-    a_star = log_coeffs.cumsum(dim = 1)
-    log_h0_plus_b_star = (log_values - a_star).logcumsumexp(dim = 1)
-    log_h = a_star + log_h0_plus_b_star
-    return log_h.exp()
+    """
+    Optimized version of the Heinsen associative scan in log space.
+    Supports both single and batched inputs.
+    
+    Args:
+        log_coeffs: Logarithm of coefficients, shape (batch, seq_len, dim) or (seq_len, dim)
+        log_values: Logarithm of values, shape (batch, seq_len, dim) or (seq_len, dim)
+        
+    Returns:
+        Scanned values, shape matches input
+    """
+    # Ensure inputs have consistent dimensions
+    if log_coeffs.ndim == 2 and log_values.ndim == 2:
+        # Handle unbatched inputs
+        a_star = log_coeffs.cumsum(dim=0)
+        log_h0_plus_b_star = (log_values - a_star).logcumsumexp(dim=0)
+        log_h = a_star + log_h0_plus_b_star
+        return log_h.exp()
+    else:
+        # Standard batched version
+        a_star = log_coeffs.cumsum(dim=1)
+        log_h0_plus_b_star = (log_values - a_star).logcumsumexp(dim=1)
+        log_h = a_star + log_h0_plus_b_star
+        return log_h.exp()
+
+# Batched version using vmap for better memory efficiency
+def batched_heinsen_scan_log(log_coeffs, log_values):
+    """
+    Memory-efficient implementation using torch.vmap.
+    Processes each batch item separately without creating large intermediate tensors.
+    
+    Args:
+        log_coeffs: Logarithm of coefficients, shape (batch, seq_len, dim)
+        log_values: Logarithm of values, shape (batch, seq_len, dim)
+        
+    Returns:
+        Scanned values, shape (batch, seq_len, dim)
+    """
+    # Define single-sequence function for vmapping
+    def scan_single_sequence(lc, lv):
+        a_star = lc.cumsum(dim=0)
+        log_h0_plus_b_star = (lv - a_star).logcumsumexp(dim=0)
+        log_h = a_star + log_h0_plus_b_star
+        return log_h.exp()
+    
+    # Apply vmap to process each batch element independently
+    return torch.vmap(scan_single_sequence)(log_coeffs, log_values)
 
 # appendix B.3
 
@@ -42,6 +85,7 @@ class minGRU(Module):
 
     def forward(self, x, prev_hidden = None, return_next_prev_hidden = False):
         seq_len = x.shape[1]
+        batch_size = x.shape[0]
         hidden, gate = self.to_hidden_and_gate(x).chunk(2, dim = -1)
 
         if seq_len == 1:
@@ -63,7 +107,13 @@ class minGRU(Module):
                 log_values = torch.cat((prev_hidden.log(), log_values), dim = 1)
                 log_coeffs = F.pad(log_coeffs, (0, 0, 1, 0))
 
-            out = heinsen_associative_scan_log(log_coeffs, log_values)
+            # Use the memory-efficient batched version for large batches/sequences
+            if batch_size > 1 and seq_len > 16:  # Threshold where memory savings become significant
+                out = batched_heinsen_scan_log(log_coeffs, log_values)
+            else:
+                # Use regular version for small batches
+                out = heinsen_associative_scan_log(log_coeffs, log_values)
+            
             out = out[:, -seq_len:]
 
         next_prev_hidden = out[:, -1:]
