@@ -732,11 +732,34 @@ class MinLMTrainer:
         
         # Check if this is a directory (DeepSpeed checkpoint) or file (PyTorch checkpoint)
         if os.path.isdir(checkpoint_path):
+            # Save reference to Schedule-Free optimizer before loading
+            sf_optimizer = None
+            if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
+                sf_optimizer = self.sf_optimizer
+                if self.global_rank == 0 and not self.silent_mode:
+                    print("Preserving Schedule-Free optimizer instance for state restoration")
+            
             # This is a DeepSpeed checkpoint directory
             # DeepSpeed handles loading both model and optimizer state
             success = self.model.load_checkpoint(checkpoint_path)
             if not success:
                 raise ValueError(f"Failed to load DeepSpeed checkpoint from {checkpoint_path}")
+            
+            # For Schedule-Free: Load optimizer state from auxiliary file if it exists
+            if sf_optimizer is not None:
+                sf_state_path = os.path.join(checkpoint_path, "sf_optimizer_state.pt")
+                if os.path.exists(sf_state_path):
+                    if self.global_rank == 0 and not self.silent_mode:
+                        print(f"Loading Schedule-Free optimizer state from {sf_state_path}")
+                    sf_state = torch.load(sf_state_path, map_location='cpu')
+                    sf_optimizer.load_state_dict(sf_state)
+                    # Restore reference to optimizer 
+                    self.sf_optimizer = sf_optimizer
+                    # Point the engine optimizer to the same object
+                    self.optimizer = sf_optimizer
+                else:
+                    if self.global_rank == 0:
+                        print("WARNING: No Schedule-Free optimizer state found, using reinitialized state")
                 
             # Try to extract step from the checkpoint path or tag file
             tag_file = os.path.join(checkpoint_path, "latest_tag")
@@ -773,8 +796,17 @@ class MinLMTrainer:
             self.best_val_loss = checkpoint.get('val_loss', float('inf'))
             self.best_val_bpb = checkpoint.get('val_bpb', float('inf'))
             
-            # Note: With DeepSpeed, we don't manually load optimizer state
-            # DeepSpeed will reinitialize the optimizer with our parameters
+            # Load Schedule-Free optimizer state if present
+            if 'sf_optimizer_state' in checkpoint and hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
+                try:
+                    if self.global_rank == 0 and not self.silent_mode:
+                        print("Restoring Schedule-Free optimizer state from checkpoint")
+                    self.sf_optimizer.load_state_dict(checkpoint['sf_optimizer_state'])
+                    # Also update DeepSpeed's reference to the optimizer
+                    self.optimizer = self.sf_optimizer
+                except Exception as e:
+                    if self.global_rank == 0:
+                        print(f"WARNING: Failed to load Schedule-Free optimizer state: {e}")
         
         # Reset token counting and timing for correct tokens/s calculation on resume
         self.start_time = time.time()
@@ -782,6 +814,17 @@ class MinLMTrainer:
         
         # Important: We keep self.global_tokens as loaded from checkpoint for total count,
         # but reset the timing so tokens/s calculation starts fresh
+        
+        # Ensure Schedule-Free optimizer is in train mode after loading
+        if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
+            self.sf_optimizer.train()
+            if self.global_rank == 0 and not self.silent_mode:
+                print("Schedule-Free optimizer set to train mode after checkpoint load")
+                # Debug: print current state of optimizer
+                if hasattr(self.sf_optimizer, 'training'):
+                    print(f"Schedule-Free optimizer training mode: {self.sf_optimizer.training}")
+                # Print current learning rate to verify state
+                print(f"Schedule-Free optimizer learning rate: {self.optimizer.param_groups[0]['lr']}")
         
         if self.global_rank == 0 and not self.silent_mode:
             print(f"✅ Checkpoint loaded. Resuming from step {self.global_step}")
@@ -805,6 +848,13 @@ class MinLMTrainer:
             'val_loss': self.val_loss,
             'val_bpb': self.val_bpb
         }
+        
+        # Save Schedule-Free optimizer state if present
+        if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
+            # Get state dict from the Schedule-Free optimizer
+            sf_state = self.sf_optimizer.state_dict()
+            # Save as part of main checkpoint
+            checkpoint['sf_optimizer_state'] = sf_state
         
         if additional_info:
             checkpoint.update(additional_info)
@@ -858,8 +908,23 @@ class MinLMTrainer:
                             if not self.silent_mode:
                                 print(f"Error removing checkpoint: {e}")
         
-        # For permanent/milestone checkpoints, just log and return
+        # For permanent/milestone checkpoints, save Schedule-Free state and return
         if is_permanent or is_milestone:
+            # For DeepSpeed checkpoints, also save Schedule-Free optimizer state separately
+            # This is the standard path used by DeepSpeed
+            ds_checkpoint_dir = os.path.join(self.checkpoint_dir, f"global_step{self.global_step}")
+            
+            # If this directory exists, it means DeepSpeed successfully saved a checkpoint
+            # We need to save our Schedule-Free state there as well
+            if os.path.exists(ds_checkpoint_dir) and hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
+                sf_state_path = os.path.join(ds_checkpoint_dir, "sf_optimizer_state.pt")
+                # Get state dict from the Schedule-Free optimizer
+                sf_state = self.sf_optimizer.state_dict()
+                # Save to file
+                torch.save(sf_state, sf_state_path)
+                if not self.silent_mode:
+                    print(f"Saved Schedule-Free optimizer state to {sf_state_path}")
+            
             if not self.silent_mode:
                 checkpoint_type = "permanent" if is_permanent else "milestone"
                 print(f"Saved {checkpoint_type} checkpoint at step {self.global_step}")
