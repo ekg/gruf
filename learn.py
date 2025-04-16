@@ -1474,6 +1474,10 @@ def main():
                         help="Save permanent checkpoints every N steps (default: 5000)")
     parser.add_argument("--depth", type=int, default=None,
                         help="Number of model layers (default: 6).")
+    parser.add_argument("--ff_mult", type=float, default=None,
+                        help=f"Feedforward multiplier (default: {MODEL_CONFIG['ff_mult']})")
+    parser.add_argument("--expansion", type=float, default=None,
+                        help=f"Expansion factor for minGRU/minLSTM (default: {MODEL_CONFIG['expansion']})")
     parser.add_argument("--embedding_dim", type=int, default=None,
                         help="Embedding dimension (vocabulary size, default: 256)")
     parser.add_argument("--params", type=str, default=None,
@@ -1639,6 +1643,14 @@ def main():
     # Get embedding dimension from command line or use default
     embedding_dim = args.embedding_dim if args.embedding_dim is not None else MODEL_CONFIG["num_tokens"]
     
+    # Get ff_mult and expansion values from command line or use defaults
+    ff_mult_value = args.ff_mult if args.ff_mult is not None else MODEL_CONFIG["ff_mult"]
+    expansion_value = args.expansion if args.expansion is not None else MODEL_CONFIG["expansion"]
+    
+    # Update model config with these values
+    MODEL_CONFIG["ff_mult"] = ff_mult_value
+    MODEL_CONFIG["expansion"] = expansion_value
+    
     # Configure model architecture based on command line arguments
     if params_value is not None:
         # Get target parameter count
@@ -1651,8 +1663,8 @@ def main():
                 target_params, 
                 dim, 
                 embedding_dim, 
-                MODEL_CONFIG["ff_mult"], 
-                MODEL_CONFIG["expansion"]
+                MODEL_CONFIG["ff_mult"],  # Now configurable from CLI
+                MODEL_CONFIG["expansion"]  # Now configurable from CLI
             )
             if global_rank == 0:
                 print(f"Target params: {target_params/1e6:.1f}M, Dimension: {dim}, Calculated depth: {depth}")
@@ -1663,8 +1675,8 @@ def main():
                 target_params, 
                 depth, 
                 embedding_dim, 
-                MODEL_CONFIG["ff_mult"], 
-                MODEL_CONFIG["expansion"]
+                MODEL_CONFIG["ff_mult"],  # Now configurable from CLI
+                MODEL_CONFIG["expansion"]  # Now configurable from CLI
             )
             if global_rank == 0:
                 print(f"Target params: {target_params/1e6:.1f}M, Calculated dimension: {dim}, Depth: {depth}")
@@ -1693,8 +1705,8 @@ def main():
                     target_params, 
                     depth, 
                     MODEL_CONFIG["num_tokens"], 
-                    MODEL_CONFIG["ff_mult"], 
-                    MODEL_CONFIG["expansion"]
+                    MODEL_CONFIG["ff_mult"],  # Now configurable from CLI
+                    MODEL_CONFIG["expansion"]  # Now configurable from CLI
                 )
                 if global_rank == 0:
                     print(f"Target params: {target_params/1e6:.1f}M, Balanced scaling - Dimension: {dim}, Depth: {depth}")
@@ -1923,6 +1935,7 @@ def main():
     if global_rank == 0 and not trainer.silent_mode:
         print(f"\n--- Training Configuration ---")
         print(f"Model: {MODEL_CONFIG['depth']} layers, {MODEL_CONFIG['dim']} dimensions")
+        print(f"FF Multiplier: {MODEL_CONFIG['ff_mult']}, Expansion Factor: {MODEL_CONFIG['expansion']}")
         print(f"Parameters: {get_parameter_count_str(MODEL_CONFIG)}")
         print(f"Batch size per GPU: {BATCH_SIZE}")
         # With tensor parallelism, the effective data parallel size is reduced
