@@ -219,7 +219,8 @@ class MinLMTrainer:
         silent_mode=True,
         debug_gradients=False,
         checkpoint_every=100,
-        permanent_save_interval=5000
+        permanent_save_interval=5000,
+        args=None
     ):
         self.learning_rate = learning_rate
         self.model = minLM(
@@ -234,8 +235,14 @@ class MinLMTrainer:
             dropout=dropout
         )
         
-        # Compile the model for better performance
-        self.model = torch.compile(self.model)
+        # Compile the model for better performance (if not disabled)
+        if not (args is not None and getattr(args, 'no_compile', False)):
+            self.model = torch.compile(self.model)
+            if not silent_mode and global_rank == 0:
+                print("Model compiled with torch.compile()")
+        else:
+            if not silent_mode and global_rank == 0:
+                print("Model compilation disabled via --no_compile")
         # For tracking tokens per second
         self.total_tokens_processed = 0
         self.start_time = None
@@ -1526,6 +1533,8 @@ def main():
                         help="Offload optimizer states to CPU (reduces GPU memory)")
     parser.add_argument("--offload_parameters", action="store_true",
                         help="Offload parameters to CPU (for ZeRO-3)")
+    parser.add_argument("--no_compile", action="store_true",
+                        help="Disable torch.compile() model compilation")
     parser.add_argument("--gradient_clip", type=float, default=None,
                         help="Gradient clipping value (default: 0.5 for all precision types, 0 to disable)")
     parser.add_argument("--debug_gradients", action="store_true",
@@ -1881,7 +1890,8 @@ def main():
         silent_mode=not args.verbose,
         debug_gradients=args.debug_gradients,
         checkpoint_every=args.checkpoint_every,
-        permanent_save_interval=args.permanent_save_interval
+        permanent_save_interval=args.permanent_save_interval,
+        args=args
     )
     
     # Store val_dataset for text generation
