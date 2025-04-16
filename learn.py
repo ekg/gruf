@@ -776,8 +776,16 @@ class MinLMTrainer:
             # Note: With DeepSpeed, we don't manually load optimizer state
             # DeepSpeed will reinitialize the optimizer with our parameters
         
+        # Reset token counting and timing for correct tokens/s calculation on resume
+        self.start_time = time.time()
+        self.total_tokens_processed = 0
+        
+        # Important: We keep self.global_tokens as loaded from checkpoint for total count,
+        # but reset the timing so tokens/s calculation starts fresh
+        
         if self.global_rank == 0 and not self.silent_mode:
             print(f"✅ Checkpoint loaded. Resuming from step {self.global_step}")
+            print(f"Token counter reset for accurate tokens/s calculation")
         
         return self.global_step
     
@@ -901,20 +909,30 @@ class MinLMTrainer:
     
     def train(self, train_dataloader, val_dataloader, num_batches, validate_every, generate_every, val_batches=4):
         """Main training loop"""
-        # Set start time if it's not already set (could be set when resuming)
-        if self.start_time is None:
-            self.start_time = time.time()
+        # Always set start time at the beginning of training or resuming
+        # This ensures we get accurate tokens/s measurements
+        self.start_time = time.time()
         
         # Create metrics log file
         if self.global_rank == 0 and self.checkpoint_dir:
             metrics_log_path = os.path.join(self.checkpoint_dir, "training_metrics.tsv")
-            with open(metrics_log_path, 'w') as f:
-                header = [
-                    "step", "time", "tokens_processed", 
-                    "tokens_per_sec", "train_loss", "val_loss", "bpb",
-                    "current_lr", "batch_size", "grad_accum"
-                ]
-                f.write('\t'.join(header) + '\n')
+            metrics_exists = os.path.exists(metrics_log_path)
+            
+            # If resuming, append to existing file rather than overwriting
+            mode = 'a' if metrics_exists else 'w'
+            with open(metrics_log_path, mode) as f:
+                # Only write header for new files
+                if not metrics_exists:
+                    header = [
+                        "step", "time", "tokens_processed", 
+                        "tokens_per_sec", "train_loss", "val_loss", "bpb",
+                        "current_lr", "batch_size", "grad_accum"
+                    ]
+                    f.write('\t'.join(header) + '\n')
+                
+                # Add resume marker if appending
+                if metrics_exists:
+                    f.write(f"# Resume training at step {self.global_step}\n")
                 
         # If using ScheduleFree, put optimizer in train mode at the beginning
         if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
@@ -952,7 +970,8 @@ class MinLMTrainer:
                 # Update progress bar
                 if self.global_rank == 0:
                     elapsed = time.time() - self.start_time
-                    tokens_per_sec = self.global_tokens.item() / elapsed if elapsed > 0 else 0
+                    # Use tokens processed in this session for accurate tokens/s reporting
+                    tokens_per_sec = self.total_tokens_processed / elapsed if elapsed > 0 else 0
                     val_info = f"Val: {self.val_loss:.4f} BPB: {self.val_bpb:.4f} | " if self.val_loss > 0 else ""
                     current_lr = self.optimizer.param_groups[0]['lr']
                         
@@ -1267,8 +1286,13 @@ class MinLMTrainer:
             
             # Prepare the line to write
             elapsed = time.time() - self.start_time
+            
+            # Use the tokens processed since current session start for tokens/s calculation
+            # This gives accurate performance metrics rather than using accumulated historical count
+            tokens_per_sec = self.total_tokens_processed / elapsed if elapsed > 0 else 0
+            
+            # But use global_tokens for total count (includes previous runs)
             global_tokens = self.global_tokens.item()
-            tokens_per_sec = global_tokens / elapsed if elapsed > 0 else 0
             
             # Get current learning rate
             current_lr = self.optimizer.param_groups[0]['lr']
@@ -1456,6 +1480,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train a minLM model with DeepSpeed")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint file to resume training from")
+    parser.add_argument("--force_lr_on_resume", action="store_true",
+                        help="Force reset learning rate to command-line value when resuming")
     parser.add_argument("--data", type=str, required=True,
                         help="Path to the training data file (e.g., 'data/enwik8.gz')")
     parser.add_argument("--gpus", type=str, default=None, 
@@ -2084,6 +2110,17 @@ def main():
                 print("Ensuring ScheduleFree optimizer is in correct mode after resume")
             # Explicitly ensure we're in train mode
             trainer.sf_optimizer.train()
+            
+        # Reset the optimizer's state if there are issues
+        if global_rank == 0:
+            print(f"Current learning rate after resume: {trainer.optimizer.param_groups[0]['lr']}")
+            
+        # For older checkpoints or if issues are detected, we can force reset the learning rate
+        if args.force_lr_on_resume and args.learning_rate is not None:
+            for param_group in trainer.optimizer.param_groups:
+                param_group['lr'] = args.learning_rate
+            if global_rank == 0:
+                print(f"Forcing learning rate to {args.learning_rate} after resume")
         
         # Adjust remaining steps to account for already completed training
         if args.steps is not None:
