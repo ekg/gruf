@@ -104,7 +104,71 @@ def base_decoding(
 
     return out[..., prompt_seq_len:]
 
-# Dataset class
+# Dataset classes
+class MemoryMappedTextDataset(Dataset):
+    def __init__(self, filepath, seq_len, offset=0, length=None):
+        super().__init__()
+        self.filepath = filepath
+        self.seq_len = seq_len
+        self.offset = offset
+        
+        # Get file size once
+        self.file_size = os.path.getsize(filepath)
+        
+        # Set the effective length for this dataset
+        if length is None:
+            self.effective_length = self.file_size - offset
+        else:
+            self.effective_length = min(length, self.file_size - offset)
+        
+        # Calculate valid end position for random sampling
+        # -seq_len-1 ensures we can always get seq_len+1 bytes
+        self.valid_end = max(0, self.effective_length - seq_len - 1)
+        
+        # Open file and create memory map - will be initialized on first access
+        self.file = None
+        self.mm = None
+        
+        # Define length as number of possible starting positions
+        self.samples_per_epoch = max(1, self.valid_end // seq_len)
+    
+    def _ensure_open(self):
+        """Ensure the memory map is open, opening it if necessary"""
+        if self.mm is None:
+            self.file = open(self.filepath, 'r+b')
+            self.mm = mmap.mmap(self.file.fileno(), 0)
+    
+    def __len__(self):
+        return self.samples_per_epoch
+    
+    def __getitem__(self, index):
+        self._ensure_open()
+        
+        # Generate a random position within our valid range
+        start_pos = random.randint(0, self.valid_end) + self.offset
+            
+        # Directly read bytes from memory map without creating intermediate arrays
+        self.mm.seek(start_pos)
+        data = self.mm.read(self.seq_len + 1)  # +1 for the target
+        
+        # Convert to tensor
+        tensor = torch.frombuffer(data, dtype=torch.uint8).long()
+        
+        # Handle edge case if we didn't get enough data
+        if tensor.size(0) < self.seq_len + 1:
+            # Pad with zeros if needed
+            padding = torch.zeros(self.seq_len + 1 - tensor.size(0), dtype=torch.long)
+            tensor = torch.cat([tensor, padding])
+        
+        return tensor
+    
+    def __del__(self):
+        # Clean up resources
+        if hasattr(self, 'mm') and self.mm is not None:
+            self.mm.close()
+        if hasattr(self, 'file') and self.file is not None:
+            self.file.close()
+
 class TextSamplerDataset(Dataset):
     def __init__(self, data, seq_len):
         super().__init__()
@@ -1475,23 +1539,24 @@ def main():
             print("Detected gzip format, loading into memory...")
         with gzip.open(args.data) as file:
             data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
-            np_train, np_valid = np.split(data, [int(90e6)])
+            # Use a percentage-based split (90% train, 10% validation)
+            split_point = int(0.9 * len(data))
+            np_train, np_valid = np.split(data, [split_point])
             data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
     else:
         if global_rank == 0:
-            print("Detected raw format, using memory mapping...")
+            print("Detected raw format, using true memory mapping...")
+        
         # Get file size
         file_size = os.path.getsize(args.data)
-        # Map the file into memory
-        with open(args.data, 'r+b') as f:
-            mm = mmap.mmap(f.fileno(), 0)
-            # Create a numpy array using the memory map
-            data = np.frombuffer(mm, dtype=np.uint8, count=min(int(95e6), file_size))
-            # Split data (but don't copy it)
-            train_size = min(int(90e6), len(data))
-            np_train, np_valid = data[:train_size], data[train_size:min(int(95e6), len(data))]
-            # Convert to PyTorch tensors
-            data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
+        
+        # Calculate split point for train/val (90/10 split)
+        split_point = int(0.9 * file_size)
+        
+        if global_rank == 0:
+            print(f"File size: {file_size} bytes")
+            print(f"Train portion: 0-{split_point} ({split_point} bytes)")
+            print(f"Validation portion: {split_point}-{file_size} ({file_size - split_point} bytes)")
     
     if global_rank == 0:
         print(f"Data loaded - Train: {data_train.shape}, Val: {data_val.shape}")
@@ -1604,8 +1669,28 @@ def main():
     if global_rank == 0:
         print(f"Creating datasets with sequence length: {SEQ_LEN}...")
     
-    train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
-    val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
+    # Create appropriate datasets based on file type
+    if is_gzip_file(args.data):
+        # For gzipped data, use in-memory dataset
+        train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
+        val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
+    else:
+        # For raw data, use memory-mapped dataset
+        # Training dataset uses first 90% of file
+        train_dataset = MemoryMappedTextDataset(
+            filepath=args.data,
+            seq_len=SEQ_LEN,
+            offset=0,
+            length=split_point
+        )
+        
+        # Validation dataset uses last 10% of file
+        val_dataset = MemoryMappedTextDataset(
+            filepath=args.data,
+            seq_len=SEQ_LEN,
+            offset=split_point,
+            length=file_size - split_point
+        )
     
     # Calculate optimal workers
     num_workers = min(4, os.cpu_count() or 2)
