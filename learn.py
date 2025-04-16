@@ -968,8 +968,8 @@ class MinLMTrainer:
                     pbar.set_description(f"Loss: {loss:.4f} | {lr_info} | {val_info}{tokens_per_sec:.2f} tok/s")
                     pbar.update(1)
                 
-                # Log progress
-                if self.global_rank == 0 and step % 10 == 0:
+                # Log progress on every step
+                if self.global_rank == 0:
                     self._log_metrics(False)
                     
                 # Save periodic checkpoint based on configured interval
