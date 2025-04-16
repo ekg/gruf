@@ -88,18 +88,30 @@ def load_model(checkpoint_path, config_path=None, use_bf16=False, use_fp16=False
     if 'state_dict' in checkpoint:
         # Standard Lightning checkpoint format
         pl_state_dict = checkpoint['state_dict']
-        
+            
         # The model in LightningMinLM is stored under 'model.' prefix
         model_state_dict = {}
         for key, value in pl_state_dict.items():
             # Remove the 'model.' prefix from keys
             if key.startswith('model.'):
                 model_state_dict[key[6:]] = value
-        
+            
         model.load_state_dict(model_state_dict)
     elif 'model_state_dict' in checkpoint:
         # Our custom Lightning checkpoint format
-        model.load_state_dict(checkpoint['model_state_dict'])
+        # First check if this is a compiled model (has '_orig_mod.' prefix)
+        if any(key.startswith('_orig_mod.') for key in checkpoint['model_state_dict']):
+            print("Detected compiled model checkpoint (_orig_mod. prefix)")
+            # Remove the '_orig_mod.' prefix from all keys
+            fixed_state_dict = {}
+            for key, value in checkpoint['model_state_dict'].items():
+                if key.startswith('_orig_mod.'):
+                    fixed_state_dict[key[10:]] = value  # Remove '_orig_mod.' prefix
+                else:
+                    fixed_state_dict[key] = value
+            model.load_state_dict(fixed_state_dict)
+        else:
+            model.load_state_dict(checkpoint['model_state_dict'])
     elif 'model' in checkpoint and 'state_dict' in checkpoint['model']:
         # Another possible Lightning format
         model.load_state_dict(checkpoint['model']['state_dict'])
@@ -120,9 +132,12 @@ def load_model(checkpoint_path, config_path=None, use_bf16=False, use_fp16=False
                         ds_state_dict[key[13:]] = value  # Remove 'module.model.'
                     elif key.startswith('model.'):
                         ds_state_dict[key[6:]] = value  # Remove 'model.'
+                    elif key.startswith('_orig_mod.'):
+                        # Handle compiled model saved with torch.compile
+                        ds_state_dict[key[10:]] = value  # Remove '_orig_mod.' prefix
                     else:
                         ds_state_dict[key] = value  # Keep as is
-                
+                    
                 # Try loading with adapted keys
                 model.load_state_dict(ds_state_dict)
                 print("Successfully loaded model with adapted keys")
