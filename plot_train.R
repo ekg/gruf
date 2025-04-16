@@ -117,7 +117,7 @@ if(length(models) > 0) {
                             "\nSteps to min ≈ ", 
                             ifelse(is.na(steps_to_threshold), 
                                    "not reached", 
-                                   format(round(steps_to_threshold, 0), big.mark=",")),
+                                   format(round(steps_to_threshold, 0), big.mark=","))),
              hjust = 0, size = 3.5)
 } else {
   cat("\nWarning: Failed to fit decay models. Check your data or try different starting parameters.\n\n")
