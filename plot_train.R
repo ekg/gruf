@@ -107,6 +107,9 @@ if(length(models) > 0) {
   cat(paste("Estimated asymptotic minimum loss:", round(min_loss, 5), "\n"))
   cat(paste("Steps to reach within 1% of minimum:", round(steps_to_threshold, 0), "\n\n"))
   
+  # Format parameters for display
+  param_text <- paste(names(params), "=", format(round(params, 4), nsmall=4), collapse="\n")
+  
   # Add the fitted curve to the plot
   p <- p + 
     geom_line(data = predictions, aes(x = step, y = train_loss), 
@@ -117,7 +120,8 @@ if(length(models) > 0) {
                             "\nSteps to min ≈ ", 
                             ifelse(is.na(steps_to_threshold), 
                                    "not reached", 
-                                   format(round(steps_to_threshold, 0), big.mark=","))),
+                                   format(round(steps_to_threshold, 0), big.mark=",")), 
+                            "\n\nParameters:\n", param_text),
              hjust = 0, size = 3.5)
 } else {
   cat("\nWarning: Failed to fit decay models. Check your data or try different starting parameters.\n\n")
