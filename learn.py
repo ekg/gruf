@@ -1281,11 +1281,25 @@ class MinLMTrainer:
         if not hasattr(self, 'val_dataset') or self.val_dataset is None:
             print("No validation dataset provided for generation")
             return
+        
+        # Handle both memory-mapped and in-memory datasets
+        if isinstance(self.val_dataset, MemoryMappedTextDataset):
+            # Get a batch from the memory-mapped dataset
+            self.val_dataset._ensure_open()  # Make sure memory map is open
             
-        # Get a random sample from validation data
-        rand_start = torch.randint(0, len(self.val_dataset.data) - prime_length - 1, (1,))
-        # Ensure prime is a Long tensor before passing to the model
-        prime = self.val_dataset.data[rand_start:rand_start + prime_length].long().unsqueeze(0).to(self.model.device)
+            # Generate a random position within the validation area
+            start_pos = random.randint(0, self.val_dataset.valid_end) + self.val_dataset.offset
+            
+            # Read the prime data from the memory map
+            self.val_dataset.mm.seek(start_pos)
+            data = self.val_dataset.mm.read(prime_length)
+            
+            # Convert to tensor
+            prime = torch.frombuffer(data, dtype=torch.uint8).long().unsqueeze(0).to(self.model.device)
+        else:
+            # For in-memory dataset
+            rand_start = torch.randint(0, len(self.val_dataset.data) - prime_length - 1, (1,))
+            prime = self.val_dataset.data[rand_start:rand_start + prime_length].long().unsqueeze(0).to(self.model.device)
         
         # Generate text
         if not self.silent_mode:
@@ -1534,6 +1548,9 @@ def main():
     if global_rank == 0:
         print(f"Loading data from {args.data}...")
     
+    # Initialize variables to track whether data is in memory or memory-mapped
+    using_mmap = False
+    
     if is_gzip_file(args.data):
         if global_rank == 0:
             print("Detected gzip format, loading into memory...")
@@ -1543,6 +1560,9 @@ def main():
             split_point = int(0.9 * len(data))
             np_train, np_valid = np.split(data, [split_point])
             data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
+            
+            if global_rank == 0:
+                print(f"Data loaded - Train: {data_train.shape}, Val: {data_val.shape}")
     else:
         if global_rank == 0:
             print("Detected raw format, using true memory mapping...")
@@ -1557,9 +1577,10 @@ def main():
             print(f"File size: {file_size} bytes")
             print(f"Train portion: 0-{split_point} ({split_point} bytes)")
             print(f"Validation portion: {split_point}-{file_size} ({file_size - split_point} bytes)")
-    
-    if global_rank == 0:
-        print(f"Data loaded - Train: {data_train.shape}, Val: {data_val.shape}")
+            print(f"Data will be accessed via memory mapping")
+        
+        # Mark that we're using memory mapping
+        using_mmap = True
     
     # Parse numerical arguments with potential suffixes
     dim_value = parse_size_with_suffix(args.dim) if args.dim is not None else None
@@ -1670,8 +1691,8 @@ def main():
         print(f"Creating datasets with sequence length: {SEQ_LEN}...")
     
     # Create appropriate datasets based on file type
-    if is_gzip_file(args.data):
-        # For gzipped data, use in-memory dataset
+    if not using_mmap:
+        # For gzipped/in-memory data, use TextSamplerDataset
         train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
         val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
     else:
