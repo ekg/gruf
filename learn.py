@@ -151,8 +151,9 @@ class MemoryMappedTextDataset(Dataset):
         self.mm.seek(start_pos)
         data = self.mm.read(self.seq_len + 1)  # +1 for the target
         
-        # Convert to tensor
-        tensor = torch.frombuffer(data, dtype=torch.uint8).long()
+        # Convert to a writable buffer first, then to tensor
+        writable_data = bytearray(data)
+        tensor = torch.frombuffer(writable_data, dtype=torch.uint8).long()
         
         # Handle edge case if we didn't get enough data
         if tensor.size(0) < self.seq_len + 1:
@@ -1294,8 +1295,9 @@ class MinLMTrainer:
             self.val_dataset.mm.seek(start_pos)
             data = self.val_dataset.mm.read(prime_length)
             
-            # Convert to tensor
-            prime = torch.frombuffer(data, dtype=torch.uint8).long().unsqueeze(0).to(self.model.device)
+            # Convert to a writable buffer first, then to tensor
+            writable_data = bytearray(data)
+            prime = torch.frombuffer(writable_data, dtype=torch.uint8).long().unsqueeze(0).to(self.model.device)
         else:
             # For in-memory dataset
             rand_start = torch.randint(0, len(self.val_dataset.data) - prime_length - 1, (1,))
