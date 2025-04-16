@@ -73,9 +73,26 @@ if(length(models) > 0) {
   
   # Calculate where loss will be within 1% of its asymptotic minimum
   threshold <- min_loss * 1.01
-  steps_to_threshold <- min(prediction_steps[predictions$train_loss <= threshold])
-  if(is.infinite(steps_to_threshold)) {
-    steps_to_threshold <- NA
+  below_threshold <- prediction_steps[predictions$train_loss <= threshold]
+  
+  if(length(below_threshold) > 0) {
+    steps_to_threshold <- min(below_threshold)
+  } else {
+    # If no values below threshold, estimate when it might happen
+    if(best_model_name == "exp") {
+      # For exponential decay, solve a*exp(-b*x) + c = threshold
+      # x = -ln((threshold-c)/a)/b
+      steps_to_threshold <- -log((threshold - params["c"]) / params["a"]) / params["b"]
+    } else {
+      # For power law, solve a*(x+d)^(-b) + c = threshold
+      # x = ((threshold-c)/a)^(-1/b) - d
+      steps_to_threshold <- ((threshold - params["c"]) / params["a"])^(-1/params["b"]) - params["d"]
+    }
+    
+    # Check if the solution is valid
+    if(is.nan(steps_to_threshold) || is.infinite(steps_to_threshold) || steps_to_threshold < 0) {
+      steps_to_threshold <- NA
+    }
   }
   
   # Calculate model statistics
@@ -97,7 +114,10 @@ if(length(models) > 0) {
     annotate("text", x = max(train_data$step) * 0.7, y = max(train_data$train_loss) * 0.8,
              label = paste0(best_model_name, " model fit\n",
                             "Min loss ≈ ", round(min_loss, 3), 
-                            "\nSteps to min ≈ ", round(steps_to_threshold, 0)),
+                            "\nSteps to min ≈ ", 
+                            ifelse(is.na(steps_to_threshold), 
+                                   "not reached", 
+                                   format(round(steps_to_threshold, 0), big.mark=",")),
              hjust = 0, size = 3.5)
 } else {
   cat("\nWarning: Failed to fit decay models. Check your data or try different starting parameters.\n\n")
