@@ -110,12 +110,20 @@ if(length(models) > 0) {
   # Format parameters for display
   param_text <- paste(names(params), "=", format(round(params, 4), nsmall=4), collapse="\n")
   
+  # Create equation text based on model type
+  if(best_model_name == "exp") {
+    equation <- "y = a * exp(-b * x) + c"
+  } else {
+    equation <- "y = a * (x + d)^(-b) + c"
+  }
+  
   # Add the fitted curve to the plot
   p <- p + 
     geom_line(data = predictions, aes(x = step, y = train_loss), 
               color = "darkgreen", size = 1, linetype = "dashed") +
     annotate("text", x = max(train_data$step) * 0.7, y = max(train_data$train_loss) * 0.8,
              label = paste0(best_model_name, " model fit\n",
+                            "Equation: ", equation, "\n",
                             "Min loss ≈ ", round(min_loss, 3), 
                             "\nSteps to min ≈ ", 
                             ifelse(is.na(steps_to_threshold), 
@@ -127,6 +135,6 @@ if(length(models) > 0) {
   cat("\nWarning: Failed to fit decay models. Check your data or try different starting parameters.\n\n")
 }
 
-# Save the plot as a PDF (8 x 4 inches)
+# Save the plot as a PDF (10 x 5 inches)
 output_file <- paste0(table_name, ".pdf")
-ggsave(filename = output_file, plot = p, width = 8, height = 4, units = "in")
+ggsave(filename = output_file, plot = p, width = 10, height = 5, units = "in")
