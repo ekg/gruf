@@ -233,6 +233,9 @@ class MinLMTrainer:
             enable_conv=enable_conv,
             dropout=dropout
         )
+        
+        # Compile the model for better performance
+        self.model = torch.compile(self.model, fullgraph=True)
         # For tracking tokens per second
         self.total_tokens_processed = 0
         self.start_time = None
