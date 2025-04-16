@@ -1250,32 +1250,53 @@ class MinLMTrainer:
             
         metrics_log_path = os.path.join(self.checkpoint_dir, "training_metrics.tsv")
         
+        # Use a more robust approach with atomic file operations to prevent race conditions
         try:
-            with open(metrics_log_path, 'a') as f:
-                elapsed = time.time() - self.start_time
-                global_tokens = self.global_tokens.item()
-                tokens_per_sec = global_tokens / elapsed if elapsed > 0 else 0
+            # Create a unique temporary file
+            temp_path = f"{metrics_log_path}.tmp.{random.randint(0, 1000000)}"
+            
+            # Prepare the line to write
+            elapsed = time.time() - self.start_time
+            global_tokens = self.global_tokens.item()
+            tokens_per_sec = global_tokens / elapsed if elapsed > 0 else 0
+            
+            # Get current learning rate
+            current_lr = self.optimizer.param_groups[0]['lr']
+            
+            # Prepare values
+            values = [
+                str(self.global_step),
+                f"{elapsed:.2f}",
+                str(global_tokens),
+                f"{tokens_per_sec:.2f}",
+                f"{self.train_loss:.6f}",
+                str(self.val_loss if is_validation else "NA"),
+                str(self.val_bpb if is_validation else "NA"),
+                f"{current_lr:.8f}",  # Use actual current LR, not initial LR
+                str(BATCH_SIZE),
+                str(self.grad_accum_steps)
+            ]
+            
+            line = '\t'.join(values) + '\n'
+            
+            # Write to temporary file first
+            with open(temp_path, 'w') as f:
+                f.write(line)
+            
+            # Then append to the main log file atomically
+            with open(metrics_log_path, 'a') as main_log:
+                with open(temp_path, 'r') as temp_log:
+                    main_log.write(temp_log.read())
+            
+            # Clean up temp file
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
                 
-                # Get current learning rate
-                current_lr = self.optimizer.param_groups[0]['lr']
-                
-                # Prepare values
-                values = [
-                    str(self.global_step),
-                    f"{elapsed:.2f}",
-                    str(global_tokens),
-                    f"{tokens_per_sec:.2f}",
-                    f"{self.train_loss:.6f}",
-                    str(self.val_loss if is_validation else "NA"),
-                    str(self.val_bpb if is_validation else "NA"),
-                    f"{current_lr:.8f}",  # Use actual current LR, not initial LR
-                    str(BATCH_SIZE),
-                    str(self.grad_accum_steps)
-                ]
-                
-                f.write('\t'.join(values) + '\n')
         except Exception as e:
             print(f"Warning: Could not write to metrics log: {e}")
+            # Add more detailed error reporting
+            import traceback
+            print(f"Exception details: {traceback.format_exc()}")
     
     def _generate_sample(self, prime_length=PRIME_LENGTH, gen_length=GENERATE_LENGTH):
         """Generate a text sample during training"""
