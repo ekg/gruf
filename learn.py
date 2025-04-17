@@ -148,8 +148,12 @@ class MemoryMappedTextDataset(Dataset):
     def __getitem__(self, index):
         self._ensure_open()
         
-        # Generate a consistent random position using our seeded RNG
-        start_pos = self.rng.randint(0, self.valid_end) + self.offset
+        # Create a deterministic random generator specifically for this index
+        # This ensures the same "random" position is returned for the same index across all ranks
+        index_rng = random.Random(self.seed + index)
+        
+        # Get deterministic random position
+        start_pos = index_rng.randint(0, self.valid_end) + self.offset
             
         # Directly read bytes from memory map without creating intermediate arrays
         self.mm.seek(start_pos)
