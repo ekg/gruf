@@ -590,7 +590,7 @@ class MinLMTrainer:
         return config
         
     def train_step(self, batch):
-        """Execute a single training step"""
+        """Execute a single training step with explicit tensor synchronization"""
         # Initialize start_time on first training step
         if self.start_time is None:
             self.start_time = time.time()
@@ -601,18 +601,29 @@ class MinLMTrainer:
                 if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
                     current_lr = self.optimizer.param_groups[0]['lr']
                     print(f"Schedule-Free initial training LR: {current_lr}")
-                
-        # Note: We no longer set sf_optimizer.train() here
-        # ScheduleFree optimizer should be in train mode for the entire training loop
         
-        # Ensure batch is a Long tensor before forward pass
-        if batch.dtype != torch.long:
-            batch = batch.long()
+        # Tensor parallel synchronization
+        if torch.distributed.is_initialized() and hasattr(deepspeed.utils, 'get_tensor_model_parallel_group'):
+            tp_group = deepspeed.utils.get_tensor_model_parallel_group()
+            tp_rank = deepspeed.utils.get_tensor_model_parallel_rank()
             
-        # Ensure batch is on the right device
-        if batch.device != self.model.device:
-            batch = batch.to(self.model.device)
-            
+            if tp_group is not None:
+                # Ensure batch is a Long tensor and on the correct device
+                if batch.dtype != torch.long:
+                    batch = batch.long()
+                if batch.device != self.model.device:
+                    batch = batch.to(self.model.device)
+                
+                # Broadcast batch from rank 0 in TP group to all others
+                src_rank = deepspeed.utils.get_global_rank_from_tp_rank(0)
+                torch.distributed.broadcast(batch, src=src_rank, group=tp_group)
+        else:
+            # No tensor parallelism or utilities not available
+            if batch.dtype != torch.long:
+                batch = batch.long()
+            if batch.device != self.model.device:
+                batch = batch.to(self.model.device)
+        
         # Forward pass - DeepSpeed handles loss scaling and backward
         loss = self.model(batch, return_loss=True)
         
