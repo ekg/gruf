@@ -29,10 +29,12 @@ Micromamba is a fast, lightweight package manager compatible with conda environm
    # Clone the repository
    git clone https://github.com/yourusername/minGRU.git
    cd minGRU
-   
-   # Create environment from the yml file
-   micromamba env create -f environment.yml
-   micromamba activate cuda_ok
+
+   micromamba env create -n mingru
+   micromamba activate mingru
+   micromamba install pytorch torchvision torchaudio pytorch-cuda lightning -c pytorch -c nvidia -c conda-forge
+   pip install deepspeed
+   pip install git+https://github.com/facebookresearch/schedule_free.git
    ```
 
 3. Verify the environment:
