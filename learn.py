@@ -567,6 +567,14 @@ class MinLMTrainer:
             "contiguous_memory_optimization": True,
             "number_checkpoints": min(depth, 8)
         }
+        
+        # Disable tensor parallel data consistency checks and add comms logger
+        config["tp_overlap"] = False
+        config["comms_logger"] = {
+            "enabled": True,
+            "verbose": False,
+            "prof_all": False
+        }
             
         return config
         
