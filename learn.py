@@ -170,34 +170,6 @@ class MemoryMappedTextDataset(Dataset):
         if hasattr(self, 'file') and self.file is not None:
             self.file.close()
 
-class TextSamplerDataset(Dataset):
-    def __init__(self, data, seq_len):
-        super().__init__()
-        self.data = data
-        self.seq_len = seq_len
-        # Define dataset length such that one epoch covers the full data
-        # Each sample is seq_len tokens, so we need data_size/seq_len samples to cover all
-        self.samples_per_epoch = max(1, self.data.size(0) // self.seq_len)
-
-    def __len__(self):
-        return self.samples_per_epoch
-
-    def __getitem__(self, index):
-        # Check if the dataset size is sufficient for the requested sequence length
-        if self.data.size(0) <= self.seq_len:
-            # Dataset is too small, return the full dataset padded if needed
-            full_seq = self.data.clone().long()
-            # If we need padding, add zeros at the end
-            if full_seq.size(0) < self.seq_len + 1:
-                padding = torch.zeros(self.seq_len + 1 - full_seq.size(0), dtype=torch.long)
-                full_seq = torch.cat([full_seq, padding])
-            return full_seq[:self.seq_len + 1]
-        
-        # Normal case: Random sampling from anywhere in the data
-        rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
-        # Always ensure we return a Long tensor
-        full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
-        return full_seq  # DeepSpeed will handle device placement
 
 # Trainer class
 class MinLMTrainer:
@@ -1403,25 +1375,19 @@ class MinLMTrainer:
             print("No validation dataset provided for generation")
             return
         
-        # Handle both memory-mapped and in-memory datasets
-        if isinstance(self.val_dataset, MemoryMappedTextDataset):
-            # Get a batch from the memory-mapped dataset
-            self.val_dataset._ensure_open()  # Make sure memory map is open
-            
-            # Generate a random position within the validation area
-            start_pos = random.randint(0, self.val_dataset.valid_end) + self.val_dataset.offset
-            
-            # Read the prime data from the memory map
-            self.val_dataset.mm.seek(start_pos)
-            data = self.val_dataset.mm.read(prime_length)
-            
-            # Convert to a writable buffer first, then to tensor
-            writable_data = bytearray(data)
-            prime = torch.frombuffer(writable_data, dtype=torch.uint8).long().unsqueeze(0).to(self.model.device)
-        else:
-            # For in-memory dataset
-            rand_start = torch.randint(0, len(self.val_dataset.data) - prime_length - 1, (1,))
-            prime = self.val_dataset.data[rand_start:rand_start + prime_length].long().unsqueeze(0).to(self.model.device)
+        # Always use memory-mapped dataset
+        self.val_dataset._ensure_open()  # Make sure memory map is open
+    
+        # Generate a random position within the validation area
+        start_pos = random.randint(0, self.val_dataset.valid_end) + self.val_dataset.offset
+    
+        # Read the prime data from the memory map
+        self.val_dataset.mm.seek(start_pos)
+        data = self.val_dataset.mm.read(prime_length)
+    
+        # Convert to a writable buffer first, then to tensor
+        writable_data = bytearray(data)
+        prime = torch.frombuffer(writable_data, dtype=torch.uint8).long().unsqueeze(0).to(self.model.device)
         
         # Generate text
         if not self.silent_mode:
@@ -1678,39 +1644,63 @@ def main():
     if global_rank == 0:
         print(f"Loading data from {args.data}...")
     
-    # Initialize variables to track whether data is in memory or memory-mapped
-    using_mmap = False
-    
+    # Always use memory mapping for data access
     if is_gzip_file(args.data):
         if global_rank == 0:
-            print("Detected gzip format, loading into memory...")
-        with gzip.open(args.data) as file:
-            data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
-            # Use a percentage-based split (90% train, 10% validation)
-            split_point = int(0.9 * len(data))
-            np_train, np_valid = np.split(data, [split_point])
-            data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
-            
-            if global_rank == 0:
-                print(f"Data loaded - Train: {data_train.shape}, Val: {data_val.shape}")
+            print("Detected gzip format, creating temporary uncompressed file for memory mapping...")
+    
+        # Create a temporary directory to hold the extracted file
+        import tempfile
+        temp_dir = tempfile.mkdtemp(prefix="minlm_data_")
+        extracted_file = os.path.join(temp_dir, "extracted_data")
+    
+        # Extract the gzipped file to the temporary file
+        with gzip.open(args.data, 'rb') as f_in:
+            with open(extracted_file, 'wb') as f_out:
+                # Read in chunks to handle large files
+                while True:
+                    chunk = f_in.read(1024 * 1024)  # 1MB chunks
+                    if not chunk:
+                        break
+                    f_out.write(chunk)
+    
+        # Use the extracted file for memory mapping
+        data_file = extracted_file
+        if global_rank == 0:
+            print(f"Extracted to temporary file: {extracted_file}")
+        
+        # Register cleanup function to run at exit
+        import atexit
+        import shutil
+    
+        def cleanup_temp_dir():
+            try:
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                    if global_rank == 0:
+                        print(f"Cleaned up temporary directory: {temp_dir}")
+            except Exception as e:
+                if global_rank == 0:
+                    print(f"Error cleaning up temporary directory: {e}")
+    
+        atexit.register(cleanup_temp_dir)
     else:
+        # Use the original file directly
+        data_file = args.data
         if global_rank == 0:
-            print("Detected raw format, using true memory mapping...")
-        
-        # Get file size
-        file_size = os.path.getsize(args.data)
-        
-        # Calculate split point for train/val (90/10 split)
-        split_point = int(0.9 * file_size)
-        
-        if global_rank == 0:
-            print(f"File size: {file_size} bytes")
-            print(f"Train portion: 0-{split_point} ({split_point} bytes)")
-            print(f"Validation portion: {split_point}-{file_size} ({file_size - split_point} bytes)")
-            print(f"Data will be accessed via memory mapping")
-        
-        # Mark that we're using memory mapping
-        using_mmap = True
+            print("Using original file for memory mapping...")
+
+    # Get file size
+    file_size = os.path.getsize(data_file)
+
+    # Calculate split point for train/val (90/10 split)
+    split_point = int(0.9 * file_size)
+
+    if global_rank == 0:
+        print(f"File size: {file_size} bytes")
+        print(f"Train portion: 0-{split_point} ({split_point} bytes)")
+        print(f"Validation portion: {split_point}-{file_size} ({file_size - split_point} bytes)")
+        print(f"Data will be accessed via memory mapping")
     
     # Parse numerical arguments with potential suffixes
     dim_value = parse_size_with_suffix(args.dim) if args.dim is not None else None
@@ -1828,28 +1818,22 @@ def main():
     if global_rank == 0:
         print(f"Creating datasets with sequence length: {SEQ_LEN}...")
     
-    # Create appropriate datasets based on file type
-    if not using_mmap:
-        # For gzipped/in-memory data, use TextSamplerDataset
-        train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
-        val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
-    else:
-        # For raw data, use memory-mapped dataset
-        # Training dataset uses first 90% of file
-        train_dataset = MemoryMappedTextDataset(
-            filepath=args.data,
-            seq_len=SEQ_LEN,
-            offset=0,
-            length=split_point
-        )
-        
-        # Validation dataset uses last 10% of file
-        val_dataset = MemoryMappedTextDataset(
-            filepath=args.data,
-            seq_len=SEQ_LEN,
-            offset=split_point,
-            length=file_size - split_point
-        )
+    # Always use memory-mapped dataset
+    # Training dataset uses first 90% of file
+    train_dataset = MemoryMappedTextDataset(
+        filepath=data_file,
+        seq_len=SEQ_LEN,
+        offset=0,
+        length=split_point
+    )
+
+    # Validation dataset uses last 10% of file
+    val_dataset = MemoryMappedTextDataset(
+        filepath=data_file,
+        seq_len=SEQ_LEN,
+        offset=split_point,
+        length=file_size - split_point
+    )
     
     # Calculate optimal workers
     num_workers = min(4, os.cpu_count() or 2)
