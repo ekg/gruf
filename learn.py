@@ -145,15 +145,12 @@ class MemoryMappedTextDataset(Dataset):
     def __getitem__(self, index):
         self._ensure_open()
         
-        # Create a deterministic random generator specifically for this index
-        # This ensures the same "random" position is returned for the same index across all ranks
-        index_rng = random.Random(self.seed + index)
+        # TESTING MODE: Always return the exact same sequence regardless of index
+        # Use a fixed position based only on the seed (not the index)
+        fixed_pos = self.offset
         
-        # Get deterministic random position
-        start_pos = index_rng.randint(0, self.valid_end) + self.offset
-            
         # Directly read bytes from memory map without creating intermediate arrays
-        self.mm.seek(start_pos)
+        self.mm.seek(fixed_pos)
         data = self.mm.read(self.seq_len + 1)  # +1 for the target
         
         # Convert to a writable buffer first, then to tensor
@@ -189,8 +186,7 @@ class TextSamplerDataset(Dataset):
         return self.samples_per_epoch
 
     def __getitem__(self, index):
-        # Create deterministic random generator for this index
-        index_rng = random.Random(self.seed + index)
+        # TESTING MODE: Always return the exact same sequence regardless of index
         
         # Check if the dataset size is sufficient for the requested sequence length
         if self.data.size(0) <= self.seq_len:
@@ -202,11 +198,11 @@ class TextSamplerDataset(Dataset):
                 full_seq = torch.cat([full_seq, padding])
             return full_seq[:self.seq_len + 1]
         
-        # Generate deterministic random position using the index-specific RNG
-        rand_start = index_rng.randint(0, self.data.size(0) - self.seq_len - 1)
+        # Always use position 0 for absolute consistency
+        fixed_start = 0
         
         # Always ensure we return a Long tensor
-        full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
+        full_seq = self.data[fixed_start : fixed_start + self.seq_len + 1].long()
         return full_seq  # DeepSpeed will handle device placement
 
 # Trainer class
