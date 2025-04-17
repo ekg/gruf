@@ -685,14 +685,29 @@ class MinLMTrainer:
         return loss_val
         
     def validation_step(self, batch):
-        """Execute a single validation step"""
+        """Execute a single validation step with explicit tensor synchronization"""
         with torch.no_grad():
-            # Ensure batch is a Long tensor
-            if batch.dtype != torch.long:
-                batch = batch.long()
-            # Move batch to device if needed
-            if batch.device != self.model.device:
-                batch = batch.to(self.model.device)
+            # Tensor parallel synchronization
+            if torch.distributed.is_initialized() and hasattr(deepspeed.utils, 'get_tensor_model_parallel_group'):
+                tp_group = deepspeed.utils.get_tensor_model_parallel_group()
+                
+                if tp_group is not None:
+                    # Ensure batch is a Long tensor and on the correct device
+                    if batch.dtype != torch.long:
+                        batch = batch.long()
+                    if batch.device != self.model.device:
+                        batch = batch.to(self.model.device)
+                    
+                    # Broadcast batch from rank 0 in TP group to all others
+                    src_rank = deepspeed.utils.get_global_rank_from_tp_rank(0)
+                    torch.distributed.broadcast(batch, src=src_rank, group=tp_group)
+            else:
+                # No tensor parallelism or utilities not available
+                if batch.dtype != torch.long:
+                    batch = batch.long()
+                if batch.device != self.model.device:
+                    batch = batch.to(self.model.device)
+            
             loss = self.model(batch, return_loss=True)
             # Calculate bits per byte (bpb)
             bpb = loss / math.log(2)
