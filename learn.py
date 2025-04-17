@@ -605,7 +605,6 @@ class MinLMTrainer:
         # Tensor parallel synchronization
         if torch.distributed.is_initialized() and hasattr(deepspeed.utils, 'get_tensor_model_parallel_group'):
             tp_group = deepspeed.utils.get_tensor_model_parallel_group()
-            tp_rank = deepspeed.utils.get_tensor_model_parallel_rank()
             
             if tp_group is not None:
                 # Ensure batch is a Long tensor and on the correct device
@@ -614,9 +613,14 @@ class MinLMTrainer:
                 if batch.device != self.model.device:
                     batch = batch.to(self.model.device)
                 
-                # Broadcast batch from rank 0 in TP group to all others
-                src_rank = deepspeed.utils.get_global_rank_from_tp_rank(0)
-                torch.distributed.broadcast(batch, src=src_rank, group=tp_group)
+                # Get ranks in the tensor parallel group
+                tp_ranks = [i for i in range(torch.distributed.get_world_size(tp_group))]
+                
+                # Use the minimum rank in the TP group as the source
+                if tp_ranks:
+                    src_rank = min(tp_ranks)
+                    # Broadcast batch from source rank to all others in this TP group
+                    torch.distributed.broadcast(batch, src=src_rank, group=tp_group)
         else:
             # No tensor parallelism or utilities not available
             if batch.dtype != torch.long:
@@ -709,9 +713,14 @@ class MinLMTrainer:
                     if batch.device != self.model.device:
                         batch = batch.to(self.model.device)
                     
-                    # Broadcast batch from rank 0 in TP group to all others
-                    src_rank = deepspeed.utils.get_global_rank_from_tp_rank(0)
-                    torch.distributed.broadcast(batch, src=src_rank, group=tp_group)
+                    # Get ranks in the tensor parallel group
+                    tp_ranks = [i for i in range(torch.distributed.get_world_size(tp_group))]
+                    
+                    # Use the minimum rank in the TP group as the source
+                    if tp_ranks:
+                        src_rank = min(tp_ranks)
+                        # Broadcast batch from source rank to all others in this TP group
+                        torch.distributed.broadcast(batch, src=src_rank, group=tp_group)
             else:
                 # No tensor parallelism or utilities not available
                 if batch.dtype != torch.long:
