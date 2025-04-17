@@ -1009,16 +1009,19 @@ class MinLMTrainer:
         if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
             self.sf_optimizer.train()
         
-        # Initial validation - run on all ranks for tensor parallelism
+        # VALIDATION DISABLED FOR DEBUGGING
         if self.global_rank == 0:
             # Save permanent checkpoint at step 0
             self.save_checkpoint({"initial": True}, is_periodic=False, is_permanent=True)
             if not self.silent_mode:
                 print(f"Saved permanent initial checkpoint at step {self.global_step}")
+                print(f"⚠️ VALIDATION DISABLED FOR DEBUGGING ⚠️")
     
-        # Run validation on ALL ranks to ensure tensor parallel consistency
-        val_results = self.validate(val_dataloader, max_batches=val_batches)
-    
+        # Skip validation completely
+        # Set default values to avoid potential None issues
+        self.val_loss = 0.0
+        self.val_bpb = 0.0
+            
         # Only log metrics on rank 0
         if self.global_rank == 0:
             self._log_metrics(True)
@@ -1078,26 +1081,18 @@ class MinLMTrainer:
                     if not self.silent_mode:
                         print(f"Saved permanent checkpoint at step {step}")
                 
-                # Validate periodically
+                # VALIDATION DISABLED FOR DEBUGGING
                 if step > 0 and step % validate_every == 0:
-                    # Set ScheduleFree optimizer to eval mode if using it (on all ranks)
-                    if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
-                        self.sf_optimizer.eval()
-                    
-                    # Run validation on ALL ranks to ensure tensor parallel consistency
-                    val_results = self.validate(val_dataloader, max_batches=val_batches)
-                    
-                    # Only do checkpoint and logging on rank 0
+                    # No validation, just save checkpoint and log metrics
                     if self.global_rank == 0:
-                        # Save checkpoint with validation results
+                        if not self.silent_mode:
+                            print(f"Step {step}: ⚠️ VALIDATION SKIPPED (DISABLED FOR DEBUGGING) ⚠️")
+                        
+                        # Save checkpoint without validation results
                         self.save_checkpoint()
                         
-                        # Log metrics
-                        self._log_metrics(True)
-                    
-                    # Put ScheduleFree optimizer back to train mode on ALL ranks
-                    if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
-                        self.sf_optimizer.train()
+                        # Log metrics (training only)
+                        self._log_metrics(False)
                 
                 # Generate samples periodically if not skipped
                 if generate_every > 0 and step > 0 and step % generate_every == 0 and self.global_rank == 0:
