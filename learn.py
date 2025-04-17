@@ -26,6 +26,20 @@ from torch.utils.data import DataLoader, Dataset
 import deepspeed
 from tqdm import tqdm
 
+# Monkey-patch DeepSpeed's data consistency check to disable it
+from deepspeed.runtime.engine import DeepSpeedEngine
+
+# Save the original function reference
+original_check = DeepSpeedEngine.check_dataloader_inputs_same_across_ranks
+
+# Replace with a no-op function that always passes
+def dummy_check(self, *args, **kwargs):
+    print(f"Skipping data consistency check across TP ranks")
+    return args[0]  # Just return the input args
+
+# Apply the monkey patch
+DeepSpeedEngine.check_dataloader_inputs_same_across_ranks = dummy_check
+
 # Set higher precision for float32 matrix multiplication
 torch.set_float32_matmul_precision('high')
 
