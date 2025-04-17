@@ -1018,14 +1018,18 @@ class MinLMTrainer:
         if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
             self.sf_optimizer.train()
         
-        # Initial validation
+        # Initial validation - run on all ranks for tensor parallelism
         if self.global_rank == 0:
             # Save permanent checkpoint at step 0
             self.save_checkpoint({"initial": True}, is_periodic=False, is_permanent=True)
             if not self.silent_mode:
                 print(f"Saved permanent initial checkpoint at step {self.global_step}")
-                
-            val_results = self.validate(val_dataloader, max_batches=val_batches)
+    
+        # Run validation on ALL ranks to ensure tensor parallel consistency
+        val_results = self.validate(val_dataloader, max_batches=val_batches)
+    
+        # Only log metrics on rank 0
+        if self.global_rank == 0:
             self._log_metrics(True)
         
         # Training loop
@@ -1085,22 +1089,24 @@ class MinLMTrainer:
                 
                 # Validate periodically
                 if step > 0 and step % validate_every == 0:
+                    # Set ScheduleFree optimizer to eval mode if using it (on all ranks)
+                    if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
+                        self.sf_optimizer.eval()
+                    
+                    # Run validation on ALL ranks to ensure tensor parallel consistency
+                    val_results = self.validate(val_dataloader, max_batches=val_batches)
+                    
+                    # Only do checkpoint and logging on rank 0
                     if self.global_rank == 0:
-                        # Set ScheduleFree optimizer to eval mode if using it
-                        if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
-                            self.sf_optimizer.eval()
-                        
-                        val_results = self.validate(val_dataloader, max_batches=val_batches)
-                        
                         # Save checkpoint with validation results
                         self.save_checkpoint()
                         
                         # Log metrics
                         self._log_metrics(True)
-                        
-                        # Put ScheduleFree optimizer back to train mode if using it
-                        if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
-                            self.sf_optimizer.train()
+                    
+                    # Put ScheduleFree optimizer back to train mode on ALL ranks
+                    if hasattr(self, 'sf_optimizer') and self.sf_optimizer is not None:
+                        self.sf_optimizer.train()
                 
                 # Generate samples periodically if not skipped
                 if generate_every > 0 and step > 0 and step % generate_every == 0 and self.global_rank == 0:
