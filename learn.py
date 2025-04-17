@@ -113,9 +113,6 @@ class MemoryMappedTextDataset(Dataset):
         self.offset = offset
         self.seed = seed
         
-        # Create a dedicated random number generator with fixed seed
-        self.rng = random.Random(self.seed)
-        
         # Get file size once
         self.file_size = os.path.getsize(filepath)
         
@@ -184,8 +181,6 @@ class TextSamplerDataset(Dataset):
         self.data = data
         self.seq_len = seq_len
         self.seed = seed
-        # Create a dedicated random number generator with fixed seed
-        self.rng = random.Random(self.seed)
         # Define dataset length such that one epoch covers the full data
         # Each sample is seq_len tokens, so we need data_size/seq_len samples to cover all
         self.samples_per_epoch = max(1, self.data.size(0) // self.seq_len)
