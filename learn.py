@@ -106,11 +106,15 @@ def base_decoding(
 
 # Dataset classes
 class MemoryMappedTextDataset(Dataset):
-    def __init__(self, filepath, seq_len, offset=0, length=None):
+    def __init__(self, filepath, seq_len, offset=0, length=None, seed=42):
         super().__init__()
         self.filepath = filepath
         self.seq_len = seq_len
         self.offset = offset
+        self.seed = seed
+        
+        # Create a dedicated random number generator with fixed seed
+        self.rng = random.Random(self.seed)
         
         # Get file size once
         self.file_size = os.path.getsize(filepath)
@@ -144,8 +148,8 @@ class MemoryMappedTextDataset(Dataset):
     def __getitem__(self, index):
         self._ensure_open()
         
-        # Generate a random position within our valid range
-        start_pos = random.randint(0, self.valid_end) + self.offset
+        # Generate a consistent random position using our seeded RNG
+        start_pos = self.rng.randint(0, self.valid_end) + self.offset
             
         # Directly read bytes from memory map without creating intermediate arrays
         self.mm.seek(start_pos)
@@ -171,10 +175,13 @@ class MemoryMappedTextDataset(Dataset):
             self.file.close()
 
 class TextSamplerDataset(Dataset):
-    def __init__(self, data, seq_len):
+    def __init__(self, data, seq_len, seed=42):
         super().__init__()
         self.data = data
         self.seq_len = seq_len
+        self.seed = seed
+        # Create a dedicated random number generator with fixed seed
+        self.rng = random.Random(self.seed)
         # Define dataset length such that one epoch covers the full data
         # Each sample is seq_len tokens, so we need data_size/seq_len samples to cover all
         self.samples_per_epoch = max(1, self.data.size(0) // self.seq_len)
@@ -193,8 +200,8 @@ class TextSamplerDataset(Dataset):
                 full_seq = torch.cat([full_seq, padding])
             return full_seq[:self.seq_len + 1]
         
-        # Normal case: Random sampling from anywhere in the data
-        rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
+        # Normal case: Consistent random sampling using seeded RNG
+        rand_start = self.rng.randint(0, self.data.size(0) - self.seq_len - 1)
         # Always ensure we return a Long tensor
         full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
         return full_seq  # DeepSpeed will handle device placement
@@ -1831,8 +1838,8 @@ def main():
     # Create appropriate datasets based on file type
     if not using_mmap:
         # For gzipped/in-memory data, use TextSamplerDataset
-        train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
-        val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
+        train_dataset = TextSamplerDataset(data_train, SEQ_LEN, seed=42)  # Fixed seed
+        val_dataset = TextSamplerDataset(data_val, SEQ_LEN, seed=42)  # Fixed seed
     else:
         # For raw data, use memory-mapped dataset
         # Training dataset uses first 90% of file
@@ -1840,7 +1847,8 @@ def main():
             filepath=args.data,
             seq_len=SEQ_LEN,
             offset=0,
-            length=split_point
+            length=split_point,
+            seed=42  # Use fixed seed for consistent sampling
         )
         
         # Validation dataset uses last 10% of file
@@ -1848,7 +1856,8 @@ def main():
             filepath=args.data,
             seq_len=SEQ_LEN,
             offset=split_point,
-            length=file_size - split_point
+            length=file_size - split_point,
+            seed=42  # Use fixed seed for consistent sampling
         )
     
     # Calculate optimal workers
@@ -1858,7 +1867,7 @@ def main():
         train_dataset, 
         batch_size=BATCH_SIZE, 
         num_workers=num_workers,
-        shuffle=True
+        shuffle=False  # Disable shuffle - randomization happens in dataset
     )
     
     val_loader = DataLoader(
@@ -2021,6 +2030,7 @@ def main():
             
             if global_rank == 0 and not trainer.silent_mode:
                 print(f"TP group size: {tp_world_size}, DP groups: {world_size // tp_world_size}")
+                print(f"Using fixed random seed 42 for datasets to ensure consistency within TP groups")
     
     # Print effective batch size
     if global_rank == 0 and not trainer.silent_mode:
