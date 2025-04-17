@@ -147,26 +147,13 @@ class MemoryMappedTextDataset(Dataset):
         return self.samples_per_epoch
     
     def __getitem__(self, index):
-        self._ensure_open()
+        # DEBUG MODE: Return tensor of all zeros
+        # No need to read from file at all
         
-        # TESTING MODE: Always return the exact same sequence regardless of index
-        # Use a fixed position based only on the seed (not the index)
-        fixed_pos = self.offset
+        # Create a tensor of zeros with shape [seq_len + 1]
+        tensor = torch.zeros(self.seq_len + 1, dtype=torch.long)
         
-        # Directly read bytes from memory map without creating intermediate arrays
-        self.mm.seek(fixed_pos)
-        data = self.mm.read(self.seq_len + 1)  # +1 for the target
-        
-        # Convert to a writable buffer first, then to tensor
-        writable_data = bytearray(data)
-        tensor = torch.frombuffer(writable_data, dtype=torch.uint8).long()
-        
-        # Handle edge case if we didn't get enough data
-        if tensor.size(0) < self.seq_len + 1:
-            # Pad with zeros if needed
-            padding = torch.zeros(self.seq_len + 1 - tensor.size(0), dtype=torch.long)
-            tensor = torch.cat([tensor, padding])
-        
+        # Return the zeros tensor, which will be identical across all processes
         return tensor
     
     def __del__(self):
@@ -190,24 +177,14 @@ class TextSamplerDataset(Dataset):
         return self.samples_per_epoch
 
     def __getitem__(self, index):
-        # TESTING MODE: Always return the exact same sequence regardless of index
+        # DEBUG MODE: Return tensor of all zeros
+        # Ignore dataset completely
         
-        # Check if the dataset size is sufficient for the requested sequence length
-        if self.data.size(0) <= self.seq_len:
-            # Dataset is too small, return the full dataset padded if needed
-            full_seq = self.data.clone().long()
-            # If we need padding, add zeros at the end
-            if full_seq.size(0) < self.seq_len + 1:
-                padding = torch.zeros(self.seq_len + 1 - full_seq.size(0), dtype=torch.long)
-                full_seq = torch.cat([full_seq, padding])
-            return full_seq[:self.seq_len + 1]
+        # Create a tensor of zeros with shape [seq_len + 1]
+        tensor = torch.zeros(self.seq_len + 1, dtype=torch.long)
         
-        # Always use position 0 for absolute consistency
-        fixed_start = 0
-        
-        # Always ensure we return a Long tensor
-        full_seq = self.data[fixed_start : fixed_start + self.seq_len + 1].long()
-        return full_seq  # DeepSpeed will handle device placement
+        # Return the zeros tensor, which will be identical across all processes
+        return tensor  # DeepSpeed will handle device placement
 
 # Trainer class
 class MinLMTrainer:
