@@ -29,6 +29,10 @@ from tqdm import tqdm
 # Set higher precision for float32 matrix multiplication
 torch.set_float32_matmul_precision('high')
 
+# Set deterministic settings for reproducibility
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
 # Import the minLM model
 from minGRU_pytorch.minLM import minLM
 
