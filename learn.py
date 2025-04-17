@@ -1881,8 +1881,9 @@ def main():
     val_loader = DataLoader(
         val_dataset, 
         batch_size=BATCH_SIZE, 
-        num_workers=num_workers,
-        shuffle=False
+        num_workers=0,  # Zero workers ensures deterministic behavior
+        shuffle=False,
+        drop_last=True  # Prevents partial batches
     )
     
     # Generate unique run name
