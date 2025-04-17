@@ -194,6 +194,9 @@ class TextSamplerDataset(Dataset):
         return self.samples_per_epoch
 
     def __getitem__(self, index):
+        # Create deterministic random generator for this index
+        index_rng = random.Random(self.seed + index)
+        
         # Check if the dataset size is sufficient for the requested sequence length
         if self.data.size(0) <= self.seq_len:
             # Dataset is too small, return the full dataset padded if needed
@@ -204,8 +207,9 @@ class TextSamplerDataset(Dataset):
                 full_seq = torch.cat([full_seq, padding])
             return full_seq[:self.seq_len + 1]
         
-        # Normal case: Consistent random sampling using seeded RNG
-        rand_start = self.rng.randint(0, self.data.size(0) - self.seq_len - 1)
+        # Generate deterministic random position using the index-specific RNG
+        rand_start = index_rng.randint(0, self.data.size(0) - self.seq_len - 1)
+        
         # Always ensure we return a Long tensor
         full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
         return full_seq  # DeepSpeed will handle device placement
